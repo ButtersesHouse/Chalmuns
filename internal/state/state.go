@@ -110,6 +110,8 @@ func Write(path string, s State) error {
 	for i := range s.Rules {
 		if s.Rules[i].ID == "" {
 			s.Rules[i].ID = newRuleID()
+		}
+		if s.Rules[i].CreatedAt == "" {
 			s.Rules[i].CreatedAt = now
 		}
 		s.Rules[i].UpdatedAt = now

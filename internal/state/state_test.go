@@ -101,6 +101,88 @@ func TestWriteAtomic(t *testing.T) {
 	}
 }
 
+func TestWriteCreatedAtForRuleWithIDButNoTimestamp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Rules = []Rule{
+		// has an ID but no created_at — simulates a migrated rule
+		{ID: "rule_existing", Title: "migrated", Rule: "...", Status: "approved", Confidence: "established"},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Rules[0].CreatedAt == "" {
+		t.Error("expected created_at set for rule with ID but missing timestamp")
+	}
+	if out.Rules[0].ID != "rule_existing" {
+		t.Error("existing ID should be preserved")
+	}
+}
+
+func TestWritePreservesCreatedAt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	const existingTimestamp = "2024-01-01T00:00:00Z"
+	s := Empty()
+	s.Rules = []Rule{
+		{ID: "rule_abc", Title: "old rule", Rule: "...", Status: "approved",
+			Confidence: "established", CreatedAt: existingTimestamp},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Rules[0].CreatedAt != existingTimestamp {
+		t.Errorf("created_at should not change: want %q, got %q", existingTimestamp, out.Rules[0].CreatedAt)
+	}
+}
+
+func TestWriteIDUniqueness(t *testing.T) {
+	dir := t.TempDir()
+
+	ids := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		path := filepath.Join(dir, "state.json")
+		s := Empty()
+		s.Rules = []Rule{{Title: "r", Rule: "r", Status: "proposed", Confidence: "emerging"}}
+		if err := Write(path, s); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := Read(path)
+		id := out.Rules[0].ID
+		if ids[id] {
+			t.Errorf("duplicate ID generated: %s", id)
+		}
+		ids[id] = true
+		os.Remove(path)
+	}
+}
+
+func TestReadInvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte("{not valid json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Read(path)
+	if err == nil {
+		t.Error("expected error for invalid JSON, got nil")
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
