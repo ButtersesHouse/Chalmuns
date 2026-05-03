@@ -56,6 +56,7 @@ func TestWriteStatsRecomputed(t *testing.T) {
 
 	s := Empty()
 	s.Rules = []Rule{
+		{Status: "approved", Confidence: "stated"},
 		{Status: "approved", Confidence: "established"},
 		{Status: "approved", Confidence: "established"},
 		{Status: "approved", Confidence: "emerging"},
@@ -71,8 +72,11 @@ func TestWriteStatsRecomputed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Stats.TotalRules != 5 {
-		t.Errorf("total_rules: want 5, got %d", out.Stats.TotalRules)
+	if out.Stats.TotalRules != 6 {
+		t.Errorf("total_rules: want 6, got %d", out.Stats.TotalRules)
+	}
+	if out.Stats.StatedRules != 1 {
+		t.Errorf("stated: want 1, got %d", out.Stats.StatedRules)
 	}
 	if out.Stats.EstablishedRules != 2 {
 		t.Errorf("established: want 2, got %d", out.Stats.EstablishedRules)
@@ -80,8 +84,8 @@ func TestWriteStatsRecomputed(t *testing.T) {
 	if out.Stats.EmergingRules != 3 {
 		t.Errorf("emerging: want 3, got %d", out.Stats.EmergingRules)
 	}
-	if out.Stats.ApprovedRules != 3 {
-		t.Errorf("approved: want 3, got %d", out.Stats.ApprovedRules)
+	if out.Stats.ApprovedRules != 4 {
+		t.Errorf("approved: want 4, got %d", out.Stats.ApprovedRules)
 	}
 	if out.Stats.RejectedRules != 1 {
 		t.Errorf("rejected: want 1, got %d", out.Stats.RejectedRules)

@@ -31,6 +31,7 @@ type Stats struct {
 	TotalSignals       int `json:"total_signals"`
 	DroppedByGrounding int `json:"dropped_by_grounding"`
 	TotalRules         int `json:"total_rules"`
+	StatedRules        int `json:"stated_rules"`
 	EstablishedRules   int `json:"established_rules"`
 	EmergingRules      int `json:"emerging_rules"`
 	ApprovedRules      int `json:"approved_rules"`
@@ -72,6 +73,10 @@ type Signal struct {
 	Reviewer  string `json:"reviewer"`
 	Date      string `json:"date"`
 	Snippet   string `json:"snippet"`
+	// Strength is "explicit" when the reviewer stated a general preference or convention
+	// ("we prefer X", "we always Y"); "implicit" for corrections without a stated rule.
+	// Empty is treated as "implicit" for backward compatibility.
+	Strength string `json:"strength,omitempty"`
 }
 
 type RejectedSignal struct {
@@ -119,12 +124,15 @@ func Write(path string, s State) error {
 
 	// recompute stats
 	s.Stats.TotalRules = len(s.Rules)
+	s.Stats.StatedRules = 0
 	s.Stats.EstablishedRules = 0
 	s.Stats.EmergingRules = 0
 	s.Stats.ApprovedRules = 0
 	s.Stats.RejectedRules = 0
 	for _, r := range s.Rules {
 		switch r.Confidence {
+		case "stated":
+			s.Stats.StatedRules++
 		case "established":
 			s.Stats.EstablishedRules++
 		case "emerging":

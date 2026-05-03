@@ -110,6 +110,60 @@ func TestWriteCLAUDEMDEstablishedBeforeEmerging(t *testing.T) {
 	}
 }
 
+func TestWriteCLAUDEMDStatedBeforeEstablishedBeforeEmerging(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(
+		approvedRule("Emerging rule", "emerging text", "CLAUDE.md", "emerging", 1),
+		approvedRule("Established rule", "established text", "CLAUDE.md", "established", 2),
+		approvedRule("Stated rule", "stated text", "CLAUDE.md", "stated", 3),
+	)
+
+	if err := Write(s, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
+	statedPos := strings.Index(content, "Stated rule")
+	estPos := strings.Index(content, "Established rule")
+	emgPos := strings.Index(content, "Emerging rule")
+	if statedPos == -1 || estPos == -1 || emgPos == -1 {
+		t.Fatal("all three rules should be present")
+	}
+	if statedPos > estPos {
+		t.Error("stated rule should appear before established rule")
+	}
+	if estPos > emgPos {
+		t.Error("established rule should appear before emerging rule")
+	}
+}
+
+func TestWriteSkillFileStatedFirst(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(
+		approvedRule("Emerging api", "emerging", "api", "emerging", 1),
+		approvedRule("Stated api", "stated", "api", "stated", 2),
+		approvedRule("Established api", "established", "api", "established", 3),
+	)
+
+	if err := Write(s, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	statedPos := strings.Index(content, "Stated api")
+	estPos := strings.Index(content, "Established api")
+	emgPos := strings.Index(content, "Emerging api")
+	if statedPos == -1 || estPos == -1 || emgPos == -1 {
+		t.Fatal("all three rules should be present in skill file")
+	}
+	if statedPos > estPos {
+		t.Error("stated rule should appear before established in skill file")
+	}
+	if estPos > emgPos {
+		t.Error("established rule should appear before emerging in skill file")
+	}
+}
+
 func TestWriteCLAUDEMDMaxThirtyRules(t *testing.T) {
 	dir := t.TempDir()
 	var rules []state.Rule

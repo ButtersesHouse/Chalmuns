@@ -68,10 +68,10 @@ func writeSkillFiles(s state.State, dir string) error {
 }
 
 func writeSkillFile(domain string, rules []state.Rule, dir string) error {
-	// sort established first, then by title
 	sort.Slice(rules, func(i, j int) bool {
-		if rules[i].Confidence != rules[j].Confidence {
-			return rules[i].Confidence == "established"
+		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
+		if ri != rj {
+			return ri < rj
 		}
 		return rules[i].Title < rules[j].Title
 	})
@@ -107,7 +107,7 @@ func writeSkillFile(domain string, rules []state.Rule, dir string) error {
 }
 
 // approvedRules returns approved rules for a given target location,
-// sorted established-first then by title.
+// sorted stated → established → emerging, then alphabetically by title.
 func approvedRules(s state.State, location string) []state.Rule {
 	var out []state.Rule
 	for _, r := range s.Rules {
@@ -116,12 +116,28 @@ func approvedRules(s state.State, location string) []state.Rule {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Confidence != out[j].Confidence {
-			return out[i].Confidence == "established"
+		ri, rj := confidenceRank(out[i].Confidence), confidenceRank(out[j].Confidence)
+		if ri != rj {
+			return ri < rj
 		}
 		return out[i].Title < out[j].Title
 	})
 	return out
+}
+
+// confidenceRank returns the sort priority for a confidence level.
+// Lower is higher priority: stated(0) > established(1) > emerging(2).
+func confidenceRank(c string) int {
+	switch c {
+	case "stated":
+		return 0
+	case "established":
+		return 1
+	case "emerging":
+		return 2
+	default:
+		return 3
+	}
 }
 
 func prList(sources []state.Signal) string {
