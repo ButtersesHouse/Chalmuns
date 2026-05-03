@@ -83,18 +83,26 @@ Create the cache directory if needed:
 mkdir -p .claude/pattern-learner/raw-cache
 ```
 
-**Fetch order: newest PRs first.** Call `mcp__github__list_pull_requests` with:
-- `owner` and `repo` from Step 3
-- `state: "closed"`
-- `sort: "updated"`, `direction: "desc"`
+The sort order and stop condition differ by mode. Keep a running `max_pr_seen = 0` as you page; update it for every PR encountered (merged or not).
 
-Page through results. Keep only PRs where `merged_at != null` AND `number > since_pr`. Stop paging when you reach a PR where `number <= since_pr` (since list is sorted descending by update time, this is an approximation — continue for at least 2 additional pages after first seeing a number <= since_pr to account for out-of-order updates).
+**Full mode** — sort by last activity, newest first. No early stop; page all results.
+```
+sort: "updated", direction: "desc"
+```
+Keep PRs where `merged_at != null`. The cache check below deduplicates any PR already seen in a prior partial run.
 
-For each qualifying PR number N:
-1. Check if `.claude/pattern-learner/raw-cache/pr-N.json` exists. If it does, skip (already cached).
-2. If not cached: call `mcp__github__pull_request_read` with the PR number. This should return reviews and review comments. If issue-level comments (general discussion) are available via a separate call, fetch those too.
-3. Count comment types: `review_comments` (diff-level), `issue_comments` (discussion thread), `review_bodies` (text in approve/request-changes reviews with non-empty body).
-4. Write to cache:
+**Refresh mode** — sort by creation order, newest first. This aligns PR numbers with page order, making the stop condition reliable.
+```
+sort: "created", direction: "desc"
+```
+Keep PRs where `merged_at != null` AND `number > since_pr`. Stop when an entire page consists only of PRs with `number <= since_pr` — all of these were processed in a prior run. Fetch one additional page after the first all-below-watermark page to guard against any gap, then stop.
+
+**For each qualifying PR number N** (both modes):
+1. Update `max_pr_seen = max(max_pr_seen, N)`.
+2. Check if `.claude/pattern-learner/raw-cache/pr-N.json` exists. If it does, skip (already cached).
+3. If not cached: call `mcp__github__pull_request_read` to get reviews and review comments. If issue-level comments (general PR discussion) are available via a separate call, fetch those too.
+4. Count comment types: `review_comments` (diff-level), `issue_comments` (discussion thread), `review_bodies` (text in approve/request-changes reviews with non-empty body).
+5. Write to cache:
    ```json
    {
      "pr_number": N,
@@ -107,7 +115,7 @@ For each qualifying PR number N:
    }
    ```
 
-Collect all fetched PR numbers into batches of 20.
+Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` forward to Step 11.
 
 ---
 
@@ -251,7 +259,7 @@ Wait for user input per rule:
 
 Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
-- Updated `last_extracted_pr_number` = highest PR number processed this run (or unchanged if --review)
+- Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
 - Updated `last_run`, `repo`, `stats`
 - Rules with `status: "rejected"` should also appear in `rejected_signals` with their rule text preserved for future matching
 
