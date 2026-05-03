@@ -1,0 +1,13 @@
+{
+  "name": "pattern-learner",
+  "version": "0.1.0",
+  "description": "Extracts recurring coding conventions from PR review history and writes approved rules to CLAUDE.md and skill files",
+  "author": {
+    "name": "ButtersesHouse",
+    "url": "https://github.com/ButtersesHouse/Chalmuns"
+  },
+  "repository": "https://github.com/ButtersesHouse/Chalmuns",
+  "license": "MIT",
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json"
+}
