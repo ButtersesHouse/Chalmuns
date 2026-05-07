@@ -1,12 +1,12 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Explicit preferences ("we prefer X", "we always Y") are captured regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching.
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching.
 argumentHint: "[--refresh | --review]"
 ---
 
 # learn-patterns
 
-Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules to `CLAUDE.md` and domain-specific skill files. Explicit preferences are captured regardless of how many times they appear.
+Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules to `CLAUDE.md` and domain-specific skill files. Treats reviewer preferences — including indirect, hedged, and skeptical language — as spoken-word rules captured at face value, regardless of occurrence count.
 
 ## Instructions
 
@@ -133,33 +133,43 @@ You are analyzing PR review comments to discover how this team prefers to write 
 
 Your output becomes the coding rules that AI assistants follow in this repository. Extract the team's stated preferences, naming conventions, architectural choices, and coding standards as expressed in code review.
 
-Below is raw JSON for a batch of merged pull requests including reviews and comments.
+Below is raw JSON for a batch of merged pull requests including reviews, comments, and reply threads.
 
 ---
 
-**PRIORITY 1 — Explicit preferences (extract even from a single occurrence)**
+**Default assumption**: in code review, reviewers rarely state preferences as blunt directives. Most conventions are communicated through polite questions, hedged suggestions, or skeptical critique. **Questions are usually directives.** A reviewer wouldn't ask if they didn't have an opinion. Take indirect feedback at face value as a real preference signal.
 
-Look for any comment where a reviewer states a general convention or team rule using language such as:
-- "we prefer / we like / we always / we never"
-- "in this codebase / in this project / our convention is / our pattern is"
-- "please always / always use / never use / going forward"
-- "the way we do this is / the pattern here is / we do X by"
+---
 
-A single occurrence is enough. These are spoken-word rules. Mark `"strength": "explicit"`.
+**PRIORITY 0 — GitHub code suggestions (strongest possible signal)**
 
-**PRIORITY 2 — Recurring corrections**
+Reviewer comments containing ` ```suggestion ` blocks. The reviewer literally wrote the code they want — this IS the convention. The diff between the original line(s) and the suggested replacement shows the pattern. Extract as `"strength": "explicit"`.
 
-A reviewer consistently correcting the same thing suggests a convention worth capturing, even without an explicit statement. Mark `"strength": "implicit"`. These are subject to a recurrence threshold in a later step.
+**PRIORITY 1 — Stated preferences (explicit OR indirect; capture from a single occurrence)**
+
+Treat all of the following as explicit preference signals (`"strength": "explicit"`):
+
+- **Direct preferences**: "we prefer / we like / we always / we never / our convention is / always use / never use / going forward / in this codebase / our pattern is"
+- **Polite directives framed as questions**: "could we use X?", "what about X?", "have you considered X?", "why not X?", "should this be X?", "any reason not to X?"
+- **Skeptical or passive-aggressive critique**: "is there a reason for this approach?", "I usually see this done with Y", "I would have done X", "hmm, this is unusual", "interesting choice", "this works but...", "this is fine I guess but..."
+- **Hedged preferences**: "maybe consider X", "I think we usually X", "we tend to X here", "it might be cleaner to X", "wouldn't it be better to X?"
+
+**Author acknowledgment** strengthens a signal. Walk the comment threads (`in_reply_to_id` linkage). When the PR author responds to a reviewer's comment with confirmation language — "good catch", "you're right", "ok fixed", "updated", "thanks", "sgtm", "done", "addressed" — the reviewer's feedback was a real ask. Treat such confirmed comments as the highest-quality explicit signals.
+
+**PRIORITY 2 — Recurring corrections without explicit framing** (`"strength": "implicit"`)
+
+Reviewers fixing the same thing across multiple comments without stated preference.
 
 ---
 
 **DO NOT extract:**
 
-- **Bug fixes**: the comment points to a specific wrong value, missing null check for a particular input, failing test assertion, or concrete runtime error. Ask yourself: "Is this about a general principle, or a specific mistake in this PR?" Only general principles qualify.
-- **Product/feature correctness**: "this feature doesn't handle X scenario", "the API returns the wrong response for Y", "this breaks in production when Z". These describe what the code should *do*, not how it should be *written*.
-- **Mechanical style enforced by tooling**: whitespace, semicolons, brace placement where a linter or formatter already handles it.
-- **Bot comments**: skip any comment where `user.login` ends in `[bot]`.
-- **Open-ended questions**: "have you considered X?" without a clear directive.
+- **Bug fixes for specific code**: "this returns null when X is empty", "missing nil check on line 42", "wrong assertion in this test", "this throws when input has trailing spaces". The comment points to a concrete defect in *this* PR, not a general principle.
+- **Product or feature correctness**: "this doesn't handle X user scenario", "the API returns the wrong response for Y", "this breaks in production when Z". These describe what the code should *do*, not how it should be *written*.
+- **Genuine clarification questions** (information-seeking): "what does this variable represent?", "is this still used anywhere?", "what's the use case for this case?", "is this intentional?". Distinguish from **rhetorical questions** (preference signals): "why are we doing it this way?", "why not just X?", "do we really need this?".
+- **Author asking reviewer**: when the PR author is asking the reviewer a question, not the other way around. Look at who is the author of each comment.
+- **Mechanical style enforced by tooling**: whitespace, semicolons, brace placement when a linter or formatter already handles it.
+- **Bot comments**: skip any comment where `user.login` ends in `[bot]`, or matches one of: `dependabot`, `renovate`, `coderabbitai`, `copilot`, `github-actions`, `sonarqube`, `codecov`.
 
 ---
 
@@ -186,11 +196,13 @@ A reviewer consistently correcting the same thing suggests a convention worth ca
 }
 ```
 
-`strength`: `"explicit"` if the reviewer stated a general rule or preference; `"implicit"` if it is a correction or suggestion without a stated general principle.
+`strength`: `"explicit"` for any Priority 0 or Priority 1 signal (direct, indirect, polite, skeptical, hedged, or code-suggestion); `"implicit"` only for Priority 2 recurring corrections without stated framing.
 
-`snippet`: the reviewer's exact verbatim words. Do not paraphrase. If you cannot quote the reviewer directly supporting the rule, omit the signal entirely.
+`snippet`: the reviewer's exact verbatim words. Do not paraphrase. If you cannot quote the reviewer directly supporting the rule, omit the signal entirely. For code-suggestion signals, the snippet may be the suggested code block itself.
 
-`do_example` / `dont_example`: include when code examples are present in the comment or clearly implied. Omit rather than invent.
+`do_example` / `dont_example`: include when code examples are present in the comment (suggestion blocks, inline code, or referenced changes) or clearly implied. Omit rather than invent. Use the file paths the PR touched to infer the language.
+
+`suggested_target`: use the file paths the PR touches as a hint. PRs touching only `internal/api/**` should suggest `"location": "api"` rather than `"CLAUDE.md"`. Reserve `"CLAUDE.md"` for project-wide rules that span multiple domains.
 
 Output only the JSON array, no other text.
 
@@ -207,9 +219,10 @@ Collect all signals returned by all subagent runs.
 
 For each signal returned in Step 6:
 1. Open `.claude/pattern-learner/raw-cache/pr-<raw_signal.pr_number>.json`.
-2. Search the entire file content for `raw_signal.snippet` as a case-insensitive substring.
-3. If the snippet is NOT found anywhere in that file: **discard the signal**. Count it as dropped.
-4. If found: keep the signal.
+2. Normalize both the cached file content and `raw_signal.snippet` for comparison: lowercase both, then collapse runs of whitespace (spaces, tabs, newlines) into single spaces. This tolerates minor formatting differences like wrapped lines or escaped newlines without admitting genuine paraphrases.
+3. Check whether the normalized snippet appears as a substring of the normalized file content.
+4. If the snippet is NOT found: **discard the signal**. Count it as dropped.
+5. If found: keep the signal.
 
 Track: total signals extracted, signals dropped by grounding check.
 
