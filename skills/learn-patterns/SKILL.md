@@ -282,6 +282,14 @@ In a single reasoning pass over all verified signals and the current state from 
 
 **A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit. Also merge their `do_examples` and `dont_examples` arrays: deduplicate by code content (exact string match after trimming whitespace), then cap each array at 4 entries. The result is a richer set of real examples accumulated across multiple PRs that all express the same convention.
 
+**A-cross. Cross-batch contradiction detection**: After all batches complete their per-batch 8A pass, collect all post-8A candidates from all batches into one pool and check them against each other for contradictions. This is necessary because Step 8A is intra-batch only — a new convention from recent PRs and the old convention it replaced, extracted from different batches, would otherwise both surface as proposals.
+
+For each pair of candidates that are semantically contradictory:
+- Compute `max_pr(X)` = highest PR number across candidate X's `sources`; same for Y.
+- The candidate with the **higher** `max_pr` is the current convention (winner). The other is the outdated convention (loser).
+- Discard the loser as a standalone candidate. Attach a `prior_convention` note to the winner: `{title: loser.title, min_pr: min(loser.sources[].pr_number), max_pr: max(loser.sources[].pr_number)}`. This note is used in the Step 10 approval display only — it is NOT written to state.
+- If both candidates' `max_pr` values are within 5 of each other (genuine ambiguity — the team may have been actively debating the convention), keep both as proposals and tag each with `[CONFLICT]` in the approval UI rather than discarding either.
+
 **B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
 
 **C. Against existing state rules**: For each candidate:
@@ -315,6 +323,15 @@ Assign confidence:
 
 Discard implicit candidates below threshold.
 
+**Recency downgrade for old-only implicit signals**: After the threshold check above, apply to implicit candidates that passed:
+- Compute `max_pr(candidate)` = highest PR number across the candidate's sources.
+- Compute `recency_cutoff` = `max_pr_seen` − ((max_pr_seen − since_pr) × 0.5). This is the midpoint of the scanned PR range — signals from the bottom half of the range are old enough to question.
+- If `max_pr(candidate) < recency_cutoff` AND the candidate has no explicit source: downgrade confidence one tier:
+  - `"established"` → `"emerging"`
+  - `"emerging"` → discard (treat as below threshold)
+
+Rationale: an implicit pattern seen only in old PRs may have been quietly resolved. If it truly persists, recent PRs would show it too. Explicit signals are exempt — a stated preference doesn't expire just because it wasn't re-stated recently.
+
 ---
 
 ### Step 10: Approval UI
@@ -330,7 +347,11 @@ For each rule, display:
 Rule: <title>
 Target: <CLAUDE.md | domain>
 Confidence: <stated (explicit preference) | established | emerging> (<N> signals across <M> PRs)
-[Supersedes: rule_<id> "<superseded rule title>" — only shown when supersedes is non-empty]
+[Supersedes: "<superseded rule title>"                              ← only when supersedes is non-empty
+   ↳ This convention: PRs #<min_new>–<max_new> (<N_new> signals)
+   ↳ Replaces:        PRs #<min_old>–<max_old> (<N_old> signals)]
+[Prior convention (same run, older PRs #<min>–<max>): "<title>"   ← only when prior_convention note from Step 8A-cross is present]
+[CONFLICT: contradicts another candidate from overlapping PR range — review both] ← only when tagged [CONFLICT] in Step 8A-cross
 
 Convention:
   <rule text>
@@ -351,6 +372,8 @@ Evidence:
 [a]pprove  [r]eject  [e]dit  [s]kip (defer)
 ────────────────────────────────────────────────────
 ```
+
+For the supersession block: `min_new`/`max_new` = min/max PR numbers from the current rule's sources; `min_old`/`max_old` = min/max PR numbers from the superseded rule's sources (look it up in state). This makes the temporal relationship visible at decision time — the reviewer can see at a glance which convention is newer and by how many PRs.
 
 Wait for user input per rule:
 - `a` → set `status: "approved"`. If the rule has non-empty `supersedes`, also set the superseded rule's `status: "superseded"` and `superseded_by: "<this_rule_id>"` (the binary will fill `<this_rule_id>` at write time if not yet assigned — pass the rule's index for now).
