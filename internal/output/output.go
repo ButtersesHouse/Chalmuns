@@ -62,14 +62,14 @@ func writeSkillFiles(s state.State, dir string, opts Options) error {
 	}
 
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain], opts); err != nil {
+		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeSkillFile(domain string, rules []state.Rule, dir string, override string, opts Options) error {
+func writeSkillFile(domain string, rules []state.Rule, dir string, override string, watermark int, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -87,13 +87,28 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 	b.WriteString(fmt.Sprintf("description: %s\n", desc))
 	b.WriteString("---\n\n")
 	b.WriteString(fmt.Sprintf("# %s Conventions\n\n", capitalize(domain)))
+
+	if exemplary := exemplaryFiles(rules); len(exemplary) > 0 {
+		b.WriteString("## Exemplary Files\n\n")
+		b.WriteString("Read one of these before writing new code in this domain — they best represent the team's style:\n\n")
+		for _, f := range exemplary {
+			b.WriteString(fmt.Sprintf("- `%s`\n", f))
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString("## Rules\n\n")
 
 	for _, r := range rules {
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
 		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
-		b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
+		if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= 100 {
+			b.WriteString(fmt.Sprintf("_Source: PRs %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
+				prList(r.Sources), r.LastSeenPR))
+		} else {
+			b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
+		}
 		if opts.RAGHints {
 			b.WriteString(fmt.Sprintf(
 				"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
@@ -211,6 +226,55 @@ func prList(sources []state.Signal) string {
 		parts[i] = fmt.Sprintf("#%d", n)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// exemplaryFiles returns up to 3 file paths that appear most frequently as
+// FileRef targets across the domain's rules. These are the files that best
+// represent the domain's coding style and are listed in the skill file so
+// the AI can read one for holistic style guidance beyond individual rules.
+func exemplaryFiles(rules []state.Rule) []string {
+	freq := map[string]int{}
+	for _, r := range rules {
+		for _, ex := range r.DoExamples {
+			if ex.FileRef == "" {
+				continue
+			}
+			// Strip :Lline suffix to get the bare file path.
+			path := ex.FileRef
+			if idx := strings.LastIndex(path, ":L"); idx > 0 {
+				path = path[:idx]
+			}
+			freq[path]++
+		}
+	}
+	if len(freq) == 0 {
+		return nil
+	}
+
+	type entry struct {
+		path  string
+		count int
+	}
+	var entries []entry
+	for p, c := range freq {
+		entries = append(entries, entry{p, c})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count != entries[j].count {
+			return entries[i].count > entries[j].count
+		}
+		return entries[i].path < entries[j].path
+	})
+
+	max := 3
+	if len(entries) < max {
+		max = len(entries)
+	}
+	out := make([]string, max)
+	for i := range out {
+		out[i] = entries[i].path
+	}
+	return out
 }
 
 func collectGlobs(rules []state.Rule) []string {

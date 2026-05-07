@@ -145,7 +145,8 @@ For each batch of up to 20 PR numbers:
          "in_reply_to_id": null,
          "type": "review_comment",
          "path": "internal/api/handlers/users.go",
-         "body": "Could we use context.WithTimeout here?"
+         "body": "Could we use context.WithTimeout here?",
+         "code_before": "ctx := context.Background()"
        },
        ...
      ]
@@ -154,7 +155,8 @@ For each batch of up to 20 PR numbers:
    - `is_pr_author`: true when the comment author equals the PR author. Used by the subagent to detect author acknowledgment vs reviewer feedback.
    - `type`: one of `review_comment`, `issue_comment`, `review_body`.
    - `path`: file path for review comments; null for issue comments and review bodies.
-   - Drop diff hunks, position info, blob URLs, reactions, and any field not listed above.
+   - `code_before`: **for `review_comment` type only** — extract from the comment's `diff_hunk` field. The `diff_hunk` is a unified diff snippet; take only the lines beginning with `-` (old/removed lines) or context lines (no prefix) that are adjacent to the change. Strip the leading `-` character. This gives the exact code the reviewer was looking at when they made the comment — it is the natural `dont_example` for any rule extracted from that comment. If `diff_hunk` is absent or empty, omit `code_before`.
+   - Drop position info, blob URLs, reactions, and any field not listed above.
 
    Concatenate the lean views into a single JSON array per batch.
 
@@ -238,13 +240,20 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 `snippet`: the reviewer's exact verbatim words. Do not paraphrase. If you cannot quote the reviewer directly supporting the rule, omit the signal entirely. For code-suggestion signals, the snippet may be the suggested code block itself.
 
-`do_examples` / `dont_examples`: arrays — include all examples available for this signal. A single comment may produce multiple examples; return them all. For **Priority 0 suggestion blocks**: set `dont_examples[0].code` to the original lines being replaced and `do_examples[0].code` to the suggested replacement; populate `context` with ±5 lines of surrounding diff context so the AI can see the pattern in situ. For other comment types, include any inline code blocks or referenced before/after changes. Omit rather than invent. Use the file paths the PR touched to infer the language.
+`do_examples` / `dont_examples`: arrays — include all examples available. Use this priority order for sourcing them:
+
+1. **Priority 0 suggestion blocks**: `dont_examples[0].code` = original lines replaced; `do_examples[0].code` = suggested replacement. Populate `context` with ±5 lines of surrounding diff context.
+2. **`code_before` field** (present on `review_comment` type): use as `dont_examples[0].code` when no suggestion block is present. This is verbatim code from the diff the reviewer was looking at — the highest-fidelity dont example available. Use the comment's body, inline code, or your inference to construct the corresponding `do_example`.
+3. **Inline code in comment body**: backtick-quoted code in the comment text.
+4. **Inference from reviewer wording**: only when none of the above are available.
+
+A single comment may produce multiple examples; return them all. Omit rather than invent when no example source is available. Use the file paths the PR touched to infer the language.
 
 `suggested_target`: use the file paths the PR touches as a hint. PRs touching only `internal/api/**` should suggest `"location": "api"` rather than `"CLAUDE.md"`. Reserve `"CLAUDE.md"` for project-wide rules that span multiple domains.
 
 Output only the JSON array, no other text.
 
-PR data (lean preprocessed view — comments + metadata + file paths only, diffs and other PR metadata stripped):
+PR data (lean preprocessed view — comments + metadata + file paths; review comments include `code_before` extracted from diff_hunk):
 [INSERT LEAN PR DATA HERE]
 
 ---

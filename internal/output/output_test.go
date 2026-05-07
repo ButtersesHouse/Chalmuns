@@ -589,6 +589,97 @@ func TestRAGHintsNotInCLAUDEMD(t *testing.T) {
 	}
 }
 
+func TestExemplaryFilesSection(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	r.DoExamples = []state.Example{
+		{Code: "errors.As(err, &t)", Language: "go", FileRef: "internal/api/handler.go:L10"},
+		{Code: "errors.As(err, &e)", Language: "go", FileRef: "internal/api/handler.go:L55"},
+		{Code: "errors.As(err, &m)", Language: "go", FileRef: "internal/api/middleware.go:L20"},
+	}
+	r2 := approvedRule("Wrap errors", "Wrap errors with context", "api", "established", 2)
+	r2.DoExamples = []state.Example{
+		{Code: `fmt.Errorf("op: %w", err)`, Language: "go", FileRef: "internal/api/handler.go:L80"},
+	}
+	if err := Write(stateWith(r, r2), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "## Exemplary Files") {
+		t.Error("Exemplary Files section missing")
+	}
+	// handler.go appears 3 times, middleware.go once — handler should be first
+	if !strings.Contains(content, "internal/api/handler.go") {
+		t.Error("top exemplary file missing")
+	}
+	handlerPos := strings.Index(content, "internal/api/handler.go")
+	middlewarePos := strings.Index(content, "internal/api/middleware.go")
+	if handlerPos > middlewarePos {
+		t.Error("more-frequent file should appear first in exemplary files")
+	}
+}
+
+func TestExemplaryFilesSectionAbsentWhenNoFileRefs(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	// No FileRef set on any example
+	r.DoExample = &state.Example{Code: "errors.As(err, &t)", Language: "go"}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "## Exemplary Files") {
+		t.Error("Exemplary Files section should not appear when no FileRefs exist")
+	}
+}
+
+func TestStalenessNoteOnOldRule(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(
+		func() state.Rule {
+			r := approvedRule("Old convention", "do the old thing", "api", "established", 1)
+			r.LastSeenPR = 5
+			return r
+		}(),
+	)
+	s.LastExtractedPRNumber = 200 // watermark 195 ahead of last_seen_pr=5
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "verify this convention is still current") {
+		t.Error("staleness note should appear for rules 100+ PRs behind watermark")
+	}
+	if !strings.Contains(content, "last seen: PR #5") {
+		t.Error("staleness note should include last_seen_pr number")
+	}
+}
+
+func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(
+		func() state.Rule {
+			r := approvedRule("Recent convention", "do the new thing", "api", "established", 1)
+			r.LastSeenPR = 195
+			return r
+		}(),
+	)
+	s.LastExtractedPRNumber = 200
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "verify this convention is still current") {
+		t.Error("staleness note should not appear for rules within 100 PRs of watermark")
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
