@@ -1,7 +1,7 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching, --discover to find patterns directly from the codebase using cursor-agent.
-argumentHint: "[--refresh | --review | --discover [domain ...]]"
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching, --auto to run without any interactive approval, --discover to find patterns directly from the codebase using cursor-agent.
+argumentHint: "[--refresh | --review | --auto [--refresh] | --discover [domain ...]]"
 ---
 
 # learn-patterns
@@ -19,8 +19,11 @@ Follow all steps in order. Do not skip steps unless the mode explicitly says to.
 Parse `$ARGUMENTS`:
 - `--refresh` → incremental mode: only fetch PRs newer than last run
 - `--review` → approval-only mode: skip all fetching, go straight to Step 10
+- `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
 - (nothing) → full mode: fetch all merged PRs
+
+Store `IS_AUTO` = true when `--auto` is present.
 
 If `--discover` is set, jump to the **Discover Mode** section after Step 4.
 
@@ -336,7 +339,24 @@ Rationale: an implicit pattern seen only in old PRs may have been quietly resolv
 
 ### Step 10: Approval UI
 
-Present each rule for user decision. Show new candidates first (status: "proposed"), then any existing proposed rules from prior runs.
+**If `IS_AUTO` is true**, skip the interactive loop entirely and apply this automatic pass instead:
+
+For each proposed rule (new candidates + any `status: "proposed"` rules from prior runs):
+- **Auto-approve** (set `status: "approved"`) if: the rule passed Step 9 threshold AND `supersedes` is empty AND the rule is NOT tagged `[CONFLICT]`.
+- **Auto-defer** (leave `status: "proposed"`) if: `supersedes` is non-empty (supersessions need human judgment — auto-approving could silently replace an established rule) OR the rule is tagged `[CONFLICT]` (genuine ambiguity between contradicting candidates).
+
+Skip the confirmation prompt ("Proceed to write state? [y/n]"). Proceed automatically to Step 11 if any rules were approved; if zero rules were approved (all deferred), print a note and continue to Step 11 anyway to persist the deferred rules.
+
+Print a single summary line:
+```
+Auto-approved: <N> rules  |  Deferred for review: <N> (run /learn-patterns --review to decide)
+```
+
+Then continue directly to Step 11.
+
+---
+
+**If `IS_AUTO` is false**, present each rule for user decision. Show new candidates first (status: "proposed"), then any existing proposed rules from prior runs.
 
 Group by target: `CLAUDE.md` rules first, then alphabetically by domain.
 
@@ -468,6 +488,16 @@ Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
 RAG hints in skill files:   <yes | no>
+─────────────────────────────────────────────────────
+```
+
+When `IS_AUTO` is true, append to the summary:
+
+```
+Auto-approve mode:
+  Auto-approved:              <N>
+  Deferred (supersessions):   <N>  ← run /learn-patterns --review to decide
+  Deferred (conflicts):       <N>  ← run /learn-patterns --review to decide
 ─────────────────────────────────────────────────────
 ```
 
