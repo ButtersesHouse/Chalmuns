@@ -37,7 +37,7 @@ func TestWriteCLAUDEMDBasicContent(t *testing.T) {
 	dir := t.TempDir()
 	s := stateWith(approvedRule("Use errors.As", "Always use errors.As", "CLAUDE.md", "established", 1, 2))
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -72,7 +72,7 @@ func TestWriteCLAUDEMDOnlyApproved(t *testing.T) {
 		}(),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -95,7 +95,7 @@ func TestWriteCLAUDEMDEstablishedBeforeEmerging(t *testing.T) {
 		approvedRule("Established rule", "established", "CLAUDE.md", "established", 2),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,7 +118,7 @@ func TestWriteCLAUDEMDStatedBeforeEstablishedBeforeEmerging(t *testing.T) {
 		approvedRule("Stated rule", "stated text", "CLAUDE.md", "stated", 3),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,7 +145,7 @@ func TestWriteSkillFileStatedFirst(t *testing.T) {
 		approvedRule("Established api", "established", "api", "established", 3),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -170,7 +170,7 @@ func TestWriteCLAUDEMDMaxThirtyRules(t *testing.T) {
 	for i := 0; i < 35; i++ {
 		rules = append(rules, approvedRule("Rule", "text", "CLAUDE.md", "established", i+1))
 	}
-	if err := Write(stateWith(rules...), dir); err != nil {
+	if err := Write(stateWith(rules...), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,7 +187,7 @@ func TestWriteCLAUDEMDNotCreatedWhenEmpty(t *testing.T) {
 	// only a skill-domain rule — no CLAUDE.md rules
 	s := stateWith(approvedRule("API rule", "use handler", "api", "established", 1))
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -201,7 +201,7 @@ func TestWriteCLAUDEMDWithExamples(t *testing.T) {
 	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
 	r.DoExample = &state.Example{Code: "errors.As(err, &target)", Language: "go"}
 	r.DontExample = &state.Example{Code: "err.(*MyErr)", Language: "go"}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -224,7 +224,7 @@ func TestWriteCLAUDEMDExamplesBeforeRuleProse(t *testing.T) {
 	dir := t.TempDir()
 	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "CLAUDE.md", "established", 1)
 	r.DoExample = &state.Example{Code: "errors.As(err, &target)", Language: "go"}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -249,7 +249,7 @@ func TestWriteCLAUDEMDPluralExamples(t *testing.T) {
 	r.DontExamples = []state.Example{
 		{Code: "err.(*MyErr)", Language: "go"},
 	}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -273,7 +273,7 @@ func TestWriteSkillFilePluralExamplesUpToThree(t *testing.T) {
 		{Code: "example three code", Language: "go"},
 		{Code: "example four code", Language: "go"}, // should be excluded (cap=3)
 	}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -292,7 +292,7 @@ func TestWriteSkillFilePluralExamplesBeforeRuleProse(t *testing.T) {
 	dir := t.TempDir()
 	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "api", "established", 1)
 	r.DoExamples = []state.Example{{Code: "errors.As(err, &target)", Language: "go"}}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -313,7 +313,7 @@ func TestWriteSkillFileFileRef(t *testing.T) {
 	r.DoExamples = []state.Example{
 		{Code: "errors.As(err, &target)", Language: "go", FileRef: "internal/api/handler.go:L42"},
 	}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -332,7 +332,7 @@ func TestPluralExamplesFallsBackToSingular(t *testing.T) {
 	r := approvedRule("Old rule", "old rule text", "api", "established", 1)
 	r.DoExample = &state.Example{Code: "singular do code", Language: "go"}
 	r.DontExample = &state.Example{Code: "singular dont code", Language: "go"}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,7 +351,7 @@ func TestWriteSkillFileCreated(t *testing.T) {
 	dir := t.TempDir()
 	s := stateWith(approvedRule("Wrap errors", "use writeError", "api", "established", 1))
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,7 +365,7 @@ func TestWriteSkillFileFrontmatter(t *testing.T) {
 	dir := t.TempDir()
 	r := approvedRule("Wrap errors", "use writeError", "api", "established", 1)
 	r.Target.FileGlob = []string{"internal/api/**/*.go"}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,7 +388,7 @@ func TestWriteSkillFileDoesNotContainCLAUDEMDRules(t *testing.T) {
 		approvedRule("API rule", "api specific", "api", "established", 2),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -408,7 +408,7 @@ func TestWriteMultipleDomains(t *testing.T) {
 		approvedRule("Auth rule", "auth thing", "auth", "established", 2),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -427,7 +427,7 @@ func TestWriteSkillFileEstablishedBeforeEmerging(t *testing.T) {
 		approvedRule("Established", "established text", "api", "established", 2),
 	)
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -444,7 +444,7 @@ func TestWriteSkillFileNoFile(t *testing.T) {
 	// only CLAUDE.md rules — no skill files should be written
 	s := stateWith(approvedRule("General", "general", "CLAUDE.md", "established", 1))
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -493,7 +493,7 @@ func TestWriteSkillFileUsesDomainDescription(t *testing.T) {
 		"api": "HTTP API endpoint conventions. Use when editing src/api/.",
 	}
 
-	if err := Write(s, dir); err != nil {
+	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -517,7 +517,7 @@ func TestPRListDeduplicatesInOutput(t *testing.T) {
 		{PRNumber: 5, Reviewer: "bob", Snippet: "b"},
 		{PRNumber: 3, Reviewer: "carol", Snippet: "c"},
 	}
-	if err := Write(stateWith(r), dir); err != nil {
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -541,6 +541,51 @@ func TestAtomicWriteNoTmpLeft(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
 		t.Error("tmp file should not exist after atomicWrite")
+	}
+}
+
+func TestRAGHintsAppearsInSkillFile(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	if err := Write(stateWith(r), dir, Options{RAGHints: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "cursor-agent") {
+		t.Error("RAG hint should contain cursor-agent command")
+	}
+	if !strings.Contains(content, "Use errors.As") {
+		t.Error("RAG hint should include the rule title")
+	}
+	if !strings.Contains(content, "Live examples:") {
+		t.Error("RAG hint label missing")
+	}
+}
+
+func TestRAGHintsAbsentWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	if err := Write(stateWith(r), dir, Options{RAGHints: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "cursor-agent") {
+		t.Error("cursor-agent hint should not appear when RAGHints is false")
+	}
+}
+
+func TestRAGHintsNotInCLAUDEMD(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
+	if err := Write(stateWith(r), dir, Options{RAGHints: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
+	if strings.Contains(content, "cursor-agent") {
+		t.Error("cursor-agent hint should not appear in CLAUDE.md")
 	}
 }
 

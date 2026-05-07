@@ -12,12 +12,19 @@ import (
 
 const maxCLAUDERules = 30
 
+// Options controls optional output features.
+type Options struct {
+	// RAGHints adds a cursor-agent query hint after each rule in domain skill
+	// files so the AI can retrieve live codebase examples at skill-use time.
+	RAGHints bool
+}
+
 // Write generates CLAUDE.md and per-domain skill files in outputDir.
-func Write(s state.State, outputDir string) error {
+func Write(s state.State, outputDir string, opts Options) error {
 	if err := writeCLAUDEMD(s, outputDir); err != nil {
 		return err
 	}
-	return writeSkillFiles(s, outputDir)
+	return writeSkillFiles(s, outputDir, opts)
 }
 
 func writeCLAUDEMD(s state.State, dir string) error {
@@ -44,7 +51,7 @@ func writeCLAUDEMD(s state.State, dir string) error {
 	return atomicWrite(filepath.Join(dir, "CLAUDE.md"), b.String())
 }
 
-func writeSkillFiles(s state.State, dir string) error {
+func writeSkillFiles(s state.State, dir string, opts Options) error {
 	byDomain := map[string][]state.Rule{}
 	for _, r := range s.Rules {
 		if r.Status != "approved" || r.Target.Location == "CLAUDE.md" || r.Target.Location == "" {
@@ -55,14 +62,14 @@ func writeSkillFiles(s state.State, dir string) error {
 	}
 
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain]); err != nil {
+		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain], opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeSkillFile(domain string, rules []state.Rule, dir string, override string) error {
+func writeSkillFile(domain string, rules []state.Rule, dir string, override string, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -87,6 +94,12 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
 		b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
+		if opts.RAGHints {
+			b.WriteString(fmt.Sprintf(
+				"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
+				r.Title,
+			))
+		}
 	}
 
 	skillDir := filepath.Join(dir, ".claude", "skills", domain)
