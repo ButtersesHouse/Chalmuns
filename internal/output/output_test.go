@@ -333,12 +333,51 @@ func TestWriteSkillFileNoFile(t *testing.T) {
 
 func TestBuildDescriptionTruncation(t *testing.T) {
 	globs := []string{strings.Repeat("a", 200)}
-	desc := buildDescription("api", globs)
+	desc := buildDescription("api", globs, "")
 	if len(desc) > 200 {
 		t.Errorf("description should be capped at 200 chars, got %d", len(desc))
 	}
 	if !strings.HasSuffix(desc, "...") {
 		t.Error("truncated description should end with ...")
+	}
+}
+
+func TestBuildDescriptionOverride(t *testing.T) {
+	override := "Conventions for HTTP API endpoints: error responses, validation, auth middleware. Use when editing src/api/"
+	desc := buildDescription("api", []string{"src/api/**"}, override)
+	if desc != override {
+		t.Errorf("override should be used verbatim when present, got %q", desc)
+	}
+}
+
+func TestBuildDescriptionOverrideTruncated(t *testing.T) {
+	override := strings.Repeat("a", 250)
+	desc := buildDescription("api", nil, override)
+	if len(desc) != 200 {
+		t.Errorf("override should be truncated to 200 chars, got %d", len(desc))
+	}
+	if !strings.HasSuffix(desc, "...") {
+		t.Error("truncated override should end with ...")
+	}
+}
+
+func TestWriteSkillFileUsesDomainDescription(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(approvedRule("API rule", "use writeError", "api", "established", 1))
+	s.DomainDescriptions = map[string]string{
+		"api": "HTTP API endpoint conventions. Use when editing src/api/.",
+	}
+
+	if err := Write(s, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "HTTP API endpoint conventions. Use when editing src/api/.") {
+		t.Errorf("skill file should use the domain description from state, got:\n%s", content)
+	}
+	if strings.Contains(content, "Coding conventions for api") {
+		t.Error("generic fallback description should not appear when override is provided")
 	}
 }
 

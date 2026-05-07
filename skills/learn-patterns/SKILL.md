@@ -23,9 +23,13 @@ Parse `$ARGUMENTS`:
 
 ---
 
-### Step 2: Locate and build the binary
+### Step 2: Pre-flight checks and binary build
 
-Check whether `.claude/pattern-learner/bin/pattern-learner` exists in the current working directory (the target repo root).
+**Pre-flight checks** (run first, abort with a clear message on failure):
+- `which go` — Go must be installed to build the binary. If missing, tell the user: "Go (1.21+) is required to build the pattern-learner binary. Install Go from https://go.dev/dl/ and retry."
+- Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review` mode since no fetching happens.)
+
+**Binary build**: check whether `.claude/pattern-learner/bin/pattern-learner` exists in the current working directory (the target repo root).
 
 If it does not exist:
 1. Find the plugin root by running:
@@ -123,8 +127,34 @@ Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` fo
 
 For each batch of up to 20 PR numbers:
 1. Read each `.claude/pattern-learner/raw-cache/pr-N.json`.
-2. Concatenate the raw data.
-3. Launch a subagent with this exact prompt (fill in the PR data at the end):
+2. **Preprocess the raw data into a lean view before sending to the subagent.** Sending the full PR JSON wastes context on diffs, file changes, labels, and PR descriptions that are noise for pattern extraction. From each PR's `raw` field, extract only:
+   ```json
+   {
+     "pr_number": 42,
+     "files_touched": ["internal/api/handlers/users.go", "..."],
+     "comments": [
+       {
+         "id": 12345,
+         "user": "alice",
+         "is_pr_author": false,
+         "created_at": "2024-01-15T...",
+         "in_reply_to_id": null,
+         "type": "review_comment",
+         "path": "internal/api/handlers/users.go",
+         "body": "Could we use context.WithTimeout here?"
+       },
+       ...
+     ]
+   }
+   ```
+   - `is_pr_author`: true when the comment author equals the PR author. Used by the subagent to detect author acknowledgment vs reviewer feedback.
+   - `type`: one of `review_comment`, `issue_comment`, `review_body`.
+   - `path`: file path for review comments; null for issue comments and review bodies.
+   - Drop diff hunks, position info, blob URLs, reactions, and any field not listed above.
+
+   Concatenate the lean views into a single JSON array per batch.
+
+3. Launch a subagent with this exact prompt (fill in the lean PR data at the end):
 
 ---
 **SUBAGENT PROMPT:**
@@ -206,8 +236,8 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 Output only the JSON array, no other text.
 
-PR data:
-[INSERT PR JSON HERE]
+PR data (lean preprocessed view — comments + metadata + file paths only, diffs and other PR metadata stripped):
+[INSERT LEAN PR DATA HERE]
 
 ---
 
@@ -218,27 +248,31 @@ Collect all signals returned by all subagent runs.
 ### Step 7: Grounding verification
 
 For each signal returned in Step 6:
-1. Open `.claude/pattern-learner/raw-cache/pr-<raw_signal.pr_number>.json`.
-2. Normalize both the cached file content and `raw_signal.snippet` for comparison: lowercase both, then collapse runs of whitespace (spaces, tabs, newlines) into single spaces. This tolerates minor formatting differences like wrapped lines or escaped newlines without admitting genuine paraphrases.
-3. Check whether the normalized snippet appears as a substring of the normalized file content.
-4. If the snippet is NOT found: **discard the signal**. Count it as dropped.
-5. If found: keep the signal.
+1. **Snippet length check**: if `raw_signal.snippet` (after trimming whitespace) is fewer than 20 characters, discard the signal — short fragments substring-match too easily and provide no real provenance. Count as dropped.
+2. Open `.claude/pattern-learner/raw-cache/pr-<raw_signal.pr_number>.json`.
+3. Normalize both the cached file content and `raw_signal.snippet` for comparison: lowercase both, then collapse runs of whitespace (spaces, tabs, newlines) into single spaces. This tolerates minor formatting differences like wrapped lines or escaped newlines without admitting genuine paraphrases.
+4. Check whether the normalized snippet appears as a substring of the normalized file content.
+5. If the snippet is NOT found: **discard the signal**. Count it as dropped.
+6. If found: keep the signal.
 
-Track: total signals extracted, signals dropped by grounding check.
+Track: total signals extracted, signals dropped by grounding check (broken down by reason: too-short vs not-found).
 
 ---
 
-### Step 8: Deduplicate and aggregate
+### Step 8: Deduplicate, normalize, and aggregate
 
 In a single reasoning pass over all verified signals and the current state from Step 4:
 
 **A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit.
 
-**B. Against existing state rules**: For each candidate:
-- If semantically equivalent to an existing rule in state → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Then recompute the rule's confidence using the Step 9 logic (check whether any source is explicit; if so, apply the explicit path — `"established"` if 3+ signals total, `"stated"` if fewer; otherwise apply the implicit path). Do NOT create a new rule.
-- If semantically distinct → treat as a new candidate rule.
+**B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
 
-**C. Against rejected signals**: If semantically equivalent to any entry in `rejected_signals` → discard silently.
+**C. Against existing state rules**: For each candidate:
+- **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text, examples, and `status`. Do NOT create a new rule.
+- **Contradicts**: semantically *opposite* to an existing rule (e.g., existing says "use X", new says "we always use Y instead"). Do NOT merge. Create a new candidate rule with `supersedes: ["<existing_rule_id>"]`. The user will see both in the approval UI and decide whether to accept the supersession (which then sets the existing rule's `status: "superseded"` and `superseded_by: "<new_rule_id>"`).
+- **Semantically distinct**: not equivalent and not contradicting → treat as a new candidate rule.
+
+**D. Against rejected signals**: If a candidate is semantically equivalent to any entry in `rejected_signals` → discard silently. Do this AFTER contradiction check so an explicit reversal of a rejected rule still has a chance to surface (rare but possible).
 
 New candidates get `status: "proposed"`. IDs will be assigned by `state-write` in Step 11.
 
@@ -279,6 +313,7 @@ For each rule, display:
 Rule: <title>
 Target: <CLAUDE.md | domain>
 Confidence: <stated (explicit preference) | established | emerging> (<N> signals across <M> PRs)
+[Supersedes: rule_<id> "<superseded rule title>" — only shown when supersedes is non-empty]
 
 Convention:
   <rule text>
@@ -301,10 +336,16 @@ Evidence:
 ```
 
 Wait for user input per rule:
-- `a` → set `status: "approved"`
+- `a` → set `status: "approved"`. If the rule has non-empty `supersedes`, also set the superseded rule's `status: "superseded"` and `superseded_by: "<this_rule_id>"` (the binary will fill `<this_rule_id>` at write time if not yet assigned — pass the rule's index for now).
 - `r` → set `status: "rejected"`; this rule will move to `rejected_signals` in state
 - `e` → prompt user to edit title, rule text, or examples inline; re-display updated rule for confirmation
 - `s` → leave as `status: "proposed"` (will appear again on next `--review`)
+
+After all rules are reviewed, display a summary of decisions:
+```
+You approved <N>, rejected <N>, edited <N>, skipped <N>. Proceed to write state? [y/n]
+```
+Wait for confirmation before continuing to Step 11. If `n`, exit without modifying state.
 
 ---
 
@@ -315,6 +356,14 @@ Build the complete updated state JSON:
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
 - Updated `last_run`, `repo`, `stats`
 - Rules with `status: "rejected"` should also appear in `rejected_signals` with their rule text preserved for future matching
+- **`domain_descriptions`**: for each domain that now has approved rules, set or refresh the entry. Read all approved rules in that domain and synthesize a 1–2 sentence description (max 200 chars) that:
+  - Names what the skill is for (e.g. "HTTP API endpoint conventions")
+  - Lists 2–3 concrete topics from the rules (e.g. "error responses, validation, auth middleware")
+  - Includes a "Use when editing" hint based on the file globs
+
+  Example: `"Conventions for HTTP API endpoints: error response format, validation patterns, auth middleware. Use when editing src/api/."`
+
+  This description goes into the generated skill file's frontmatter and drives Claude Code's auto-loading. Generic descriptions ("Coding conventions for api") won't trigger loading at the right times — be specific.
 
 Write the JSON to a staging file using the Write tool (avoids shell command-line length limits):
 ```
@@ -357,6 +406,8 @@ Signals extracted:          <N>
   explicit (spoken-word):   <N>
   implicit (corrections):   <N>
 Signals dropped (grounding):<N>
+  too short (<20 chars):    <N>
+  not found in source:      <N>
 New rules proposed:         <N>
   Approved:                 <N>
     stated (explicit):      <N>
@@ -364,6 +415,7 @@ New rules proposed:         <N>
     emerging:               <N>
   Rejected:                 <N>
   Skipped (deferred):       <N>
+Supersessions accepted:     <N>  (existing rules replaced)
 Files written:
   CLAUDE.md                 (<N> rules)
   .claude/skills/<domain>/SKILL.md  (<N> rules)

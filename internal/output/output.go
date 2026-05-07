@@ -60,14 +60,14 @@ func writeSkillFiles(s state.State, dir string) error {
 	}
 
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, dir); err != nil {
+		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeSkillFile(domain string, rules []state.Rule, dir string) error {
+func writeSkillFile(domain string, rules []state.Rule, dir string, override string) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -77,7 +77,7 @@ func writeSkillFile(domain string, rules []state.Rule, dir string) error {
 	})
 
 	globs := collectGlobs(rules)
-	desc := buildDescription(domain, globs)
+	desc := buildDescription(domain, globs, override)
 
 	var b strings.Builder
 	b.WriteString("---\n")
@@ -171,7 +171,16 @@ func collectGlobs(rules []state.Rule) []string {
 	return out
 }
 
-func buildDescription(domain string, globs []string) string {
+// buildDescription returns the SKILL.md frontmatter description for a domain.
+// If override is non-empty, it is used directly (truncated if needed). Otherwise
+// a generic fallback is constructed from the domain name and globs.
+func buildDescription(domain string, globs []string, override string) string {
+	if override != "" {
+		if len(override) > 200 {
+			return override[:197] + "..."
+		}
+		return override
+	}
 	base := fmt.Sprintf("Coding conventions for %s", domain)
 	if len(globs) > 0 {
 		base += fmt.Sprintf(". Use when editing files matching: %s", strings.Join(globs, ", "))

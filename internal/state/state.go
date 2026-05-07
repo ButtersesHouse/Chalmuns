@@ -11,13 +11,18 @@ import (
 const SchemaVersion = "1"
 
 type State struct {
-	SchemaVersion         string           `json:"schema_version"`
-	Repo                  RepoInfo         `json:"repo"`
-	LastRun               string           `json:"last_run"`
-	LastExtractedPRNumber int              `json:"last_extracted_pr_number"`
-	Stats                 Stats            `json:"stats"`
-	Rules                 []Rule           `json:"rules"`
-	RejectedSignals       []RejectedSignal `json:"rejected_signals"`
+	SchemaVersion         string            `json:"schema_version"`
+	Repo                  RepoInfo          `json:"repo"`
+	LastRun               string            `json:"last_run"`
+	LastExtractedPRNumber int               `json:"last_extracted_pr_number"`
+	Stats                 Stats             `json:"stats"`
+	Rules                 []Rule            `json:"rules"`
+	RejectedSignals       []RejectedSignal  `json:"rejected_signals"`
+	// DomainDescriptions maps a skill domain name to a human-written description
+	// used in the skill file's frontmatter. SKILL.md generates these during
+	// approval; output.go reads them when present, falls back to a generic
+	// template otherwise. Drives Claude Code's skill auto-loading.
+	DomainDescriptions map[string]string `json:"domain_descriptions,omitempty"`
 }
 
 type RepoInfo struct {
