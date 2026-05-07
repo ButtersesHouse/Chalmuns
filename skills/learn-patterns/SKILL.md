@@ -210,8 +210,12 @@ Reviewers fixing the same thing across multiple comments without stated preferen
   "title": "Short rule title (5-8 words)",
   "rule": "The convention as a clear imperative instruction",
   "strength": "explicit",
-  "do_example": {"code": "...", "language": "go"},
-  "dont_example": {"code": "...", "language": "go"},
+  "do_examples": [
+    {"code": "...", "language": "go", "context": "optional: surrounding function (±5 lines from diff)"}
+  ],
+  "dont_examples": [
+    {"code": "...", "language": "go", "context": "optional: surrounding function (±5 lines from diff)"}
+  ],
   "suggested_target": {
     "location": "CLAUDE.md or domain-name (e.g. api, auth, models)",
     "file_glob": ["src/api/**/*.go"]
@@ -230,7 +234,7 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 `snippet`: the reviewer's exact verbatim words. Do not paraphrase. If you cannot quote the reviewer directly supporting the rule, omit the signal entirely. For code-suggestion signals, the snippet may be the suggested code block itself.
 
-`do_example` / `dont_example`: include when code examples are present in the comment (suggestion blocks, inline code, or referenced changes) or clearly implied. Omit rather than invent. Use the file paths the PR touched to infer the language.
+`do_examples` / `dont_examples`: arrays — include all examples available for this signal. A single comment may produce multiple examples; return them all. For **Priority 0 suggestion blocks**: set `dont_examples[0].code` to the original lines being replaced and `do_examples[0].code` to the suggested replacement; populate `context` with ±5 lines of surrounding diff context so the AI can see the pattern in situ. For other comment types, include any inline code blocks or referenced before/after changes. Omit rather than invent. Use the file paths the PR touched to infer the language.
 
 `suggested_target`: use the file paths the PR touches as a hint. PRs touching only `internal/api/**` should suggest `"location": "api"` rather than `"CLAUDE.md"`. Reserve `"CLAUDE.md"` for project-wide rules that span multiple domains.
 
@@ -263,12 +267,12 @@ Track: total signals extracted, signals dropped by grounding check (broken down 
 
 In a single reasoning pass over all verified signals and the current state from Step 4:
 
-**A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit.
+**A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit. Also merge their `do_examples` and `dont_examples` arrays: deduplicate by code content (exact string match after trimming whitespace), then cap each array at 4 entries. The result is a richer set of real examples accumulated across multiple PRs that all express the same convention.
 
 **B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
 
 **C. Against existing state rules**: For each candidate:
-- **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text, examples, and `status`. Do NOT create a new rule.
+- **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text and `status`. Merge the candidate's `do_examples`/`dont_examples` into the existing rule's arrays (deduplicate by code content, cap each at 4). Do NOT create a new rule.
 - **Contradicts**: semantically *opposite* to an existing rule (e.g., existing says "use X", new says "we always use Y instead"). Do NOT merge. Create a new candidate rule with `supersedes: ["<existing_rule_id>"]`. The user will see both in the approval UI and decide whether to accept the supersession (which then sets the existing rule's `status: "superseded"` and `superseded_by: "<new_rule_id>"`).
 - **Semantically distinct**: not equivalent and not contradicting → treat as a new candidate rule.
 

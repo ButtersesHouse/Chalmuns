@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/detect"
 	"github.com/ButtersesHouse/Chalmuns/internal/output"
@@ -84,7 +87,82 @@ func runWriteOutputs(args []string) error {
 	if err != nil {
 		return err
 	}
+	anchorExamples(&s, outputDir)
 	return output.Write(s, outputDir)
+}
+
+// anchorExamples does a best-effort search for real codebase instances of each
+// approved rule's first do_example and sets FileRef when found. Errors are
+// silently ignored — this is advisory metadata only.
+func anchorExamples(s *state.State, outputDir string) {
+	for i := range s.Rules {
+		r := &s.Rules[i]
+		if r.Status != "approved" || len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
+			continue
+		}
+		if r.DoExamples[0].FileRef != "" {
+			continue
+		}
+		token := firstMeaningfulLine(r.DoExamples[0].Code)
+		if len(token) < 10 {
+			continue
+		}
+		for _, glob := range r.Target.FileGlob {
+			matches, err := filepath.Glob(filepath.Join(outputDir, glob))
+			if err != nil {
+				continue
+			}
+			found := false
+			for _, file := range matches {
+				lineNum, ok := findInFile(file, token)
+				if !ok {
+					continue
+				}
+				rel, err := filepath.Rel(outputDir, file)
+				if err != nil {
+					rel = file
+				}
+				r.DoExamples[0].FileRef = fmt.Sprintf("%s:L%d", rel, lineNum)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+	}
+}
+
+// firstMeaningfulLine returns the first non-blank, non-comment line from code.
+func firstMeaningfulLine(code string) string {
+	for _, line := range strings.Split(code, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#") ||
+			strings.HasPrefix(t, "*") || strings.HasPrefix(t, "/*") {
+			continue
+		}
+		return t
+	}
+	return ""
+}
+
+// findInFile searches filename line-by-line for substring and returns the line number.
+func findInFile(filename, substring string) (int, bool) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if strings.Contains(scanner.Text(), substring) {
+			return lineNum, true
+		}
+	}
+	return 0, false
 }
 
 // flagValue extracts --flag value from an args slice.

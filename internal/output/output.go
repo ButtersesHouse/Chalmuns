@@ -36,13 +36,8 @@ func writeCLAUDEMD(s state.State, dir string) error {
 
 	for _, r := range rules {
 		b.WriteString(fmt.Sprintf("## %s\n\n", r.Title))
+		renderExamples(&b, r, 1)
 		b.WriteString(r.Rule + "\n\n")
-		if r.DoExample != nil {
-			b.WriteString(fmt.Sprintf("**Do:**\n```%s\n%s\n```\n\n", r.DoExample.Language, r.DoExample.Code))
-		}
-		if r.DontExample != nil {
-			b.WriteString(fmt.Sprintf("**Don't:**\n```%s\n%s\n```\n\n", r.DontExample.Language, r.DontExample.Code))
-		}
 		b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
 	}
 
@@ -89,13 +84,8 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 
 	for _, r := range rules {
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
+		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
-		if r.DoExample != nil {
-			b.WriteString(fmt.Sprintf("**Do:**\n```%s\n%s\n```\n\n", r.DoExample.Language, r.DoExample.Code))
-		}
-		if r.DontExample != nil {
-			b.WriteString(fmt.Sprintf("**Don't:**\n```%s\n%s\n```\n\n", r.DontExample.Language, r.DontExample.Code))
-		}
 		b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
 	}
 
@@ -104,6 +94,59 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 		return err
 	}
 	return atomicWrite(filepath.Join(skillDir, "SKILL.md"), b.String())
+}
+
+// renderExamples writes do/don't example pairs (up to maxPairs) before rule prose.
+// Prefers DoExamples/DontExamples (plural); falls back to DoExample/DontExample for
+// rules created before plural support was added.
+func renderExamples(b *strings.Builder, r state.Rule, maxPairs int) {
+	dos := effectiveDoExamples(r)
+	donts := effectiveDontExamples(r)
+
+	if len(dos) == 0 && len(donts) == 0 {
+		return
+	}
+
+	n := len(dos)
+	if len(donts) > n {
+		n = len(donts)
+	}
+	if n > maxPairs {
+		n = maxPairs
+	}
+
+	for i := 0; i < n; i++ {
+		if i < len(dos) {
+			b.WriteString(fmt.Sprintf("**Do:**\n```%s\n%s\n```\n", dos[i].Language, dos[i].Code))
+			if dos[i].FileRef != "" {
+				b.WriteString(fmt.Sprintf("_Real instance: see %s_\n", dos[i].FileRef))
+			}
+			b.WriteString("\n")
+		}
+		if i < len(donts) {
+			b.WriteString(fmt.Sprintf("**Don't:**\n```%s\n%s\n```\n\n", donts[i].Language, donts[i].Code))
+		}
+	}
+}
+
+func effectiveDoExamples(r state.Rule) []state.Example {
+	if len(r.DoExamples) > 0 {
+		return r.DoExamples
+	}
+	if r.DoExample != nil {
+		return []state.Example{*r.DoExample}
+	}
+	return nil
+}
+
+func effectiveDontExamples(r state.Rule) []state.Example {
+	if len(r.DontExamples) > 0 {
+		return r.DontExamples
+	}
+	if r.DontExample != nil {
+		return []state.Example{*r.DontExample}
+	}
+	return nil
 }
 
 // approvedRules returns approved rules for a given target location,

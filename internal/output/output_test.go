@@ -220,6 +220,131 @@ func TestWriteCLAUDEMDWithExamples(t *testing.T) {
 	}
 }
 
+func TestWriteCLAUDEMDExamplesBeforeRuleProse(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "CLAUDE.md", "established", 1)
+	r.DoExample = &state.Example{Code: "errors.As(err, &target)", Language: "go"}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
+	examplePos := strings.Index(content, "errors.As(err, &target)")
+	rulePos := strings.Index(content, "Always use errors.As for type checking")
+	if examplePos == -1 || rulePos == -1 {
+		t.Fatal("both example and rule prose should be present")
+	}
+	if examplePos > rulePos {
+		t.Error("examples should appear before rule prose")
+	}
+}
+
+func TestWriteCLAUDEMDPluralExamples(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
+	r.DoExamples = []state.Example{
+		{Code: "errors.As(err, &target)", Language: "go"},
+		{Code: "errors.As(err, &myErr)", Language: "go"},
+	}
+	r.DontExamples = []state.Example{
+		{Code: "err.(*MyErr)", Language: "go"},
+	}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
+	// CLAUDE.md caps at 1 pair; only first do example should appear
+	if !strings.Contains(content, "errors.As(err, &target)") {
+		t.Error("first do example missing")
+	}
+	// second do example should NOT appear in CLAUDE.md (capped at 1 pair)
+	if strings.Contains(content, "errors.As(err, &myErr)") {
+		t.Error("second do example should not appear in CLAUDE.md (max 1 pair)")
+	}
+}
+
+func TestWriteSkillFilePluralExamplesUpToThree(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	r.DoExamples = []state.Example{
+		{Code: "example one code", Language: "go"},
+		{Code: "example two code", Language: "go"},
+		{Code: "example three code", Language: "go"},
+		{Code: "example four code", Language: "go"}, // should be excluded (cap=3)
+	}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	for _, ex := range []string{"example one code", "example two code", "example three code"} {
+		if !strings.Contains(content, ex) {
+			t.Errorf("expected %q in skill file", ex)
+		}
+	}
+	if strings.Contains(content, "example four code") {
+		t.Error("fourth example should be excluded (cap=3)")
+	}
+}
+
+func TestWriteSkillFilePluralExamplesBeforeRuleProse(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "api", "established", 1)
+	r.DoExamples = []state.Example{{Code: "errors.As(err, &target)", Language: "go"}}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	examplePos := strings.Index(content, "errors.As(err, &target)")
+	rulePos := strings.Index(content, "Always use errors.As for type checking")
+	if examplePos == -1 || rulePos == -1 {
+		t.Fatal("both example and rule prose should be present")
+	}
+	if examplePos > rulePos {
+		t.Error("examples should appear before rule prose in skill file")
+	}
+}
+
+func TestWriteSkillFileFileRef(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
+	r.DoExamples = []state.Example{
+		{Code: "errors.As(err, &target)", Language: "go", FileRef: "internal/api/handler.go:L42"},
+	}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "internal/api/handler.go:L42") {
+		t.Error("FileRef should appear in skill file output")
+	}
+	if !strings.Contains(content, "Real instance: see") {
+		t.Error("FileRef label should appear")
+	}
+}
+
+func TestPluralExamplesFallsBackToSingular(t *testing.T) {
+	dir := t.TempDir()
+	// Rule with only singular examples (backward compat)
+	r := approvedRule("Old rule", "old rule text", "api", "established", 1)
+	r.DoExample = &state.Example{Code: "singular do code", Language: "go"}
+	r.DontExample = &state.Example{Code: "singular dont code", Language: "go"}
+	if err := Write(stateWith(r), dir); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "singular do code") {
+		t.Error("singular do example should appear via fallback")
+	}
+	if !strings.Contains(content, "singular dont code") {
+		t.Error("singular dont example should appear via fallback")
+	}
+}
+
 // Skill file tests
 
 func TestWriteSkillFileCreated(t *testing.T) {

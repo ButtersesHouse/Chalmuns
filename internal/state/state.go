@@ -44,12 +44,14 @@ type Stats struct {
 }
 
 type Rule struct {
-	ID           string   `json:"id"`
-	Title        string   `json:"title"`
-	Rule         string   `json:"rule"`
-	DoExample    *Example `json:"do_example,omitempty"`
-	DontExample  *Example `json:"dont_example,omitempty"`
-	Target       Target   `json:"target"`
+	ID           string    `json:"id"`
+	Title        string    `json:"title"`
+	Rule         string    `json:"rule"`
+	DoExample    *Example  `json:"do_example,omitempty"`
+	DontExample  *Example  `json:"dont_example,omitempty"`
+	DoExamples   []Example `json:"do_examples,omitempty"`
+	DontExamples []Example `json:"dont_examples,omitempty"`
+	Target       Target    `json:"target"`
 	Confidence   string   `json:"confidence"`
 	SignalCount  int      `json:"signal_count"`
 	Sources      []Signal `json:"sources"`
@@ -64,6 +66,8 @@ type Rule struct {
 type Example struct {
 	Code     string `json:"code"`
 	Language string `json:"language"`
+	FileRef  string `json:"file_ref,omitempty"` // "path/to/file.go:L45" — set by write-outputs
+	Context  string `json:"context,omitempty"`  // surrounding function context from suggestion blocks
 }
 
 // Target.Location is either "CLAUDE.md" or a skill domain name (e.g. "api", "auth").

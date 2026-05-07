@@ -175,6 +175,49 @@ func TestWriteIDUniqueness(t *testing.T) {
 	}
 }
 
+func TestRoundTripPluralExamples(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Rules = []Rule{
+		{
+			Title:      "Use errors.As",
+			Rule:       "Use errors.As for type-checking errors",
+			Confidence: "established",
+			Status:     "approved",
+			DoExamples: []Example{
+				{Code: "errors.As(err, &target)", Language: "go", FileRef: "internal/foo.go:L10"},
+				{Code: "errors.As(err, &myErr)", Language: "go", Context: "surrounding function context"},
+			},
+			DontExamples: []Example{
+				{Code: "err.(*MyErr)", Language: "go"},
+			},
+			Target: Target{Location: "api"},
+		},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Rules[0].DoExamples) != 2 {
+		t.Errorf("expected 2 do_examples, got %d", len(out.Rules[0].DoExamples))
+	}
+	if out.Rules[0].DoExamples[0].FileRef != "internal/foo.go:L10" {
+		t.Errorf("file_ref not preserved: %q", out.Rules[0].DoExamples[0].FileRef)
+	}
+	if out.Rules[0].DoExamples[1].Context != "surrounding function context" {
+		t.Errorf("context not preserved: %q", out.Rules[0].DoExamples[1].Context)
+	}
+	if len(out.Rules[0].DontExamples) != 1 {
+		t.Errorf("expected 1 dont_example, got %d", len(out.Rules[0].DontExamples))
+	}
+}
+
 func TestReadInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
