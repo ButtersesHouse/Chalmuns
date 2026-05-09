@@ -191,17 +191,12 @@ New candidates get `status: "proposed"`. IDs will be assigned by `state-write` i
 
 ---
 
-### Step 9: Threshold filter
+### Step 9: Confidence assignment
 
-From new candidates, keep only those with:
-- 3+ distinct PR numbers in `sources`, OR
-- 2+ distinct reviewers in `sources`
-
-Assign confidence:
+Assign confidence to new candidates:
 - `established`: 5+ signals total
 - `emerging`: 3–4 signals total
-
-Discard candidates below threshold.
+- `proposed`: fewer than 3 signals total
 
 ---
 
