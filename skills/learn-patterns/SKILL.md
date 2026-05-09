@@ -316,15 +316,10 @@ Keep unconditionally regardless of occurrence count. Assign confidence:
 - `"stated"` — 1–2 signals total (explicitly declared preference, fewer occurrences)
 
 **Implicit candidates** — all sources have `strength: "implicit"` (or empty):
-Keep only if:
-- 3+ distinct PR numbers in `sources`, OR
-- 2+ distinct reviewers in `sources`
-
-Assign confidence:
+Keep unconditionally. Assign confidence:
 - `"established"` — 5+ signals total
 - `"emerging"` — 3–4 signals total
-
-Discard implicit candidates below threshold.
+- `"emerging"` — 1–2 signals total (single silent correction; surface for human review)
 
 **Recency downgrade for old-only implicit signals**: After the threshold check above, apply to implicit candidates that passed:
 - Compute `max_pr(candidate)` = highest PR number across the candidate's sources.
