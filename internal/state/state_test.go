@@ -218,6 +218,70 @@ func TestRoundTripPluralExamples(t *testing.T) {
 	}
 }
 
+func TestRoundTripReviewedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Rules = []Rule{
+		{
+			Title:      "Use context.WithTimeout",
+			Rule:       "Prefer context.WithTimeout over context.Background",
+			Status:     "proposed",
+			Confidence: "emerging",
+			ReviewedSnapshot: &ReviewedSnapshot{
+				SignalCount:     2,
+				SourcePRNumbers: []int{42, 67},
+			},
+		},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := out.Rules[0].ReviewedSnapshot
+	if snap == nil {
+		t.Fatal("reviewed_snapshot was nil after round-trip — field missing from Rule struct causes state-write to drop it")
+	}
+	if snap.SignalCount != 2 {
+		t.Errorf("signal_count: want 2, got %d", snap.SignalCount)
+	}
+	if len(snap.SourcePRNumbers) != 2 || snap.SourcePRNumbers[0] != 42 || snap.SourcePRNumbers[1] != 67 {
+		t.Errorf("source_pr_numbers: want [42 67], got %v", snap.SourcePRNumbers)
+	}
+}
+
+func TestRoundTripConflicted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Rules = []Rule{
+		{
+			Title:      "conflicted rule",
+			Rule:       "...",
+			Status:     "proposed",
+			Confidence: "emerging",
+			Conflicted: true,
+		},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Rules[0].Conflicted {
+		t.Error("conflicted field was not persisted through state-write")
+	}
+}
+
 func TestReadInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")

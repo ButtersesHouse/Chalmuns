@@ -142,15 +142,21 @@ Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` fo
 
 For each batch of up to 20 PR numbers:
 1. Read each `.claude/pattern-learner/raw-cache/pr-N.json`.
-2. **Preprocess the raw data into a lean view before sending to the subagent.** Sending the full PR JSON wastes context on diffs, file changes, labels, and PR descriptions that are noise for pattern extraction. From each PR's `raw` field, extract only:
+2. **Preprocess the raw data into a lean view** by running the `extract-lean` subcommand. This deterministically parses `code_before` from each review comment's `diff_hunk`, computes `is_pr_author`, and drops all noise fields:
+
+   ```
+   $BIN extract-lean --cache-dir .claude/pattern-learner/raw-cache --prs <comma-separated batch PR numbers>
+   ```
+
+   The output is a JSON array of lean PR views ready to insert into the subagent prompt. The lean view schema (for reference — do not reconstruct it by hand):
    ```json
    {
      "pr_number": 42,
-     "files_touched": ["internal/api/handlers/users.go", "..."],
+     "files_touched": ["internal/api/handlers/users.go"],
      "comments": [
        {
          "id": 12345,
-         "user": "alice",
+         "user": "bob",
          "is_pr_author": false,
          "created_at": "2024-01-15T...",
          "in_reply_to_id": null,
@@ -158,23 +164,12 @@ For each batch of up to 20 PR numbers:
          "path": "internal/api/handlers/users.go",
          "body": "Could we use context.WithTimeout here?",
          "code_before": "ctx := context.Background()"
-       },
-       ...
+       }
      ]
    }
    ```
-   - `is_pr_author`: true when the comment author equals the PR author. Used by the subagent to detect author acknowledgment vs reviewer feedback.
-   - `type`: one of `review_comment`, `issue_comment`, `review_body`.
-   - `path`: file path for review comments; null for issue comments and review bodies.
-   - `code_before`: **for `review_comment` type only** — extract from the comment's `diff_hunk` field. The `diff_hunk` is a unified diff snippet; take only the lines beginning with `-` (old/removed lines) or context lines (no prefix) that are adjacent to the change. Strip the leading `-` character. This gives the exact code the reviewer was looking at when they made the comment — it is the natural `dont_example` for any rule extracted from that comment. If `diff_hunk` is absent or empty, omit `code_before`.
 
-   **Pass `code_before` (already extracted) to the subagent, NOT the raw `diff_hunk`.** The diff syntax (`-`/`+` prefixes, `@@` headers, surrounding context lines) is noise that degrades example quality and wastes tokens. Extraction must happen here in preprocessing, not inside the subagent.
-
-   - Drop position info, blob URLs, reactions, and any field not listed above.
-
-   Concatenate the lean views into a single JSON array per batch.
-
-3. Launch a subagent with this exact prompt (fill in the lean PR data at the end):
+3. Launch a subagent with this exact prompt (fill in the `extract-lean` output at the end):
 
 ---
 **SUBAGENT PROMPT:**
@@ -280,21 +275,25 @@ Collect all signals returned by all subagent runs.
 
 ### Step 7: Grounding verification
 
-For each signal returned in Step 6:
-1. **Snippet length check**: if `raw_signal.snippet` (after trimming whitespace) is fewer than 20 characters, discard the signal — short fragments substring-match too easily and provide no real provenance. Count as dropped.
-2. Open `.claude/pattern-learner/raw-cache/pr-<raw_signal.pr_number>.json`.
-3. Normalize both the cached file content and `raw_signal.snippet` for comparison: lowercase both, then collapse runs of whitespace (spaces, tabs, newlines) into single spaces. This tolerates minor formatting differences like wrapped lines or escaped newlines without admitting genuine paraphrases.
-4. Check whether the normalized snippet appears as a substring of the normalized file content.
-5. If the snippet is NOT found: **discard the signal**. Count it as dropped.
-6. If found: keep the signal.
+Pipe the signals array from Step 6 through the `verify-grounding` subcommand:
 
-Track: total signals extracted, signals dropped by grounding check (broken down by reason: too-short vs not-found).
+```
+cat signals.json | $BIN verify-grounding --cache-dir .claude/pattern-learner/raw-cache
+```
+
+The tool enforces:
+- **≥20-char minimum** (trimmed rune count): short fragments substring-match too easily and provide no real provenance.
+- **Normalized substring match**: lowercases both snippet and cached file content, collapses whitespace runs to single spaces, then checks containment. Tolerates minor formatting differences without admitting genuine paraphrases.
+
+Output shape: `{"kept": [...signals...], "stats": {"too_short": N, "not_found": N, "kept": N}}`.
+
+Read `stats.too_short` and `stats.not_found` for the Step 13 summary. Use `kept` as the verified signals array for Step 8.
 
 ---
 
 ### Step 8: Deduplicate, normalize, and aggregate
 
-In a single reasoning pass over all verified signals and the current state from Step 4:
+Run semantic dedup in domain-sharded reasoning passes over the verified signals and the current state from Step 4. For small signal sets (under ~100 signals from a single domain) a single reasoning pass is fine. For larger sets, shard by `suggested_target.location` and run one reasoning pass per domain shard to prevent context overload — then combine the per-shard candidates for Steps 8C–D. The sharding threshold is a practical concern, not a correctness one; the output of each approach is the same candidates list.
 
 **A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit. Also merge their `do_examples` and `dont_examples` arrays: deduplicate by code content (exact string match after trimming whitespace), then cap each array at 4 entries. The result is a richer set of real examples accumulated across multiple PRs that all express the same convention.
 
@@ -308,7 +307,7 @@ For each pair of candidates that are semantically contradictory:
 - Compute `max_pr(X)` = highest PR number across candidate X's `sources`; same for Y.
 - The candidate with the **higher** `max_pr` is the current convention (winner). The other is the outdated convention (loser).
 - Discard the loser as a standalone candidate. Attach a `prior_convention` note to the winner: `{title: loser.title, min_pr: min(loser.sources[].pr_number), max_pr: max(loser.sources[].pr_number)}`. This note is used in the Step 10 approval display only — it is NOT written to state.
-- If both candidates' `max_pr` values are within 5 of each other (genuine ambiguity — the team may have been actively debating the convention), keep both as proposals and tag each with `[CONFLICT]` in the approval UI rather than discarding either.
+- If both candidates' `max_pr` values are within 5 of each other (genuine ambiguity — the team may have been actively debating the convention), keep both as proposals and set `conflicted: true` on each. This field is persisted to state so that it survives `--auto` deferral and re-surfaces correctly in a subsequent `--review` run. The approval UI displays a `[CONFLICT]` marker for rules with `conflicted: true`.
 
 **B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
 
@@ -327,46 +326,36 @@ New candidates get `status: "proposed"`. IDs will be assigned by `state-write` i
 
 ### Step 9: Signal threshold and confidence
 
-Apply rules based on signal strength:
+Pipe the deduplicated candidates from Step 8 through the `classify` subcommand:
 
-**Explicit candidates** — at least one source has `strength: "explicit"`:
-Keep unconditionally regardless of occurrence count. Assign confidence:
-- `"established"` — 3+ signals total
-- `"stated"` — 1–2 signals total (explicitly declared preference, fewer occurrences)
+```
+cat candidates.json | $BIN classify --max-pr-seen <max_pr_seen> --since-pr <since_pr>
+```
 
-**Implicit candidates** — all sources have `strength: "implicit"` (or empty):
-Keep unconditionally. Assign confidence:
-- `"established"` — 5+ signals total
-- `"emerging"` — 3–4 signals total
-- `"emerging"` — 1–2 signals total (single silent correction; surface for human review)
+The tool applies the strength-aware confidence rules and recency downgrade:
 
-**Recency downgrade for old-only implicit signals**: After the threshold check above, apply to implicit candidates that passed:
-- Compute `max_pr(candidate)` = highest PR number across the candidate's sources.
-- Compute `recency_cutoff` = `max_pr_seen` − ((max_pr_seen − since_pr) × 0.5). This is the midpoint of the scanned PR range — signals from the bottom half of the range are old enough to question.
-- If `max_pr(candidate) < recency_cutoff` AND the candidate has no explicit source: downgrade confidence one tier:
-  - `"established"` → `"emerging"`
-  - `"emerging"` → discard (treat as below threshold)
+- **Explicit** (any source `strength: "explicit"`): `"established"` (3+ signals) or `"stated"` (1–2 signals). Kept unconditionally — a stated preference does not expire.
+- **Implicit** (all sources implicit or empty): `"established"` (5+) or `"emerging"` (1–4). Recency downgrade: if the candidate's most-recent source PR is below the midpoint of the scanned range (`max_pr_seen − (max_pr_seen − since_pr) × 0.5`) the confidence is downgraded one tier (`established` → `emerging`; `emerging` → dropped).
 
-Rationale: an implicit pattern seen only in old PRs may have been quietly resolved. If it truly persists, recent PRs would show it too. Explicit signals are exempt — a stated preference doesn't expire just because it wasn't re-stated recently.
+`signal_count` is authoritatively set to `len(sources)` by the tool, ending manual drift.
+
+Output: `{"kept": [...candidates with confidence set...], "dropped": N}`. Use `kept` as input to Step 10.
 
 ---
 
 ### Step 10: Approval UI
 
-**If `IS_AUTO` is true**, skip the interactive loop entirely and apply this automatic pass instead:
+**If `IS_AUTO` is true**, skip the interactive loop entirely and use the `triage` subcommand instead:
 
-For each proposed rule (new candidates + any `status: "proposed"` rules from prior runs), evaluate in order — the first matching condition wins:
+1. Extract all `status: "proposed"` rules from the state into `proposed.json`.
+2. Run:
+   ```
+   cat proposed.json | $BIN triage --mode auto [--auto-threshold]
+   ```
+   The tool applies the ordered predicate and returns the same rules with `status` patched to `"approved"` or left as `"proposed"` (deferred). Defer conditions (first match wins): `supersedes` non-empty → defer; `conflicted: true` → defer; `signal_count == 1` AND all sources implicit AND NOT `--auto-threshold` → defer. Otherwise → approve.
+3. Replace the proposed rules in the state with the triage output.
 
-1. **Auto-defer** (leave `status: "proposed"`) if ANY of:
-   - `supersedes` is non-empty (supersessions need human judgment — auto-approving could silently replace an established rule)
-   - the rule is tagged `[CONFLICT]` (genuine ambiguity between contradicting candidates)
-   - `IS_AUTO_THRESHOLD` is false AND `signal_count == 1` AND all sources are `strength: "implicit"` (a single silent correction; surface for human review before codifying as a rule)
-
-2. **Auto-approve** (set `status: "approved"`) if none of the above apply AND the rule passed Step 9 threshold.
-
-Skip the confirmation prompt ("Proceed to write state? [y/n]"). Proceed automatically to Step 11 if any rules were approved; if zero rules were approved (all deferred), print a note and continue to Step 11 anyway to persist the deferred rules.
-
-Print a single summary line:
+Skip the confirmation prompt. Proceed automatically to Step 11. Print a single summary line:
 ```
 Auto-approved: <N> rules  |  Deferred for review: <N> (run /learn-patterns --review to decide)
 ```
@@ -381,21 +370,23 @@ Then continue directly to Step 11.
 
 Group by target: `CLAUDE.md` rules first, then alphabetically by domain.
 
-**Emerging rule unchanged filter** (applies before the display loop, unless `IS_SHOW_ALL` is true):
+**Emerging rule unchanged filter** (run before the display loop):
 
-A proposed rule is "unchanged emerging" when ALL of the following hold:
-- `confidence == "emerging"`
-- the rule has a `reviewed_snapshot` field (set by a previous `s` action)
-- `signal_count` equals `reviewed_snapshot.signal_count`
-- the sorted list of source PR numbers equals `reviewed_snapshot.source_pr_numbers`
+```
+cat proposed.json | $BIN triage --mode review-filter [--all]
+```
 
-Suppress unchanged emerging rules from the display loop — the user already decided to defer them and nothing new has arrived. If any are suppressed, print before the loop begins:
+The tool compares each emerging rule's current `signal_count` and sorted source PR numbers against its `reviewed_snapshot` (set by a previous `s` action). Rules where both match are "unchanged" and suppressed — the user already saw them and nothing new has arrived. Pass `--all` when `IS_SHOW_ALL` is true.
+
+Output: `{"show": [...rules to display...], "suppressed": N, "suppressed_ids": [...]}`.
+
+If `suppressed > 0`, print before the loop:
 ```
 Skipping <N> unchanged emerging rule(s) (previously reviewed, no new signals).
 Run /learn-patterns --review --all to force-show all.
 ```
 
-All other proposed rules (new, updated emerging, non-emerging) display as normal.
+Display only the rules in `show`.
 
 For each rule, display:
 
@@ -408,7 +399,7 @@ Confidence: <stated (explicit preference) | established | emerging> (<N> signals
    ↳ This convention: PRs #<min_new>–<max_new> (<N_new> signals)
    ↳ Replaces:        PRs #<min_old>–<max_old> (<N_old> signals)]
 [Prior convention (same run, older PRs #<min>–<max>): "<title>"   ← only when prior_convention note from Step 8A-cross is present]
-[CONFLICT: contradicts another candidate from overlapping PR range — review both] ← only when tagged [CONFLICT] in Step 8A-cross
+[CONFLICT: contradicts another candidate from overlapping PR range — review both] ← only when rule.conflicted == true
 
 Convention:
   <rule text>
@@ -450,7 +441,7 @@ Wait for confirmation before continuing to Step 11. If `n`, exit without modifyi
 
 Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
-- `reviewed_snapshot` per rule: persist the snapshot set by the `s` action (`{signal_count, source_pr_numbers}`). Clear it when a rule is approved or rejected (it's no longer needed). Do NOT clear it on `e` (edit) — the snapshot tracks signal state, not rule text, so editing doesn't reset the "already reviewed" watermark.
+- `reviewed_snapshot` and `conflicted` per rule: both fields are part of the `Rule` struct and round-trip through `state-write` automatically. `reviewed_snapshot` is set by the `s` action and cleared on approve/reject (not on edit). `conflicted` is set by Step 8A-cross and cleared when the user resolves the conflict during review.
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
 - Updated `last_run`, `repo`, `stats`
 - Rules with `status: "rejected"` should also appear in `rejected_signals` with their rule text preserved for future matching
@@ -473,7 +464,7 @@ Then pipe it to state-write:
 cat .claude/pattern-learner/state-pending.json | $BIN state-write --state .claude/pattern-learner/state.json
 ```
 
-The binary assigns UUIDs to new rules and writes atomically. Delete `state-pending.json` after a successful write.
+The binary assigns `rule_<hex>` IDs to new rules and writes atomically. Delete `state-pending.json` after a successful write.
 
 ---
 
@@ -610,7 +601,7 @@ Read each extracted candidate and construct a candidate rule:
 - `do_examples`: from cursor-agent output (already include FileRef and Context)
 - `dont_examples`: from cursor-agent output
 - `target`: `{location: domain, file_glob: globs}`
-- `confidence`: map cursor-agent confidence → rule confidence: `"high"` → `"established"`, `"medium"` → `"emerging"`, `"low"` → `"stated"`
+- `confidence`: map cursor-agent confidence → rule confidence: `"high"` → `"established"`, `"medium"` → `"emerging"`, `"low"` → `"emerging"` (a single observed instance, not a stated preference — treat with the same human-review level as implicit emerging rules)
 - `sources`: `[]` (empty — no PR source; codebase-derived)
 - `signal_count`: 1
 - `strength`: `"explicit"` (AI-curated from real code; treat as authoritative)

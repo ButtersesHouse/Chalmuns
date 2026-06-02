@@ -52,15 +52,32 @@ type Rule struct {
 	DoExamples   []Example `json:"do_examples,omitempty"`
 	DontExamples []Example `json:"dont_examples,omitempty"`
 	Target       Target    `json:"target"`
-	Confidence   string   `json:"confidence"`
-	SignalCount  int      `json:"signal_count"`
-	Sources      []Signal `json:"sources"`
-	Status       string   `json:"status"`
-	Supersedes   []string `json:"supersedes,omitempty"`
-	SupersededBy *string  `json:"superseded_by,omitempty"`
-	CreatedAt    string   `json:"created_at"`
-	UpdatedAt    string   `json:"updated_at"`
-	LastSeenPR   int      `json:"last_seen_pr"`
+	Confidence   string    `json:"confidence"`
+	SignalCount  int       `json:"signal_count"`
+	Sources      []Signal  `json:"sources"`
+	Status       string    `json:"status"`
+	Supersedes   []string  `json:"supersedes,omitempty"`
+	SupersededBy *string   `json:"superseded_by,omitempty"`
+	// Conflicted is set when cross-batch contradiction detection finds two
+	// candidates from overlapping PR ranges that contradict each other.
+	// Persisted through state-write so it survives --auto deferral and
+	// re-surfaces correctly in --review mode.
+	Conflicted       bool              `json:"conflicted,omitempty"`
+	// ReviewedSnapshot records signal state at the time the user pressed 's'
+	// (skip/defer). Used by 'triage --mode review-filter' to suppress unchanged
+	// emerging rules on subsequent runs. Cleared on approve or reject.
+	ReviewedSnapshot *ReviewedSnapshot `json:"reviewed_snapshot,omitempty"`
+	CreatedAt    string    `json:"created_at"`
+	UpdatedAt    string    `json:"updated_at"`
+	LastSeenPR   int       `json:"last_seen_pr"`
+}
+
+// ReviewedSnapshot records the signal state at the time a user last skipped an
+// emerging rule. An emerging rule is suppressed from the review loop when its
+// current signal_count and sorted source PR numbers exactly match the snapshot.
+type ReviewedSnapshot struct {
+	SignalCount     int   `json:"signal_count"`
+	SourcePRNumbers []int `json:"source_pr_numbers"`
 }
 
 type Example struct {
