@@ -1,7 +1,7 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching, --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent.
-argumentHint: "[--refresh | --review | --auto [--refresh] [--auto-threshold] | --discover [domain ...]]"
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent.
+argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...]]"
 ---
 
 # learn-patterns
@@ -21,10 +21,11 @@ Parse `$ARGUMENTS`:
 - `--review` → approval-only mode: skip all fetching, go straight to Step 10
 - `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. Supersessions, conflicts, and single-implicit singletons are auto-deferred for human review. `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
 - `--auto-threshold` → modifier for `--auto` only: also auto-approve single-implicit singletons that would normally be deferred. Has no effect without `--auto`.
+- `--all` → modifier for `--review` only: force-show all proposed emerging rules in the approval loop, including ones the user previously skipped that have not received new signals since. Has no effect without `--review`.
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
 - (nothing) → full mode: fetch all merged PRs
 
-Store `IS_AUTO` = true when `--auto` is present. Store `IS_AUTO_THRESHOLD` = true when `--auto-threshold` is present (only meaningful with `IS_AUTO`).
+Store `IS_AUTO` = true when `--auto` is present. Store `IS_AUTO_THRESHOLD` = true when `--auto-threshold` is present (only meaningful with `IS_AUTO`). Store `IS_SHOW_ALL` = true when `--all` is present (only meaningful with `--review`).
 
 If `--discover` is set, jump to the **Discover Mode** section after Step 4.
 
@@ -380,6 +381,22 @@ Then continue directly to Step 11.
 
 Group by target: `CLAUDE.md` rules first, then alphabetically by domain.
 
+**Emerging rule unchanged filter** (applies before the display loop, unless `IS_SHOW_ALL` is true):
+
+A proposed rule is "unchanged emerging" when ALL of the following hold:
+- `confidence == "emerging"`
+- the rule has a `reviewed_snapshot` field (set by a previous `s` action)
+- `signal_count` equals `reviewed_snapshot.signal_count`
+- the sorted list of source PR numbers equals `reviewed_snapshot.source_pr_numbers`
+
+Suppress unchanged emerging rules from the display loop — the user already decided to defer them and nothing new has arrived. If any are suppressed, print before the loop begins:
+```
+Skipping <N> unchanged emerging rule(s) (previously reviewed, no new signals).
+Run /learn-patterns --review --all to force-show all.
+```
+
+All other proposed rules (new, updated emerging, non-emerging) display as normal.
+
 For each rule, display:
 
 ```
@@ -416,10 +433,10 @@ Evidence:
 For the supersession block: `min_new`/`max_new` = min/max PR numbers from the current rule's sources; `min_old`/`max_old` = min/max PR numbers from the superseded rule's sources (look it up in state). This makes the temporal relationship visible at decision time — the reviewer can see at a glance which convention is newer and by how many PRs.
 
 Wait for user input per rule:
-- `a` → set `status: "approved"`. If the rule has non-empty `supersedes`, also set the superseded rule's `status: "superseded"` and `superseded_by: "<this_rule_id>"` (the binary will fill `<this_rule_id>` at write time if not yet assigned — pass the rule's index for now).
-- `r` → set `status: "rejected"`; this rule will move to `rejected_signals` in state
+- `a` → set `status: "approved"`; clear `reviewed_snapshot`. If the rule has non-empty `supersedes`, also set the superseded rule's `status: "superseded"` and `superseded_by: "<this_rule_id>"` (the binary will fill `<this_rule_id>` at write time if not yet assigned — pass the rule's index for now).
+- `r` → set `status: "rejected"`; clear `reviewed_snapshot`; this rule will move to `rejected_signals` in state
 - `e` → prompt user to edit title, rule text, or examples inline; re-display updated rule for confirmation
-- `s` → leave as `status: "proposed"` (will appear again on next `--review`)
+- `s` → leave as `status: "proposed"` and save a review snapshot: `reviewed_snapshot = {signal_count: <current signal_count>, source_pr_numbers: <sorted list of PR numbers from sources>}`. On the next run the rule will be suppressed unless new signals arrive (i.e. signal_count increases or new PR numbers are added to sources).
 
 After all rules are reviewed, display a summary of decisions:
 ```
@@ -433,6 +450,7 @@ Wait for confirmation before continuing to Step 11. If `n`, exit without modifyi
 
 Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
+- `reviewed_snapshot` per rule: persist the snapshot set by the `s` action (`{signal_count, source_pr_numbers}`). Clear it when a rule is approved or rejected (it's no longer needed). Do NOT clear it on `e` (edit) — the snapshot tracks signal state, not rule text, so editing doesn't reset the "already reviewed" watermark.
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
 - Updated `last_run`, `repo`, `stats`
 - Rules with `status: "rejected"` should also appear in `rejected_signals` with their rule text preserved for future matching
