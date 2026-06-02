@@ -1,7 +1,7 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching, --auto to run without any interactive approval, --discover to find patterns directly from the codebase using cursor-agent.
-argumentHint: "[--refresh | --review | --auto [--refresh] | --discover [domain ...]]"
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching, --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent.
+argumentHint: "[--refresh | --review | --auto [--refresh] [--auto-threshold] | --discover [domain ...]]"
 ---
 
 # learn-patterns
@@ -19,11 +19,12 @@ Follow all steps in order. Do not skip steps unless the mode explicitly says to.
 Parse `$ARGUMENTS`:
 - `--refresh` → incremental mode: only fetch PRs newer than last run
 - `--review` → approval-only mode: skip all fetching, go straight to Step 10
-- `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
+- `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. Supersessions, conflicts, and single-implicit singletons are auto-deferred for human review. `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
+- `--auto-threshold` → modifier for `--auto` only: also auto-approve single-implicit singletons that would normally be deferred. Has no effect without `--auto`.
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
 - (nothing) → full mode: fetch all merged PRs
 
-Store `IS_AUTO` = true when `--auto` is present.
+Store `IS_AUTO` = true when `--auto` is present. Store `IS_AUTO_THRESHOLD` = true when `--auto-threshold` is present (only meaningful with `IS_AUTO`).
 
 If `--discover` is set, jump to the **Discover Mode** section after Step 4.
 
@@ -128,6 +129,12 @@ Keep PRs where `merged_at != null` AND `number > since_pr`. Stop when an entire 
 
 Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` forward to Step 11.
 
+> **Large repo note** (1,000+ merged PRs): one-at-a-time MCP calls will be slow. A bulk-fetch script using `gh api --paginate` is a supported alternative. It must write the same cache format:
+> ```json
+> { "pr_number": N, "comment_sources": {"review_comments": <count>, "issue_comments": <count>, "review_bodies": <count>}, "raw": <full PR data> }
+> ```
+> The cache contract is identical; Steps 6–13 are unaffected regardless of how the cache was populated. Parallelize with `xargs -P8` or similar. Output must follow the `.claude/pattern-learner/raw-cache/pr-N.json` naming convention.
+
 ---
 
 ### Step 6: Extract signals via subagents
@@ -159,6 +166,9 @@ For each batch of up to 20 PR numbers:
    - `type`: one of `review_comment`, `issue_comment`, `review_body`.
    - `path`: file path for review comments; null for issue comments and review bodies.
    - `code_before`: **for `review_comment` type only** — extract from the comment's `diff_hunk` field. The `diff_hunk` is a unified diff snippet; take only the lines beginning with `-` (old/removed lines) or context lines (no prefix) that are adjacent to the change. Strip the leading `-` character. This gives the exact code the reviewer was looking at when they made the comment — it is the natural `dont_example` for any rule extracted from that comment. If `diff_hunk` is absent or empty, omit `code_before`.
+
+   **Pass `code_before` (already extracted) to the subagent, NOT the raw `diff_hunk`.** The diff syntax (`-`/`+` prefixes, `@@` headers, surrounding context lines) is noise that degrades example quality and wastes tokens. Extraction must happen here in preprocessing, not inside the subagent.
+
    - Drop position info, blob URLs, reactions, and any field not listed above.
 
    Concatenate the lean views into a single JSON array per batch.
@@ -243,6 +253,8 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 `snippet`: the reviewer's exact verbatim words. Do not paraphrase. If you cannot quote the reviewer directly supporting the rule, omit the signal entirely. For code-suggestion signals, the snippet may be the suggested code block itself.
 
+**Rule text provenance (required)**: `title` and `rule` MUST be synthesized from the reviewer's actual words, not from a pre-authored category or taxonomy. If the reviewer wrote "we prefer returning errors as values here, not panicking", the rule should say "Return errors as values; do not panic for expected error cases" — not a generic error-handling rule invented by the subagent. A reviewer must be able to read the rule and recognize their own feedback. Rules that are disconnected from reviewer language are fabricated — discard them and omit the signal.
+
 `do_examples` / `dont_examples`: arrays — include all examples available. Use this priority order for sourcing them:
 
 1. **Priority 0 suggestion blocks**: `dont_examples[0].code` = original lines replaced; `do_examples[0].code` = suggested replacement. Populate `context` with ±5 lines of surrounding diff context.
@@ -252,7 +264,7 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 A single comment may produce multiple examples; return them all. Omit rather than invent when no example source is available. Use the file paths the PR touched to infer the language.
 
-`suggested_target`: use the file paths the PR touches as a hint. PRs touching only `internal/api/**` should suggest `"location": "api"` rather than `"CLAUDE.md"`. Reserve `"CLAUDE.md"` for project-wide rules that span multiple domains.
+`suggested_target`: use the file paths the PR touches as a hint. Pick the **most specific** domain the PR's file paths suggest — e.g. `"migrations"` not `"database"`, `"mutations"` not `"backend"`, `"workers"` not `"jobs"`. Never use coarse buckets like `"backend"`, `"frontend"`, or `"general"` as a location — always go one level more specific (e.g. `"api"`, `"auth"`, `"models"`, `"migrations"`, `"workers"`, `"components"`, `"hooks"`). Reserve `"CLAUDE.md"` **only** for rules that apply universally regardless of which file is being edited: naming conventions, commit message format, anti-patterns true everywhere in the codebase. When in doubt, prefer a specific domain over `"CLAUDE.md"`.
 
 Output only the JSON array, no other text.
 
@@ -285,6 +297,10 @@ In a single reasoning pass over all verified signals and the current state from 
 
 **A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit. Also merge their `do_examples` and `dont_examples` arrays: deduplicate by code content (exact string match after trimming whitespace), then cap each array at 4 entries. The result is a richer set of real examples accumulated across multiple PRs that all express the same convention.
 
+**Preserve `strength` in every intermediate representation**: when candidates are stored to disk or passed between steps, carry `sources[].strength` through verbatim. Do NOT compute strength from raw count alone or reconstruct it later. Losing `strength` in intermediate storage causes Step 9 to mis-assign confidence — all rules will appear implicit and zero `stated` rules will be emitted. When batches are aggregated across multiple runs, re-merge their `sources` lists preserving each entry's `strength` before applying 8C/8D.
+
+**At scale (300+ signals from multiple batch runs)**: Step 8A is intra-batch only. After all batches complete, collect post-8A candidates and run a second cross-domain dedup pass before Step 8C. For very large signal sets, shard by `suggested_target.location` and run one subagent per domain shard — a narrower scope prevents context overload and produces sharper dedup. Combine each shard's output, then run Steps 8C–D on the unified candidate list.
+
 **A-cross. Cross-batch contradiction detection**: After all batches complete their per-batch 8A pass, collect all post-8A candidates from all batches into one pool and check them against each other for contradictions. This is necessary because Step 8A is intra-batch only — a new convention from recent PRs and the old convention it replaced, extracted from different batches, would otherwise both surface as proposals.
 
 For each pair of candidates that are semantically contradictory:
@@ -294,6 +310,8 @@ For each pair of candidates that are semantically contradictory:
 - If both candidates' `max_pr` values are within 5 of each other (genuine ambiguity — the team may have been actively debating the convention), keep both as proposals and tag each with `[CONFLICT]` in the approval UI rather than discarding either.
 
 **B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
+
+**CLAUDE.md qualification**: a rule belongs in `"CLAUDE.md"` only when it applies to every file in the repository regardless of technology or context — e.g. "no abbreviations in identifiers", "prefix commits with the ticket number", "never log PII". Rules that depend on file path, language, framework, or layer belong in domain skills, even if they appeared across many PRs. Coarse locations like `"backend"`, `"frontend"`, or `"general"` are not valid domain names — re-normalize these to the most specific subdomain the rule's file globs imply. When in doubt between `"CLAUDE.md"` and a domain, choose the domain.
 
 **C. Against existing state rules**: For each candidate:
 - **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text and `status`. Merge the candidate's `do_examples`/`dont_examples` into the existing rule's arrays (deduplicate by code content, cap each at 4). Do NOT create a new rule.
@@ -336,9 +354,14 @@ Rationale: an implicit pattern seen only in old PRs may have been quietly resolv
 
 **If `IS_AUTO` is true**, skip the interactive loop entirely and apply this automatic pass instead:
 
-For each proposed rule (new candidates + any `status: "proposed"` rules from prior runs):
-- **Auto-approve** (set `status: "approved"`) if: the rule passed Step 9 threshold AND `supersedes` is empty AND the rule is NOT tagged `[CONFLICT]`.
-- **Auto-defer** (leave `status: "proposed"`) if: `supersedes` is non-empty (supersessions need human judgment — auto-approving could silently replace an established rule) OR the rule is tagged `[CONFLICT]` (genuine ambiguity between contradicting candidates).
+For each proposed rule (new candidates + any `status: "proposed"` rules from prior runs), evaluate in order — the first matching condition wins:
+
+1. **Auto-defer** (leave `status: "proposed"`) if ANY of:
+   - `supersedes` is non-empty (supersessions need human judgment — auto-approving could silently replace an established rule)
+   - the rule is tagged `[CONFLICT]` (genuine ambiguity between contradicting candidates)
+   - `IS_AUTO_THRESHOLD` is false AND `signal_count == 1` AND all sources are `strength: "implicit"` (a single silent correction; surface for human review before codifying as a rule)
+
+2. **Auto-approve** (set `status: "approved"`) if none of the above apply AND the rule passed Step 9 threshold.
 
 Skip the confirmation prompt ("Proceed to write state? [y/n]"). Proceed automatically to Step 11 if any rules were approved; if zero rules were approved (all deferred), print a note and continue to Step 11 anyway to persist the deferred rules.
 
@@ -350,6 +373,8 @@ Auto-approved: <N> rules  |  Deferred for review: <N> (run /learn-patterns --rev
 Then continue directly to Step 11.
 
 ---
+
+**At scale (50+ proposed rules)**: rules are already grouped by domain — lean into that structure. It is acceptable to approve by confidence tier within a domain ("approve all `established` rules in `api`") rather than reviewing every rule individually. Use `--auto` for large initial runs with no supersessions; reserve the interactive loop for supersession rules and `[CONFLICT]` tags. For first-time runs on large repos, `--auto` + `--refresh` is the recommended path.
 
 **If `IS_AUTO` is false**, present each rule for user decision. Show new candidates first (status: "proposed"), then any existing proposed rules from prior runs.
 
