@@ -1,7 +1,7 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent.
-argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...]]"
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like "add a rule that…", "remember we always/never…", "make a convention that…", "save this as a rule", "let's standardize on…", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule.
+argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text]]"
 ---
 
 # learn-patterns
@@ -46,11 +46,13 @@ Parse `$ARGUMENTS`:
 - `--auto-threshold` → modifier for `--auto` only: also auto-approve single-implicit singletons that would normally be deferred. Has no effect without `--auto`.
 - `--all` → modifier for `--review` only: force-show all proposed emerging rules in the approval loop, including ones the user previously skipped that have not received new signals since. Has no effect without `--review`.
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
+- `--add [rule text]` → manual-add mode: record a single human-authored rule the developer wants to persist (no PR fetching, no cursor-agent). Any text after `--add` is the rule statement; if absent, infer the rule from the user's request in the conversation. `--add` is incompatible with every other mode flag — if combined, abort with: "Error: --add records one manual rule and cannot be combined with other modes."
 - (nothing) → full mode: fetch all merged PRs
 
 Store `IS_AUTO` = true when `--auto` is present. Store `IS_AUTO_THRESHOLD` = true when `--auto-threshold` is present (only meaningful with `IS_AUTO`). Store `IS_SHOW_ALL` = true when `--all` is present (only meaningful with `--review`).
 
 If `--discover` is set, jump to the **Discover Mode** section after Step 4.
+If `--add` is set, jump to the **Add Mode** section after Step 4.
 
 ---
 
@@ -58,7 +60,7 @@ If `--discover` is set, jump to the **Discover Mode** section after Step 4.
 
 **Pre-flight checks** (run first, abort with a clear message on failure):
 - `which go` — Go must be installed to build the binary. If missing, tell the user: "Go (1.21+) is required to build the pattern-learner binary. Install Go from https://go.dev/dl/ and retry."
-- Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review` and `--discover` modes since no PR fetching happens.)
+- Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review`, `--discover`, and `--add` modes since no PR fetching happens.)
 - `which cursor-agent` — check if cursor-agent is available. Store result as `HAS_CURSOR_AGENT` (true/false). In `--discover` mode, if cursor-agent is not found, abort: "cursor-agent is required for --discover mode. Install Cursor and ensure cursor-agent is on your PATH." In other modes, cursor-agent is optional — absence is not an error.
 
 **Binary build**: check whether `.claude/pattern-learner/bin/pattern-learner` exists in the current working directory (the target repo root).
@@ -673,3 +675,149 @@ Candidates found:           <N>
 Candidates merged into existing rules: <N>
 New candidates proposed:    <N>
 ```
+
+---
+
+## Add Mode
+
+Invoked when `--add` is set. This records **one** rule a developer authored by hand —
+a convention they decided on while working — and persists it into the right skill file
+so it travels across Claude Code instances instead of living in disposable session
+memory. It runs after Step 4 (state read) and replaces Steps 5–10 entirely; Steps 11
+(state write), 12 (output generation), and 13 (summary) run as normal.
+
+Manual rules bypass the fetch / grounding / classify pipeline — there is no PR to ground
+against and no occurrence count to score. The rule is authoritative because a human
+stated it: it is written with `origin: "manual"`, `strength: "explicit"`,
+`confidence: "stated"`, and `status: "approved"`.
+
+The two pieces of judgment in this mode — deciding whether the rule already exists, and
+deciding which domain it belongs to — are genuinely semantic and interactive. You perform
+them directly. Do not write a script; the only `$BIN` calls are `state-read` (already done
+in Step 4), `state-write`, and `write-outputs`.
+
+---
+
+### Add Step A1: Capture the rule
+
+Determine the convention the user wants to record:
+- If text follows `--add`, that text is the rule statement.
+- Otherwise, use the user's request from the conversation that triggered this skill.
+- If the intent is too vague to turn into a concrete instruction (e.g. just "add a rule
+  about errors"), ask the user to state the convention as a single imperative sentence.
+
+Synthesize a candidate rule:
+- `title`: 5–8 words.
+- `rule`: one imperative sentence, in the user's own intent — not a generic textbook rule.
+- `do_examples` / `dont_examples`: include them only if the user supplied code or a clear
+  before/after. Manual rules may legitimately have no examples — do **not** invent code the
+  user didn't provide.
+
+Echo the synthesized rule back to the user in one line so they can catch a misread before
+anything is written.
+
+---
+
+### Add Step A2: Check whether the rule already exists
+
+Read every rule already in state (from Step 4) — across all domains **and** `CLAUDE.md`,
+including `proposed` and `superseded` rules, not just approved ones. Semantically compare
+the new rule against each existing one. This is your judgment, not a string match.
+
+- **Equivalent** to an existing rule (same intent, even if worded differently): do NOT
+  create a duplicate. Tell the user it already exists, showing the existing rule's title,
+  its target location (`CLAUDE.md` or domain), and current confidence. Then ask how to
+  proceed:
+  - **Strengthen it** — append a manual source to the existing rule (a `Signal` with
+    `reviewer` = the user, `date` = today, `snippet` = the user's rule statement,
+    `strength: "explicit"`, `pr_number: 0`), bump `signal_count`, set `last_seen_pr`
+    unchanged, and leave its text and status. If the existing rule was implicit/`emerging`,
+    this human confirmation promotes it — re-run its confidence as explicit (`stated`).
+  - **Replace its text** — keep the rule's identity and sources but update `title`/`rule`/
+    examples to the new wording.
+  - **Cancel** — make no change and stop (still release the run-lock).
+  Skip A3 in the strengthen/replace cases — the target is already decided. Go to Step 11.
+- **Contradicts** an existing rule (the new rule says the opposite): show both to the user
+  and ask whether the new rule should supersede the old one. If yes, set
+  `supersedes: ["<existing_rule_id>"]` on the new rule (Step 11 will mark the old one
+  `superseded`). If no, stop.
+- **Distinct** (neither equivalent nor contradicting): proceed to A3.
+
+---
+
+### Add Step A3: Choose the target skill
+
+A manual rule must land in a specific skill file (or `CLAUDE.md`). Decide **with** the user:
+
+1. Build the list of candidate targets: every domain that already has rules in state (read
+   their `target.location` and `file_glob`s), plus `CLAUDE.md`.
+2. Form a suggestion. Use the rule's content and the existing domains' file globs to pick
+   the most specific fitting domain. Reserve `CLAUDE.md` **only** for rules that apply to
+   every file regardless of language/layer (naming conventions, commit format, repo-wide
+   anti-patterns) — the same CLAUDE.md qualification as Step 8. When unsure between a
+   domain and `CLAUDE.md`, prefer the domain.
+3. Ask the user to confirm the target, using the existing domains as options and your
+   suggestion marked as recommended — e.g. via `AskUserQuestion` with the candidate domains,
+   `CLAUDE.md`, and a "new skill" choice. The user may pick an existing domain, `CLAUDE.md`,
+   or a brand-new domain.
+
+**If the user chooses a new domain** (one not present in state):
+- **Confirm before creating.** Ask explicitly: "No skill exists for `<domain>` yet — create
+  a new skill at `.claude/skills/<domain>/SKILL.md`? [y/n]". Only proceed on an affirmative
+  answer. If declined, return to step 3 and let them pick an existing target.
+- Ask for the file globs that scope the new domain (e.g. `internal/api/**/*.go`) so the
+  generated skill auto-loads at the right times. Store them on the rule's
+  `target.file_glob`.
+- The skill file itself is created by `write-outputs` in Step 12 — you do not author it by
+  hand. You only add the rule with the new `target.location`.
+
+Set the rule's `target` to `{location: <chosen>, file_glob: <globs>}`. For `CLAUDE.md`,
+`file_glob` may be empty.
+
+---
+
+### Add Step A4: Assemble the rule for state
+
+Construct the final rule object (for the distinct/new case):
+- `title`, `rule`, `do_examples`, `dont_examples` from A1
+- `target` from A3
+- `origin: "manual"`
+- `confidence: "stated"`
+- `status: "approved"`
+- `sources`: a single `Signal` — `{reviewer: <user>, date: <today>, snippet: <the user's
+  rule statement verbatim>, strength: "explicit", pr_number: 0}`
+- `signal_count: 1`
+- `supersedes`: set only if A2 found a contradiction the user chose to supersede
+- Leave `id`, `created_at`, `updated_at` empty — `state-write` fills them.
+
+For the **strengthen** or **replace** path from A2, instead modify the existing rule in
+place (append source / update text) rather than adding a new rule.
+
+If a new domain was created, also add or refresh its `domain_descriptions` entry following
+the same guidance as Step 11 (name what the skill is for, 2–3 concrete topics, a "Use when
+editing" hint from the globs).
+
+---
+
+### Add Step A5: Persist and generate
+
+Proceed to **Step 11** (write the updated state via `state-write`), then **Step 12**
+(`write-outputs` regenerates `CLAUDE.md` and the affected `.claude/skills/<domain>/SKILL.md`).
+`last_extracted_pr_number` is unchanged in this mode — manual add does not touch the PR
+watermark.
+
+---
+
+### Add Step A6: Summary
+
+Replace the Step 13 summary with a short confirmation:
+```
+── Manual Rule Added ────────────────────────────────
+Rule:        <title>
+Target:      <CLAUDE.md | domain>  (<new skill created | existing skill>)
+Action:      <added new rule | strengthened existing rule | replaced existing rule | superseded "<old title>">
+File:        <CLAUDE.md | .claude/skills/<domain>/SKILL.md>
+─────────────────────────────────────────────────────
+```
+
+Then **release the run-lock** (`rm -f .claude/pattern-learner/.run-lock`) as in Step 13.

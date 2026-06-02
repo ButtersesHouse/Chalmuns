@@ -282,6 +282,34 @@ func TestRoundTripConflicted(t *testing.T) {
 	}
 }
 
+func TestRoundTripOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Rules = []Rule{
+		{
+			Title:      "Always wrap errors with %w",
+			Rule:       "Wrap errors with fmt.Errorf and %w when propagating",
+			Status:     "approved",
+			Confidence: "stated",
+			Origin:     "manual",
+			Sources:    []Signal{{Reviewer: "mryave", Snippet: "always wrap errors with %w", Strength: "explicit"}},
+		},
+	}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Rules[0].Origin != "manual" {
+		t.Errorf("origin not persisted through state-write: want %q, got %q", "manual", out.Rules[0].Origin)
+	}
+}
+
 func TestReadInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")

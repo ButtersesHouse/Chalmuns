@@ -58,6 +58,11 @@ type Rule struct {
 	Status       string    `json:"status"`
 	Supersedes   []string  `json:"supersedes,omitempty"`
 	SupersededBy *string   `json:"superseded_by,omitempty"`
+	// Origin records how the rule first entered state: "" or "pr-review" for the
+	// PR ingestion pipeline (default), "discover" for cursor-agent codebase
+	// discovery, "manual" for a rule a developer added directly via --add. Drives
+	// the provenance line in generated output files.
+	Origin string `json:"origin,omitempty"`
 	// Conflicted is set when cross-batch contradiction detection finds two
 	// candidates from overlapping PR ranges that contradict each other.
 	// Persisted through state-write so it survives --auto deferral and

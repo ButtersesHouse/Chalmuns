@@ -326,6 +326,28 @@ func TestWriteSkillFileFileRef(t *testing.T) {
 	}
 }
 
+func TestWriteManualRuleSourceLabel(t *testing.T) {
+	dir := t.TempDir()
+	// Manual rule: no PR sources, origin "manual".
+	r := state.Rule{
+		ID: "rule_manual", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "stated", Origin: "manual",
+		Target:  state.Target{Location: "api"},
+		Sources: []state.Signal{{Reviewer: "mryave", Snippet: "always wrap with %w", Strength: "explicit"}},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: manually added_") {
+		t.Errorf("manual rule should render 'manually added' source label; got:\n%s", content)
+	}
+	if strings.Contains(content, "PRs #0") || strings.Contains(content, "PRs _") {
+		t.Error("manual rule must not render a bogus PR list")
+	}
+}
+
 func TestPluralExamplesFallsBackToSingular(t *testing.T) {
 	dir := t.TempDir()
 	// Rule with only singular examples (backward compat)

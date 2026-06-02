@@ -45,7 +45,7 @@ func writeCLAUDEMD(s state.State, dir string) error {
 		b.WriteString(fmt.Sprintf("## %s\n\n", r.Title))
 		renderExamples(&b, r, 1)
 		b.WriteString(r.Rule + "\n\n")
-		b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
+		b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
 	}
 
 	return atomicWrite(filepath.Join(dir, "CLAUDE.md"), b.String())
@@ -103,11 +103,15 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
 		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
-		if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= 100 {
-			b.WriteString(fmt.Sprintf("_Source: PRs %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
-				prList(r.Sources), r.LastSeenPR))
+		if r.Origin == "" || r.Origin == "pr-review" {
+			if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= 100 {
+				b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
+					sourceLabel(r), r.LastSeenPR))
+			} else {
+				b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
+			}
 		} else {
-			b.WriteString(fmt.Sprintf("_Source: PRs %s_\n\n", prList(r.Sources)))
+			b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
 		}
 		if opts.RAGHints {
 			b.WriteString(fmt.Sprintf(
@@ -208,6 +212,23 @@ func confidenceRank(c string) int {
 		return 2
 	default:
 		return 3
+	}
+}
+
+// sourceLabel returns the provenance text for a rule's "_Source: …_" line.
+// Manual and discover-origin rules have no PR numbers, so they get a descriptive
+// label instead of an empty PR list.
+func sourceLabel(r state.Rule) string {
+	switch r.Origin {
+	case "manual":
+		return "manually added"
+	case "discover":
+		return "discovered from codebase"
+	default:
+		if prs := prList(r.Sources); prs != "" {
+			return "PRs " + prs
+		}
+		return "—"
 	}
 }
 
