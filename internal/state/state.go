@@ -11,13 +11,13 @@ import (
 const SchemaVersion = "1"
 
 type State struct {
-	SchemaVersion         string            `json:"schema_version"`
-	Repo                  RepoInfo          `json:"repo"`
-	LastRun               string            `json:"last_run"`
-	LastExtractedPRNumber int               `json:"last_extracted_pr_number"`
-	Stats                 Stats             `json:"stats"`
-	Rules                 []Rule            `json:"rules"`
-	RejectedSignals       []RejectedSignal  `json:"rejected_signals"`
+	SchemaVersion         string           `json:"schema_version"`
+	Repo                  RepoInfo         `json:"repo"`
+	LastRun               string           `json:"last_run"`
+	LastExtractedPRNumber int              `json:"last_extracted_pr_number"`
+	Stats                 Stats            `json:"stats"`
+	Rules                 []Rule           `json:"rules"`
+	RejectedSignals       []RejectedSignal `json:"rejected_signals"`
 	// DomainDescriptions maps a skill domain name to a human-written description
 	// used in the skill file's frontmatter. SKILL.md generates these during
 	// approval; output.go reads them when present, falls back to a generic
@@ -62,14 +62,14 @@ type Rule struct {
 	// candidates from overlapping PR ranges that contradict each other.
 	// Persisted through state-write so it survives --auto deferral and
 	// re-surfaces correctly in --review mode.
-	Conflicted       bool              `json:"conflicted,omitempty"`
+	Conflicted bool `json:"conflicted,omitempty"`
 	// ReviewedSnapshot records signal state at the time the user pressed 's'
 	// (skip/defer). Used by 'triage --mode review-filter' to suppress unchanged
 	// emerging rules on subsequent runs. Cleared on approve or reject.
 	ReviewedSnapshot *ReviewedSnapshot `json:"reviewed_snapshot,omitempty"`
-	CreatedAt    string    `json:"created_at"`
-	UpdatedAt    string    `json:"updated_at"`
-	LastSeenPR   int       `json:"last_seen_pr"`
+	CreatedAt        string            `json:"created_at"`
+	UpdatedAt        string            `json:"updated_at"`
+	LastSeenPR       int               `json:"last_seen_pr"`
 }
 
 // ReviewedSnapshot records the signal state at the time a user last skipped an

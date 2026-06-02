@@ -23,7 +23,7 @@ func makeRule(t *testing.T, id, confidence string, signalCount int, supersedes [
 		ID               string          `json:"id"`
 		Status           string          `json:"status"`
 		Confidence       string          `json:"confidence"`
-		SignalCount       int             `json:"signal_count"`
+		SignalCount      int             `json:"signal_count"`
 		Sources          []src           `json:"sources"`
 		Supersedes       []string        `json:"supersedes,omitempty"`
 		Conflicted       bool            `json:"conflicted,omitempty"`
@@ -33,7 +33,7 @@ func makeRule(t *testing.T, id, confidence string, signalCount int, supersedes [
 		ID:               id,
 		Status:           "proposed",
 		Confidence:       confidence,
-		SignalCount:       signalCount,
+		SignalCount:      signalCount,
 		Sources:          ss,
 		Supersedes:       supersedes,
 		Conflicted:       conflicted,
@@ -55,7 +55,10 @@ func getStatus(t *testing.T, raw json.RawMessage) string {
 
 func TestTriageAuto_approvesClean(t *testing.T) {
 	raw := makeRule(t, "rule_1", "established", 3, nil, false,
-		[]struct{ prNum int; strength string }{{1, "explicit"}, {2, "explicit"}, {3, "explicit"}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, "explicit"}, {2, "explicit"}, {3, "explicit"}},
 		nil)
 	out, err := TriageAuto([]json.RawMessage{raw}, false)
 	if err != nil {
@@ -68,7 +71,10 @@ func TestTriageAuto_approvesClean(t *testing.T) {
 
 func TestTriageAuto_defersSupersedes(t *testing.T) {
 	raw := makeRule(t, "rule_2", "established", 3, []string{"rule_old"}, false,
-		[]struct{ prNum int; strength string }{{1, "explicit"}, {2, "explicit"}, {3, "explicit"}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, "explicit"}, {2, "explicit"}, {3, "explicit"}},
 		nil)
 	out, _ := TriageAuto([]json.RawMessage{raw}, false)
 	if getStatus(t, out[0]) != "proposed" {
@@ -78,7 +84,10 @@ func TestTriageAuto_defersSupersedes(t *testing.T) {
 
 func TestTriageAuto_defersConflicted(t *testing.T) {
 	raw := makeRule(t, "rule_3", "emerging", 2, nil, true,
-		[]struct{ prNum int; strength string }{{1, "explicit"}, {2, "explicit"}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, "explicit"}, {2, "explicit"}},
 		nil)
 	out, _ := TriageAuto([]json.RawMessage{raw}, false)
 	if getStatus(t, out[0]) != "proposed" {
@@ -88,7 +97,10 @@ func TestTriageAuto_defersConflicted(t *testing.T) {
 
 func TestTriageAuto_defersSingleton(t *testing.T) {
 	raw := makeRule(t, "rule_4", "emerging", 1, nil, false,
-		[]struct{ prNum int; strength string }{{1, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, ""}},
 		nil)
 	out, _ := TriageAuto([]json.RawMessage{raw}, false)
 	if getStatus(t, out[0]) != "proposed" {
@@ -98,7 +110,10 @@ func TestTriageAuto_defersSingleton(t *testing.T) {
 
 func TestTriageAuto_autoThresholdApproveSingleton(t *testing.T) {
 	raw := makeRule(t, "rule_5", "emerging", 1, nil, false,
-		[]struct{ prNum int; strength string }{{1, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, ""}},
 		nil)
 	out, _ := TriageAuto([]json.RawMessage{raw}, true) // autoThreshold=true
 	if getStatus(t, out[0]) != "approved" {
@@ -109,7 +124,10 @@ func TestTriageAuto_autoThresholdApproveSingleton(t *testing.T) {
 func TestTriageAuto_explicitSingletonApproved(t *testing.T) {
 	// 1 explicit source is NOT a singleton for deferral purposes (strength matters).
 	raw := makeRule(t, "rule_6", "stated", 1, nil, false,
-		[]struct{ prNum int; strength string }{{1, "explicit"}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{1, "explicit"}},
 		nil)
 	out, _ := TriageAuto([]json.RawMessage{raw}, false)
 	if getStatus(t, out[0]) != "approved" {
@@ -122,7 +140,10 @@ func TestTriageAuto_explicitSingletonApproved(t *testing.T) {
 func TestTriageReviewFilter_suppressUnchanged(t *testing.T) {
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{42, 67}}
 	raw := makeRule(t, "rule_7", "emerging", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}},
 		snap)
 	result, err := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if err != nil {
@@ -143,7 +164,10 @@ func TestTriageReviewFilter_showUpdated(t *testing.T) {
 	// Snapshot recorded signal_count=2 but now there are 3 sources.
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{42, 67}}
 	raw := makeRule(t, "rule_8", "emerging", 3, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}, {99, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}, {99, ""}},
 		snap)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 0 {
@@ -158,7 +182,10 @@ func TestTriageReviewFilter_showNewPR(t *testing.T) {
 	// Same count but a different PR number appeared.
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{42, 67}}
 	raw := makeRule(t, "rule_9", "emerging", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {100, ""}}, // PR 100 is new
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {100, ""}}, // PR 100 is new
 		snap)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 0 {
@@ -169,7 +196,10 @@ func TestTriageReviewFilter_showNewPR(t *testing.T) {
 func TestTriageReviewFilter_noSnapshot(t *testing.T) {
 	// No snapshot → never suppressed (rule not yet seen by user).
 	raw := makeRule(t, "rule_10", "emerging", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}},
 		nil)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 0 {
@@ -181,7 +211,10 @@ func TestTriageReviewFilter_nonEmergingNotSuppressed(t *testing.T) {
 	// Snapshot exists but confidence is established — filter only targets emerging.
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{42, 67}}
 	raw := makeRule(t, "rule_11", "established", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}},
 		snap)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 0 {
@@ -193,7 +226,10 @@ func TestTriageReviewFilter_showAll(t *testing.T) {
 	// --all bypasses suppression entirely.
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{42, 67}}
 	raw := makeRule(t, "rule_12", "emerging", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}},
 		snap)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, true) // showAll=true
 	if result.Suppressed != 0 {
@@ -209,7 +245,10 @@ func TestTriageReviewFilter_sortOrderIndependent(t *testing.T) {
 	// The comparison must sort both sides before comparing.
 	snap := &triageSnapshot{SignalCount: 2, SourcePRNumbers: []int{67, 42}} // reversed
 	raw := makeRule(t, "rule_13", "emerging", 2, nil, false,
-		[]struct{ prNum int; strength string }{{42, ""}, {67, ""}},
+		[]struct {
+			prNum    int
+			strength string
+		}{{42, ""}, {67, ""}},
 		snap)
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 1 {

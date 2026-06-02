@@ -44,7 +44,10 @@ func classifyOne(t *testing.T, raw json.RawMessage, maxPR, sincePR int) map[stri
 }
 
 func TestClassify_explicitSingle_stated(t *testing.T) {
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, "explicit"}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, "explicit"}})
 	out := classifyOne(t, raw, 200, 0)
 	if out == nil {
 		t.Fatal("expected 1 kept candidate")
@@ -58,7 +61,10 @@ func TestClassify_explicitSingle_stated(t *testing.T) {
 }
 
 func TestClassify_explicitTwo_stated(t *testing.T) {
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, "explicit"}, {110, "explicit"}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, "explicit"}, {110, "explicit"}})
 	out := classifyOne(t, raw, 200, 0)
 	if out["confidence"] != "stated" {
 		t.Errorf("2 explicit sources → stated; got %v", out["confidence"])
@@ -66,7 +72,10 @@ func TestClassify_explicitTwo_stated(t *testing.T) {
 }
 
 func TestClassify_explicitThree_established(t *testing.T) {
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, "explicit"}, {110, "explicit"}, {120, "explicit"}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, "explicit"}, {110, "explicit"}, {120, "explicit"}})
 	out := classifyOne(t, raw, 200, 0)
 	if out["confidence"] != "established" {
 		t.Errorf("3 explicit sources → established; got %v", out["confidence"])
@@ -74,7 +83,10 @@ func TestClassify_explicitThree_established(t *testing.T) {
 }
 
 func TestClassify_implicitFour_emerging(t *testing.T) {
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, ""}, {110, ""}, {120, ""}, {130, ""}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, ""}, {110, ""}, {120, ""}, {130, ""}})
 	out := classifyOne(t, raw, 200, 0)
 	if out["confidence"] != "emerging" {
 		t.Errorf("4 implicit sources → emerging; got %v", out["confidence"])
@@ -83,9 +95,15 @@ func TestClassify_implicitFour_emerging(t *testing.T) {
 
 func TestClassify_implicitFive_established(t *testing.T) {
 	// Use maxPRSeen=200 so cutoff=100. Sources at 100-140 have max=140 ≥ 100 → no downgrade.
-	sources := make([]struct{ prNum int; strength string }, 5)
+	sources := make([]struct {
+		prNum    int
+		strength string
+	}, 5)
 	for i := range sources {
-		sources[i] = struct{ prNum int; strength string }{100 + i*10, ""}
+		sources[i] = struct {
+			prNum    int
+			strength string
+		}{100 + i*10, ""}
 	}
 	raw := makeCandidate(t, sources)
 	out := classifyOne(t, raw, 200, 0)
@@ -97,9 +115,15 @@ func TestClassify_implicitFive_established(t *testing.T) {
 func TestClassify_implicitOld_downgradeEstablishedToEmerging(t *testing.T) {
 	// 5 implicit sources all from PR 100; maxPRSeen=500, sincePR=0 → cutoff=250.
 	// PR 100 < 250 → downgrade established → emerging.
-	sources := make([]struct{ prNum int; strength string }, 5)
+	sources := make([]struct {
+		prNum    int
+		strength string
+	}, 5)
 	for i := range sources {
-		sources[i] = struct{ prNum int; strength string }{100, ""}
+		sources[i] = struct {
+			prNum    int
+			strength string
+		}{100, ""}
 	}
 	raw := makeCandidate(t, sources)
 	out := classifyOne(t, raw, 500, 0)
@@ -114,7 +138,10 @@ func TestClassify_implicitOld_downgradeEstablishedToEmerging(t *testing.T) {
 func TestClassify_implicitVeryOld_dropped(t *testing.T) {
 	// 2 implicit sources from PR 50; maxPRSeen=500, sincePR=0 → cutoff=250.
 	// PR 50 < 250 AND confidence starts as emerging → downgrade drops it.
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{50, ""}, {60, ""}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{50, ""}, {60, ""}})
 	result, _ := Classify([]json.RawMessage{raw}, 500, 0)
 	if len(result.Kept) != 0 {
 		t.Error("old implicit emerging candidate should be dropped by recency downgrade")
@@ -126,7 +153,10 @@ func TestClassify_implicitVeryOld_dropped(t *testing.T) {
 
 func TestClassify_explicitOld_exempt(t *testing.T) {
 	// Explicit signal from PR 50; maxPRSeen=500 → old, but explicit signals are exempt.
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{50, "explicit"}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{50, "explicit"}})
 	out := classifyOne(t, raw, 500, 0)
 	if out == nil {
 		t.Fatal("explicit candidate should not be dropped by recency downgrade")
@@ -138,7 +168,10 @@ func TestClassify_explicitOld_exempt(t *testing.T) {
 
 func TestClassify_mixedStrength_treatedAsExplicit(t *testing.T) {
 	// One explicit source + one implicit source → treated as explicit.
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, "explicit"}, {110, ""}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, "explicit"}, {110, ""}})
 	out := classifyOne(t, raw, 200, 0)
 	// 2 sources, explicit → "stated" (not "emerging")
 	if out["confidence"] != "stated" {
@@ -170,7 +203,10 @@ func TestClassify_passthroughFields(t *testing.T) {
 
 func TestClassify_recencyCutoffBoundary(t *testing.T) {
 	// PR exactly at the cutoff (= 250 when maxPRSeen=500, sincePR=0) should NOT be downgraded.
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{250, ""}, {260, ""}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{250, ""}, {260, ""}})
 	out := classifyOne(t, raw, 500, 0)
 	if out == nil {
 		t.Fatal("candidate at cutoff should be kept")
@@ -183,7 +219,10 @@ func TestClassify_recencyCutoffBoundary(t *testing.T) {
 
 func TestClassify_refreshMode_noCutoff(t *testing.T) {
 	// Refresh where sincePR == maxPRSeen → no recency downgrade at all.
-	raw := makeCandidate(t, []struct{ prNum int; strength string }{{100, ""}, {110, ""}})
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{100, ""}, {110, ""}})
 	out := classifyOne(t, raw, 500, 500)
 	if out == nil {
 		t.Fatal("should be kept when no range to compute cutoff")

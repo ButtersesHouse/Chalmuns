@@ -71,9 +71,10 @@ func RunClassify(args []string) error {
 //     5+ signals → "established"; 1–4 → "emerging"
 //
 // Recency downgrade (implicit-only):
-//   cutoff = maxPRSeen − (maxPRSeen − sincePR) × 0.5
-//   If max(source.pr_number) < cutoff: established → emerging; emerging → dropped.
-//   Explicit signals are exempt — a stated preference does not expire.
+//
+//	cutoff = maxPRSeen − (maxPRSeen − sincePR) × 0.5
+//	If max(source.pr_number) < cutoff: established → emerging; emerging → dropped.
+//	Explicit signals are exempt — a stated preference does not expire.
 func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (ClassifyResult, error) {
 	var result ClassifyResult
 

@@ -9,13 +9,13 @@ import (
 
 // triageRule is the minimal set of fields read from a rule for triage decisions.
 type triageRule struct {
-	ID          string           `json:"id"`
-	Confidence  string           `json:"confidence"`
-	SignalCount  int              `json:"signal_count"`
-	Sources     []classifySource `json:"sources"`
-	Supersedes  []string         `json:"supersedes,omitempty"`
-	Conflicted  bool             `json:"conflicted,omitempty"`
-	ReviewedSnapshot *triageSnapshot `json:"reviewed_snapshot,omitempty"`
+	ID               string           `json:"id"`
+	Confidence       string           `json:"confidence"`
+	SignalCount      int              `json:"signal_count"`
+	Sources          []classifySource `json:"sources"`
+	Supersedes       []string         `json:"supersedes,omitempty"`
+	Conflicted       bool             `json:"conflicted,omitempty"`
+	ReviewedSnapshot *triageSnapshot  `json:"reviewed_snapshot,omitempty"`
 }
 
 // triageSnapshot mirrors state.ReviewedSnapshot without importing the state package.
@@ -35,10 +35,11 @@ type TriageFilterResult struct {
 // predicate, returning the result to stdout.
 //
 // Modes:
-//   auto           [--auto-threshold]  — apply approve/defer predicate; output rules
-//                                        with status patched
-//   review-filter  [--all]             — suppress unchanged emerging rules; output
-//                                        {show, suppressed, suppressed_ids}
+//
+//	auto           [--auto-threshold]  — apply approve/defer predicate; output rules
+//	                                     with status patched
+//	review-filter  [--all]             — suppress unchanged emerging rules; output
+//	                                     {show, suppressed, suppressed_ids}
 func RunTriage(args []string) error {
 	mode := flagVal(args, "--mode", "")
 	if mode == "" {

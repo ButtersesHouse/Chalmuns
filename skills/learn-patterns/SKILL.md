@@ -8,6 +8,29 @@ argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-thresh
 
 Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules to `CLAUDE.md` and domain-specific skill files. Treats reviewer preferences — including indirect, hedged, and skeptical language — as spoken-word rules captured at face value, regardless of occurrence count.
 
+## Tooling policy (read first)
+
+Every deterministic step in this pipeline is implemented as a subcommand of the
+`pattern-learner` binary (`$BIN`): `detect-repo`, `state-read`, `state-write`,
+`write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`. **These
+subcommands are the only sanctioned implementations of their logic.**
+
+- **Do NOT** write or run ad-hoc scripts (Python, Node, Ruby, Perl, shell scripts, etc.)
+  to fetch, preprocess, ground-check, deduplicate by rule, score confidence, or triage.
+  These were the source of past correctness failures (lost `strength`, dropped signals,
+  fabricated rule text).
+- The only work you perform directly is genuinely semantic: signal extraction (via the
+  Step 6 subagent), semantic dedup, contradiction detection, and domain canonicalization
+  (Step 8). Everything else is a `$BIN` call.
+- **If a subcommand is missing, errors, or seems unable to do what you need: STOP and
+  report it to the user. Do not write a workaround script.** A gap in the tooling is a
+  bug to fix in the binary, not something to paper over.
+
+This policy is mechanically enforced: while a run is in progress (Step 2 creates a
+run-lock at `.claude/pattern-learner/.run-lock`), a PreToolUse hook blocks interpreter
+invocations and script file creation. If you find yourself blocked, it means you are
+trying to reimplement a sanctioned subcommand — use the subcommand instead.
+
 ## Instructions
 
 Follow all steps in order. Do not skip steps unless the mode explicitly says to.
@@ -60,6 +83,14 @@ If it does not exist:
 If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
+
+**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
+
+**Create the run-lock** (enables the off-script guard for the duration of this run):
+```
+mkdir -p .claude/pattern-learner && touch .claude/pattern-learner/.run-lock
+```
+The lock activates the PreToolUse hook that blocks interpreter/script usage (see the Tooling policy). **If the skill aborts at any later step, remove the lock** (`rm -f .claude/pattern-learner/.run-lock`) before exiting so the guard does not linger.
 
 ---
 
@@ -130,11 +161,11 @@ Keep PRs where `merged_at != null` AND `number > since_pr`. Stop when an entire 
 
 Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` forward to Step 11.
 
-> **Large repo note** (1,000+ merged PRs): one-at-a-time MCP calls will be slow. A bulk-fetch script using `gh api --paginate` is a supported alternative. It must write the same cache format:
+> **Large repo note** (1,000+ merged PRs): one-at-a-time MCP calls will be slow. Bulk-fetching with `gh api --paginate` piped through `jq` is the supported alternative — `gh`, `jq`, and `xargs` are permitted by the guard. Run these as **inline commands**, not as an authored `.sh`/`.py` script file (the guard blocks script creation during a run, and a fetch script is exactly the kind of off-pipeline tooling this prevents). Each fetched PR must be written as a cache file in the same format:
 > ```json
 > { "pr_number": N, "comment_sources": {"review_comments": <count>, "issue_comments": <count>, "review_bodies": <count>}, "raw": <full PR data> }
 > ```
-> The cache contract is identical; Steps 6–13 are unaffected regardless of how the cache was populated. Parallelize with `xargs -P8` or similar. Output must follow the `.claude/pattern-learner/raw-cache/pr-N.json` naming convention.
+> The cache contract is identical; Steps 6–13 are unaffected regardless of how the cache was populated. Parallelize with `xargs -P8`. Output must follow the `.claude/pattern-learner/raw-cache/pr-N.json` naming convention. (Fetch is the one network step the binary cannot perform — it is zero-network by design — so this inline `gh` path is sanctioned.)
 
 ---
 
@@ -528,6 +559,11 @@ Auto-approve mode:
   Deferred (supersessions):   <N>  ← run /learn-patterns --review to decide
   Deferred (conflicts):       <N>  ← run /learn-patterns --review to decide
 ─────────────────────────────────────────────────────
+```
+
+**Release the run-lock**: after the summary is printed, remove the guard lock so normal tooling is unrestricted again:
+```
+rm -f .claude/pattern-learner/.run-lock
 ```
 
 ---

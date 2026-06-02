@@ -1,1 +1,15 @@
-{}
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" ]; then \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" guard; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
