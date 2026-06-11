@@ -17,17 +17,37 @@ type Options struct {
 	// RAGHints adds a cursor-agent query hint after each rule in domain skill
 	// files so the AI can retrieve live codebase examples at skill-use time.
 	RAGHints bool
+	// ClaudeMDPath is the explicit destination for CLAUDE.md. When empty,
+	// defaults to <outputDir>/CLAUDE.md. Set this to place CLAUDE.md at any
+	// path independently of where the skill files are written.
+	ClaudeMDPath string
+	// SkillsDir is the explicit destination directory for per-domain skill
+	// files. When empty, defaults to <outputDir>/.claude/skills. Set this to
+	// decouple the skill files location from the CLAUDE.md location.
+	SkillsDir string
 }
 
-// Write generates CLAUDE.md and per-domain skill files in outputDir.
+// Write generates CLAUDE.md and per-domain skill files.
+// outputDir establishes the default root for both outputs (backward compat):
+//
+//	CLAUDE.md  →  opts.ClaudeMDPath  (or <outputDir>/CLAUDE.md)
+//	skills     →  opts.SkillsDir     (or <outputDir>/.claude/skills)
 func Write(s state.State, outputDir string, opts Options) error {
-	if err := writeCLAUDEMD(s, outputDir); err != nil {
+	claudeMDPath := opts.ClaudeMDPath
+	if claudeMDPath == "" {
+		claudeMDPath = filepath.Join(outputDir, "CLAUDE.md")
+	}
+	skillsDir := opts.SkillsDir
+	if skillsDir == "" {
+		skillsDir = filepath.Join(outputDir, ".claude", "skills")
+	}
+	if err := writeCLAUDEMD(s, claudeMDPath); err != nil {
 		return err
 	}
-	return writeSkillFiles(s, outputDir, opts)
+	return writeSkillFiles(s, skillsDir, opts)
 }
 
-func writeCLAUDEMD(s state.State, dir string) error {
+func writeCLAUDEMD(s state.State, path string) error {
 	rules := approvedRules(s, "CLAUDE.md")
 	if len(rules) == 0 {
 		return nil
@@ -48,10 +68,13 @@ func writeCLAUDEMD(s state.State, dir string) error {
 		b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
 	}
 
-	return atomicWrite(filepath.Join(dir, "CLAUDE.md"), b.String())
+	return atomicWrite(path, b.String())
 }
 
-func writeSkillFiles(s state.State, dir string, opts Options) error {
+// writeSkillFiles writes per-domain skill files under skillsDir.
+// skillsDir is the root under which per-domain subdirs are created (e.g.
+// ".claude/skills" → ".claude/skills/api/SKILL.md").
+func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 	byDomain := map[string][]state.Rule{}
 	for _, r := range s.Rules {
 		if r.Status != "approved" || r.Target.Location == "CLAUDE.md" || r.Target.Location == "" {
@@ -62,14 +85,14 @@ func writeSkillFiles(s state.State, dir string, opts Options) error {
 	}
 
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, dir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, opts); err != nil {
+		if err := writeSkillFile(domain, rules, skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeSkillFile(domain string, rules []state.Rule, dir string, override string, watermark int, opts Options) error {
+func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -121,7 +144,7 @@ func writeSkillFile(domain string, rules []state.Rule, dir string, override stri
 		}
 	}
 
-	skillDir := filepath.Join(dir, ".claude", "skills", domain)
+	skillDir := filepath.Join(skillsDir, domain)
 	if err := os.MkdirAll(skillDir, 0755); err != nil {
 		return err
 	}

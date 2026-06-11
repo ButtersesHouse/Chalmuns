@@ -507,14 +507,24 @@ Build the flags based on available tools:
 - If `HAS_CURSOR_AGENT` is true: add `--rag-hints` (embeds live query hints in skill files) and `--rag` (uses cursor-agent for semantic anchoring instead of grep)
 - Otherwise: no extra flags
 
-Run:
+`write-outputs` writes two independent outputs: `CLAUDE.md` and per-domain skill files under `.claude/skills/`. **These paths are independently controllable** — use `--claude-md` to target an existing `CLAUDE.md` at a non-root location, and `--skills-dir` to target a non-default skills directory. When both are omitted, `--output-dir` provides the base for both (for backward compat: `<dir>/CLAUDE.md` and `<dir>/.claude/skills`).
+
+**Typical invocation** (target repo has `CLAUDE.md` at its root and skills under `.claude/skills/`):
 ```
-$BIN write-outputs --state .claude/pattern-learner/state.json --output-dir . [--rag-hints] [--rag]
+$BIN write-outputs \
+  --state .claude/pattern-learner/state.json \
+  --claude-md CLAUDE.md \
+  --skills-dir .claude/skills \
+  [--rag-hints] [--rag]
 ```
 
+Using `--claude-md` and `--skills-dir` directly avoids any ambiguity about where the files land — even if the project has an unusual layout — and prevents the tool from writing an unwanted `CLAUDE.md` at a wrong depth.
+
+If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched domain skills), add `--claude-md /dev/null` to suppress that output.
+
 This writes:
-- `CLAUDE.md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
-- `.claude/skills/<domain>/SKILL.md` — one file per domain with approved rules; when `--rag-hints` is set, each rule includes a `cursor-agent` command for retrieving live codebase examples at skill-use time
+- `CLAUDE.md` at the path given by `--claude-md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
+- `<skills-dir>/<domain>/SKILL.md` — one file per domain with approved rules; when `--rag-hints` is set, each rule includes a `cursor-agent` command for retrieving live codebase examples at skill-use time
 
 ---
 
@@ -802,7 +812,8 @@ editing" hint from the globs).
 ### Add Step A5: Persist and generate
 
 Proceed to **Step 11** (write the updated state via `state-write`), then **Step 12**
-(`write-outputs` regenerates `CLAUDE.md` and the affected `.claude/skills/<domain>/SKILL.md`).
+(`write-outputs` regenerates `CLAUDE.md` and the affected `.claude/skills/<domain>/SKILL.md` using
+`--claude-md` and `--skills-dir` as described there).
 `last_extracted_pr_number` is unchanged in this mode — manual add does not touch the PR
 watermark.
 

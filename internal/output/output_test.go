@@ -702,6 +702,42 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 	}
 }
 
+func TestWriteOutputsIndependentPaths(t *testing.T) {
+	// ClaudeMDPath and SkillsDir can be set independently so they don't have
+	// to share a common outputDir root — the core of the "clobber" bug.
+	repoRoot := t.TempDir()
+	customClaude := filepath.Join(t.TempDir(), "docs", "CLAUDE.md")
+	customSkills := filepath.Join(t.TempDir(), "my-skills")
+
+	s := stateWith(
+		approvedRule("CLAUDE rule", "global rule", "CLAUDE.md", "established", 1),
+		approvedRule("API rule", "api rule", "api", "established", 2),
+	)
+	opts := Options{
+		ClaudeMDPath: customClaude,
+		SkillsDir:    customSkills,
+	}
+	if err := Write(s, repoRoot, opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// CLAUDE.md must land at the custom path, not under repoRoot.
+	if _, err := os.Stat(customClaude); err != nil {
+		t.Errorf("CLAUDE.md not written to custom path %s: %v", customClaude, err)
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "CLAUDE.md")); err == nil {
+		t.Error("CLAUDE.md must not be written under repoRoot when ClaudeMDPath is set")
+	}
+
+	// Skill files must land under customSkills, not under repoRoot/.claude/skills.
+	if _, err := os.Stat(filepath.Join(customSkills, "api", "SKILL.md")); err != nil {
+		t.Errorf("skill file not written under custom skills dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, ".claude", "skills", "api", "SKILL.md")); err == nil {
+		t.Error("skill file must not be written under repoRoot when SkillsDir is set")
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)

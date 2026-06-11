@@ -109,7 +109,12 @@ func runWriteOutputs(args []string) error {
 		anchorExamples(&s, outputDir)
 	}
 
-	return output.Write(s, outputDir, output.Options{RAGHints: ragHints})
+	opts := output.Options{
+		RAGHints:     ragHints,
+		ClaudeMDPath: flagValue(args, "--claude-md", ""),
+		SkillsDir:    flagValue(args, "--skills-dir", ""),
+	}
+	return output.Write(s, outputDir, opts)
 }
 
 // anchorExamplesRAG uses cursor-agent to semantically find real codebase instances
