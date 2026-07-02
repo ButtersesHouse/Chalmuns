@@ -1,0 +1,38 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "chalmuns",
+  "description": "ButtersesHouse Claude Code plugins — pattern learning and skill model right-sizing.",
+  "owner": {
+    "name": "ButtersesHouse",
+    "email": "mryave@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "pattern-learner",
+      "description": "Extracts recurring coding conventions from PR review history and writes approved rules to CLAUDE.md and skill files.",
+      "author": { "name": "ButtersesHouse" },
+      "category": "development",
+      "source": "./plugins/pattern-learner"
+    },
+    {
+      "name": "skill-right-sizing",
+      "description": "right-size-skills proposes the cheapest model/effort each skill needs; skill-compare A/B tests the change with a cost-adjusted verdict before you adopt it.",
+      "author": { "name": "ButtersesHouse" },
+      "category": "productivity",
+      "source": "./plugins/skill-right-sizing"
+    },
+    {
+      "name": "skill-right-sizing-beta",
+      "description": "Bleeding-edge BETA of skill-right-sizing — newest and least-tested. Installed DISABLED; enable at your own risk. Handy for running skill-compare --channels to A/B stable vs beta.",
+      "author": { "name": "ButtersesHouse" },
+      "category": "productivity",
+      "defaultEnabled": false,
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/ButtersesHouse/Chalmuns.git",
+        "path": "plugins/skill-right-sizing",
+        "ref": "beta"
+      }
+    }
+  ]
+}

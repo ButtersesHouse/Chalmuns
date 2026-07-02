@@ -1,0 +1,35 @@
+{
+  "skill_name": "right-size-skills",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Right-size the session-report skill and recommend a model and effort.",
+      "expected_output": "Recommends a small model (haiku) with low effort because the parsing is done by a bundled deterministic analyzer script, leaving only mechanical residual (paste data + simple %s). Classified as Transform/mechanical. Advisory only — no edits.",
+      "expectations": [
+        "Recommends haiku (or an explicitly cheaper-than-sonnet model)",
+        "Cites the bundled analyzer script / mechanical residual as the reason (does not down-tier merely because it 'sounds' simple)",
+        "Produces an advisory report and does not edit the skill file"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Right-size the math-olympiad skill.",
+      "expected_output": "Recommends opus with high or max effort; identifies it as hard, adversarial Reasoning; explicitly does not down-tier.",
+      "expectations": [
+        "Recommends opus (not haiku or sonnet)",
+        "Identifies it as high-stakes / novel / adversarial Reasoning",
+        "Does NOT propose down-tiering a hard-reasoning skill"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Audit my skills for model cost and give me a plan-ready report.",
+      "expected_output": "A report with per-skill archetype, recommended model/effort, confidence, and a change list limited to owned skills; treats absent/inherit model as unsized rather than endorsed; plugin skills are advisory-only.",
+      "expectations": [
+        "Output is a report/table with per-skill model + effort recommendations and rationale",
+        "Only owned skills appear in the actionable change list (plugin/marketplace skills are advisory-only)",
+        "Treats an absent or 'inherit' model as unsized, not as an endorsement of the session model"
+      ]
+    }
+  ]
+}

@@ -1,2 +1,4 @@
-# compiled binary (built into target repos, not committed here)
-/pattern-learner
+__pycache__/
+*.pyc
+.DS_Store
+/pl-check

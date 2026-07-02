@@ -1,0 +1,35 @@
+{
+  "skill_name": "skill-compare",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Two versions of a skill produced identical, correct outputs on every task. Version A ran on sonnet, version B on haiku, and both used roughly equal token counts. Which version should be adopted, and why?",
+      "expected_output": "Adopt the cheaper version (B / haiku): quality is at parity, and price-weighted cost favors haiku (~3.3x cheaper) even though raw token counts are equal. Raw token count is the wrong cost measure across models.",
+      "expectations": [
+        "Recommends adopting the haiku version",
+        "Justifies cost by PRICE-WEIGHTING per model, not by raw token count",
+        "Notes quality parity (equal correctness) as the precondition for down-tiering"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "An A/B comparison ran only 1 repetition on 1 eval and version B looks slightly better. What verdict should be returned?",
+      "expected_output": "INCONCLUSIVE / underpowered: do not declare a winner from 1 rep on 1 eval; recommend increasing repetitions and adding evals before deciding.",
+      "expectations": [
+        "Returns INCONCLUSIVE (or explicitly refuses to declare a winner)",
+        "Cites low statistical power (too few reps/evals) as the reason",
+        "Recommends increasing repetitions before deciding"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "How do I A/B test the beta version of the right-size-skills skill against the stable one?",
+      "expected_output": "Use the --channels mode: it auto-locates the installed stable and beta copies and compares them, running each on its own model and returning a cost-adjusted verdict. Requires both the stable and beta marketplaces to be added.",
+      "expectations": [
+        "Points to the --channels mode (or resolve_channels.py) to locate the two installed copies",
+        "Notes that both stable and beta marketplaces must be added first",
+        "Ends in a cost-adjusted verdict rather than a static assessment"
+      ]
+    }
+  ]
+}
