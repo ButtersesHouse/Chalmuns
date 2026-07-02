@@ -97,7 +97,7 @@ else: sys.stderr.write(f"bad bump '{bump}'\n"); sys.exit(3)
 print(f"{a}.{b}.{c}")
 PY
 )"
-TAG="v$NEW"
+TAG="skill-right-sizing--v$NEW"   # plugin-scoped tag (repo hosts multiple plugins)
 echo "== version: $CUR -> $NEW (tag $TAG) =="
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   echo "ERROR: tag $TAG already exists. Bump differently."; exit 1
