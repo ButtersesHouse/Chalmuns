@@ -51,33 +51,25 @@ Writes `~/.claude/skill-compare/trend.md`. Runs nothing else — safe any time.
 
 ### 1. Resolve the two versions → isolated dirs
 
-Set `WS=<cwd>/skill-compare-workspace`. Materialize both versions:
-- **`skillA skillB`** — two skill directories → `WS/versionA`, `WS/versionB`.
-- **`--skill <path> --patch <k=v…>`** — `versionA` = copy of the skill;
-  `versionB` = same copy with the frontmatter patched (e.g. `model=haiku`,
-  `effort=low`). The headline mode for model/effort sweeps.
-- **`--git <refA> <refB>`** — extract the skill dir at each ref
-  (`git -C <repo> archive <ref> <skill-subpath> | tar -x -C …`) → versionA/B.
-- **`--channels <skill-name>`** — for the marketplace beta framework: auto-locate
-  the installed **stable** and **beta** copies. Run
-  `python <skill-dir>/scripts/resolve_channels.py <skill-name>`; it returns the
-  stable/beta dirs (channel inferred from marketplace name, e.g. `kara-kara` vs
-  `kara-kara-beta`), which feed the `--dirs` flow (stable=versionA, beta=versionB).
-  Errors if both channels aren't installed — tell the user to add the beta
-  marketplace first. With no tasks supplied, use the target skill's bundled
-  `evals/evals.json`.
-
-Then **strip version-identifying markers** from both copies (version strings,
-changelog comments, differing header text) so the blind comparator cannot infer
-provenance from the outputs. The only intended difference is the change under test.
-
-Also write `WS/meta.json` describing the comparison, so the ledger record is
-self-contained:
-```json
-{"skill": "<name>", "change": "model=haiku (B) vs model=sonnet (A)",
- "versions": {"versionA": {"model": "sonnet", "effort": null},
-              "versionB": {"model": "haiku", "effort": "low"}}}
+Set `WS=<cwd>/skill-compare-workspace`, then run **`prepare.py`** (deterministic —
+it materializes both versions, parses each frontmatter `model`/`effort`, writes
+`WS/meta.json`, and scaffolds the run tree). Pick the mode:
+```sh
+python <skill-dir>/scripts/prepare.py --ws WS --evals <evals.json> --reps 3 \
+  ( --dirs <A> <B> \
+  | --skill <path> --patch model=haiku [effort=low]   # headline: model/effort sweep \
+  | --git <repo> <refA> <refB> [--subpath <p>] \
+  | --channels <skill-name> [--root <r>] )             # stable vs beta (reuses resolve_channels.py)
 ```
+It produces `WS/versionA`, `WS/versionB`, `WS/meta.json` (the exact schema
+`verdict.py` consumes), and the layout
+`WS/iteration-1/eval-<K>/{versionA,versionB}/run-<N>/outputs/` + `eval-<K>/comparison/`.
+`--channels` errors if both channels aren't installed (tell the user to add the
+beta marketplace first).
+
+Blinding is handled by neutral slot paths in step 5 — do **not** scrub the skill
+files. If a skill *emits* its own version string into its output, note it in the
+report rather than trying to strip it.
 
 ### 2. Get eval tasks
 
@@ -87,31 +79,26 @@ confirm. For each task, note whether it has a **deterministic oracle** — a
 checkable answer computable by a script (e.g. session-report's token math). Tasks
 with an oracle get objective grading; prefer to include at least one.
 
-### 3. Read each version's execution config
+### 3. Execution config (already parsed)
 
-Parse `model:` and `effort:` from each version's frontmatter. `inherit`/absent →
-session default. These drive step 4 — this is what makes the A/B test the change.
+`prepare.py` already parsed each version's `model`/`effort` into `WS/meta.json`
+(`inherit`/absent → `null` = session default). Use those values when pinning the
+executors in step 4 — no manual frontmatter reading.
 
 ### 4. Run paired executions (N reps, default 3)
 
-For each `eval × version × rep`, spawn an **executor subagent pinned to that
-version's model/effort** via the Agent tool (`model`, `effort` params), giving it:
-that version's SKILL.md body, the task prompt, any input files, and an output dir.
-Spawn both versions' runs in the same turn (parallel). Capture `total_tokens` and
-`duration_ms` from each task-completion notification.
-
-Write this exact layout (what `scripts/verdict.py` and skill-creator's aggregator
-both read):
-```
-WS/iteration-1/eval-<K>/
-  versionA/run-<N>/{outputs/…, grading.json, timing.json}
-  versionB/run-<N>/{outputs/…, grading.json, timing.json}
-  comparison/run-<N>/{comparison.json, slotmap.json}
-```
-`timing.json` = `{"total_tokens": …, "total_duration_seconds": …}`.
+The run tree is already scaffolded by `prepare.py`. For each `eval × version ×
+rep`, spawn an **executor subagent pinned to that version's model/effort** (from
+`meta.json`) via the Agent tool (`model`, `effort` params), giving it that
+version's SKILL.md body, the task prompt, any input files, and the pre-created
+`WS/iteration-1/eval-<K>/<version>/run-<N>/outputs/` dir. Spawn both versions'
+runs in the same turn (parallel). Capture `total_tokens` and `duration_ms` from
+each task-completion notification and write
+`…/run-<N>/timing.json` = `{"total_tokens": …, "total_duration_seconds": …}`.
 
 Note: giving the executor the skill body approximates real Skill-tool invocation
-(the same approximation skill-creator makes) — state this in the report.
+(the same approximation skill-creator makes) — state this in the report. (Phase 2
+replaces this whole step with a deterministic `claude -p` driver.)
 
 ### 5. Grade each run (triangulate)
 
@@ -119,12 +106,17 @@ Note: giving the executor the skill body approximates real Skill-tool invocation
   `{"summary": {"pass_rate", "passed", "failed", "total"}, "expectations":[{text,passed,evidence}]}`.
 - **Assertions** (optional): if the eval has `expectations[]` and skill-creator is
   installed, use its `agents/grader.md` to grade → same `grading.json` schema.
-- **Blind quality**: for each `eval × rep`, spawn a comparator subagent with
-  `references/comparator.md`, passing versionA's and versionB's outputs. **Randomize
-  which version is slot A vs B** and write the mapping to
-  `comparison/run-N/slotmap.json` as `{"A": "versionA"|"versionB", "B": …}`; pass
-  the oracle result if available. The comparator writes `comparison.json`
-  (`winner: A|B|TIE` + scores) — blind to provenance.
+- **Blind quality**: first run **`blind.py`** to stage the comparison —
+  deterministic, seeded slot randomization + neutral copies + `slotmap.json`:
+  ```sh
+  python <skill-dir>/scripts/blind.py WS/iteration-1 [--seed S] [--per eval|rep]
+  ```
+  It writes `comparison/run-<N>/{slotA, slotB, slotmap.json}`. Then, for each
+  staged comparison, spawn a comparator subagent with `references/comparator.md`,
+  passing the neutral **`slotA`** and **`slotB`** dirs (never the versionA/B paths)
+  plus the oracle result if available. The comparator writes `comparison.json`
+  (`winner: A|B|TIE` + scores) — blind to provenance. `verdict.py` de-blinds via
+  `slotmap.json`.
 
 ### 6. Aggregate + decide
 
@@ -163,6 +155,11 @@ adopting the winner is a separate, user-approved step.
 
 - **`references/comparator.md`** — vendored blind A/B judge (spawn as a subagent).
 - **`references/verdict-rules.md`** — the cost-adjusted decision rule + thresholds.
+- **`scripts/prepare.py`** — deterministic version materialization
+  (`--dirs`/`--patch`/`--git`/`--channels`) + frontmatter parse + `meta.json` +
+  run-tree scaffold. Replaces step-1/step-3 bookkeeping.
+- **`scripts/blind.py`** — deterministic seeded slot randomization + neutral
+  `slotA/slotB` copies + `slotmap.json`. Replaces the step-5 blinding hygiene.
 - **`scripts/verdict.py`** — stats + verdict + ledger append;
   `python scripts/verdict.py <iteration-dir> --meta <meta.json>`.
 - **`scripts/trend.py`** — summarize the rolling ledger over time;
