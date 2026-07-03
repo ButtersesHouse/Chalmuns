@@ -1,10 +1,16 @@
 {
-  "name": "skill-right-sizing",
+  "name": "skill-right-sizing-beta",
   "description": "Right-size the model each skill uses (right-size-skills), then A/B test the change with a cost-adjusted verdict before adopting it (skill-compare).",
-  "version": "0.1.0",
+  "version": "0.1.1-beta.1",
   "author": {
     "name": "ButtersesHouse",
     "email": "mryave@gmail.com"
   },
-  "keywords": ["skills", "model-selection", "cost", "a-b-testing", "right-sizing"]
+  "keywords": [
+    "skills",
+    "model-selection",
+    "cost",
+    "a-b-testing",
+    "right-sizing"
+  ]
 }
