@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/detect"
+	"github.com/ButtersesHouse/Chalmuns/internal/format"
 	"github.com/ButtersesHouse/Chalmuns/internal/guard"
 	"github.com/ButtersesHouse/Chalmuns/internal/output"
 	"github.com/ButtersesHouse/Chalmuns/internal/pipeline"
@@ -19,7 +20,8 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
-		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage, guard")
+		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
+		fmt.Fprintln(os.Stderr, "             audit-format, guard")
 		os.Exit(1)
 	}
 
@@ -41,6 +43,8 @@ func main() {
 		err = pipeline.RunClassify(os.Args[2:])
 	case "triage":
 		err = pipeline.RunTriage(os.Args[2:])
+	case "audit-format":
+		err = format.RunAuditFormat(os.Args[2:])
 	case "guard":
 		err = guard.Run()
 	default:

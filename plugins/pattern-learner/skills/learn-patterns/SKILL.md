@@ -12,8 +12,9 @@ Extracts coding conventions and developer preferences from merged PR review comm
 
 Every deterministic step in this pipeline is implemented as a subcommand of the
 `pattern-learner` binary (`$BIN`): `detect-repo`, `state-read`, `state-write`,
-`write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`. **These
-subcommands are the only sanctioned implementations of their logic.**
+`write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`,
+`audit-format`. **These subcommands are the only sanctioned implementations of
+their logic.**
 
 - **Do NOT** write or run ad-hoc scripts (Python, Node, Ruby, Perl, shell scripts, etc.)
   to fetch, preprocess, ground-check, deduplicate by rule, score confidence, or triage.
@@ -86,7 +87,7 @@ If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
 
-**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
+**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `audit-format`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
 
 **Create the run-lock** (enables the off-script guard for the duration of this run):
 ```
@@ -528,6 +529,59 @@ This writes:
 
 ---
 
+### Step 12.5: Format check
+
+Run the deterministic size/frontmatter check against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
+
+```
+$BIN audit-format <skills-dir>/<domain1>/SKILL.md <skills-dir>/<domain2>/SKILL.md ...
+```
+
+This mirrors the size/frontmatter budget the `skill-right-sizing` plugin's
+`right-format-skills` skill checks hand-authored skills against (500-line
+body budget; `name`/`description` frontmatter validity) — see that skill's
+`references/rubric.md` for the full citations. `audit-format` is a narrower,
+Go-native port scoped to what `write-outputs`' fixed template can actually
+produce.
+
+For each result:
+- **`frontmatter_issues` non-empty** — the domain name or its generated
+  description violates the documented frontmatter rules (e.g. Step 8B/A3
+  picked a domain name with an underscore or uppercase letter, or
+  `domain_descriptions[domain]` grew past 1024 chars). This is a **state
+  problem**, not a text-edit problem.
+- **`over_budget`** (>500 lines) or **`approaching_budget`** (400–499
+  lines) — the domain has accumulated enough rules that the generated file
+  is, or is about to be, oversized.
+
+**Do not hand-edit the generated `SKILL.md` to fix either finding** (e.g. by
+extracting a section into a reference file the way `right-format-skills`
+would for a hand-authored skill). `write-outputs` does a full atomic
+rewrite of that file from state on *every* run — a hand-split reference
+file would be silently orphaned the next time pattern-learner runs. The
+durable fix lives at the **state** level:
+
+- **Frontmatter issue**: propose a corrected domain name (valid charset) or
+  a shortened `domain_descriptions[domain]` entry to the user.
+- **Over/approaching budget**: read that domain's approved rules (already
+  in memory from Step 4 / assembled in Step 11) and propose splitting them
+  into narrower sub-domains — the same judgment call as Step 8B's domain
+  normalization, run in reverse. Look for a natural split (shared
+  `file_glob` sub-paths, or a sub-topic within the domain) rather than an
+  arbitrary line-count cut. Present the proposed split — which rules move
+  to which new domain name(s) — and ask the user to approve it.
+
+On approval: re-target the affected rules' `target.location` to the new
+domain name(s), refresh `domain_descriptions` for every domain touched, then
+re-run **Step 11** (state-write) and **Step 12** (write-outputs) so the split
+is regenerated durably. Re-run this step on the new files to confirm they're
+now within budget.
+
+On decline: note the finding in the Step 13 summary and continue without
+changing state — this step never edits a file or state on its own.
+
+---
+
 ### Step 13: Summary
 
 Report to the user:
@@ -560,6 +614,9 @@ Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
 RAG hints in skill files:   <yes | no>
+Format check (audit-format):
+  <"all domain skills within budget, no frontmatter issues" |
+   list per flagged domain: "<domain>: <N> lines (over budget|approaching) — <split proposed and applied | split proposed, declined | not yet resolved>" and/or "<domain>: frontmatter issue — <finding> — <fixed | declined>">
 ─────────────────────────────────────────────────────
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "pattern-learner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Extracts recurring coding conventions from PR review history and writes approved rules to CLAUDE.md and skill files",
   "author": {
     "name": "ButtersesHouse",
