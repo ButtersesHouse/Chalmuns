@@ -1,0 +1,35 @@
+{
+  "skill_name": "right-format-skills",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Check whether my skill-compare skill's SKILL.md is too long or needs reformatting.",
+      "expected_output": "Runs scripts/audit_format.py against the skill, reports its body line count against the 500-line budget, and notes any structure findings (nested references, missing TOC on reference files >100 lines) as candidates to confirm rather than automatic verdicts. Produces an advisory report and does not edit the skill file.",
+      "expectations": [
+        "Runs or references the deterministic audit_format.py scan rather than eyeballing line counts",
+        "States the body line count against the 500-line ceiling explicitly",
+        "Does not edit the skill file in this pass"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "One of my skills is 700 lines. Decompose it.",
+      "expected_output": "Reads the skill body, proposes a concrete decomposition plan (which sections move to which named reference files, keeping references one level deep from SKILL.md), and gives the exact scripts/decompose.py commands — but does not run them without the user approving the plan (either via a separate --apply invocation or explicit confirmation).",
+      "expectations": [
+        "Proposes specific section -> target-file mappings, not a generic 'split it up' answer",
+        "Keeps proposed reference files one level deep (no reference file pointing to a further reference file)",
+        "Does not silently run decompose.py without the plan being approved first"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Audit my skills for format and give me a plan-ready report, including plugin skills.",
+      "expected_output": "A report with per-skill body-line status, frontmatter validity, and structure findings; a plan-ready decompose command list limited to owned skills; plugin/marketplace skills included as advisory-only and excluded from the actionable command list.",
+      "expectations": [
+        "Output is a report with per-skill size/structure findings, not just a pass/fail",
+        "Only owned skills appear in the plan-ready decompose command list",
+        "Plugin skills are marked advisory-only, consistent with them being overwritten on update"
+      ]
+    }
+  ]
+}

@@ -16,7 +16,7 @@
     },
     {
       "name": "skill-right-sizing",
-      "description": "right-size-skills proposes the cheapest model/effort each skill needs; skill-compare A/B tests the change with a cost-adjusted verdict before you adopt it.",
+      "description": "right-size-skills proposes the cheapest model/effort each skill needs; skill-compare A/B tests the change with a cost-adjusted verdict before you adopt it; right-format-skills audits skill files against Anthropic's format/size guidance and can decompose oversized ones.",
       "author": { "name": "ButtersesHouse" },
       "category": "productivity",
       "source": "./plugins/skill-right-sizing"

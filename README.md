@@ -28,6 +28,11 @@ into the target repo; requires Go 1.21+). Source in `plugins/pattern-learner/`.
   on its own model, grades blind, returns a **cost-adjusted verdict**; logs every
   run to a rolling ledger for trends over time. `--channels` A/B-tests the beta
   entry against stable.
+- **`right-format-skills`** — audits `SKILL.md` files against Anthropic's
+  published format/size guidance (500-line body budget, frontmatter validity,
+  progressive-disclosure structure), then proposes — and can mechanically
+  execute via `--apply` — a decomposition into reference files for anything
+  oversized.
 
 A `skill-right-sizing-beta` channel (git-subdir @ the `beta` branch,
 `defaultEnabled: false`) lets you run the newest build at your own risk.
@@ -38,7 +43,7 @@ A `skill-right-sizing-beta` channel (git-subdir @ the `beta` branch,
 .claude-plugin/marketplace.json     ← marketplace manifest
 plugins/
 ├── pattern-learner/                ← Go plugin (cmd/ internal/ hooks/ skills/ go.mod)
-└── skill-right-sizing/             ← skills plugin (right-size-skills + skill-compare)
+└── skill-right-sizing/             ← skills plugin (right-size-skills + skill-compare + right-format-skills)
 release.sh                          ← publishes skill-right-sizing (stable + --beta lanes)
 ```
 

@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV="$HOME/.claude/skills"
 PLUG="$ROOT/plugins/skill-right-sizing"
 MANIFEST="$PLUG/.claude-plugin/plugin.json"
-SKILLS=(right-size-skills skill-compare)
+SKILLS=(right-size-skills skill-compare right-format-skills)
 cd "$ROOT"
 
 mirror() {  # dev copies -> plugin tree (idempotent)

@@ -1,7 +1,7 @@
 {
   "name": "skill-right-sizing",
-  "description": "Right-size the model each skill uses (right-size-skills), then A/B test the change with a cost-adjusted verdict before adopting it (skill-compare).",
-  "version": "0.2.0",
+  "description": "Right-size the model each skill uses (right-size-skills), then A/B test the change with a cost-adjusted verdict before adopting it (skill-compare). Also right-sizes the skill files themselves against Anthropic's format/size guidance, with a means to decompose oversized ones (right-format-skills).",
+  "version": "0.3.0",
   "author": {
     "name": "ButtersesHouse",
     "email": "mryave@gmail.com"
@@ -11,6 +11,8 @@
     "model-selection",
     "cost",
     "a-b-testing",
-    "right-sizing"
+    "right-sizing",
+    "skill-format",
+    "progressive-disclosure"
   ]
 }
