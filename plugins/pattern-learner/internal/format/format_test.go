@@ -105,6 +105,11 @@ func TestAuditFile_missingFile(t *testing.T) {
 }
 
 func TestCountLines(t *testing.T) {
+	// Expected values mirror Python's len(body.splitlines()), which the
+	// sibling audit_format.py uses — verified against `python3 -c
+	// "print(len(s.splitlines()))"` for each case, including trailing blank
+	// lines (a naive strings.TrimRight(body, "\n") would collapse those away
+	// and undercount).
 	cases := []struct {
 		body string
 		want int
@@ -114,6 +119,10 @@ func TestCountLines(t *testing.T) {
 		{"one line", 1},
 		{"line1\nline2\nline3\n", 3},
 		{"line1\nline2\nline3", 3},
+		{"line1\n\n\n\n", 4},
+		{"line1\n\n", 2},
+		{"\n", 1},
+		{"\n\n", 2},
 	}
 	for _, tc := range cases {
 		if got := countLines(tc.body); got != tc.want {

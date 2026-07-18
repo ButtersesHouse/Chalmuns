@@ -88,12 +88,19 @@ func parseFrontmatter(text string) (map[string]string, string) {
 	return fields, body
 }
 
+// countLines mirrors Python's len(s.splitlines()): a trailing newline does
+// not add an extra (empty) line, but interior/multiple trailing blank lines
+// each count — unlike strings.TrimRight(body, "\n"), which collapses every
+// trailing blank line away and would undercount a padded body.
 func countLines(body string) int {
-	body = strings.TrimRight(body, "\n")
 	if body == "" {
 		return 0
 	}
-	return strings.Count(body, "\n") + 1
+	n := strings.Count(body, "\n")
+	if strings.HasSuffix(body, "\n") {
+		return n
+	}
+	return n + 1
 }
 
 // checkFrontmatter validates name/description against Anthropic's documented

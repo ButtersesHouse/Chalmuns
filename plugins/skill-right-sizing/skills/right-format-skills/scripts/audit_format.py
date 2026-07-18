@@ -99,9 +99,13 @@ def find_local_md_links(body):
         target = m.group(2)
         if target.startswith(("http://", "https://", "#")):
             continue
+        target = target.split("#", 1)[0].split("?", 1)[0]  # strip anchor/query
         if target.lower().endswith(".md"):
             links.add(target)
-    for m in BARE_PATH_RE.finditer(body):
+    # Exclude URLs before the bare-path scan so a substring inside
+    # https://example.com/docs/spec.md isn't misread as a local file.
+    body_no_urls = re.sub(r"https?://\S+", "", body)
+    for m in BARE_PATH_RE.finditer(body_no_urls):
         links.add(m.group(0).strip("`*"))
     return sorted(links)
 
@@ -114,7 +118,9 @@ def check_reference_file(path):
         return None, None, None
     lines = text.splitlines()
     head = "\n".join(lines[:15]).lower()
-    has_toc = "content" in head or bool(re.search(r"^#+\s*(table of )?contents", head, re.MULTILINE))
+    # Require an actual "Contents" *heading*, not just the word "content"
+    # appearing in ordinary prose (e.g. "documents the content of...").
+    has_toc = bool(re.search(r"^#+\s*(table of )?contents\b", head, re.MULTILINE))
     return len(lines), has_toc, bool(WINDOWS_PATH_RE.search(text))
 
 

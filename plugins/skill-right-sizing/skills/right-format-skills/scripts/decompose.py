@@ -23,24 +23,52 @@ import argparse, re, sys
 from pathlib import Path
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
+
+
+def _heading_lines(lines):
+    """Yield (index, match) for lines that are real headings — i.e. HEADING_RE
+    matches and the line is not inside a fenced code block. A `#`-prefixed
+    comment inside a ``` fence must never be mistaken for a markdown heading."""
+    in_fence = False
+    fence_marker = None
+    for i, line in enumerate(lines):
+        fm = FENCE_RE.match(line)
+        if fm:
+            marker = fm.group(1)[0] * 3  # normalize to the fence character run
+            if not in_fence:
+                in_fence, fence_marker = True, marker
+            elif marker[0] == fence_marker[0]:
+                in_fence, fence_marker = False, None
+            continue
+        if in_fence:
+            continue
+        m = HEADING_RE.match(line)
+        if m:
+            yield i, m
 
 
 def find_section(lines, heading_text):
-    """Locate a heading matching heading_text (case-insensitive, exact text)
-    and return (start_index, level, end_index_exclusive)."""
-    start = None
-    level = None
-    for i, line in enumerate(lines):
-        m = HEADING_RE.match(line)
-        if m and m.group(2).strip().lower() == heading_text.strip().lower():
-            start, level = i, len(m.group(1))
-            break
-    if start is None:
+    """Locate the heading matching heading_text (case-insensitive, exact
+    text, ignoring anything inside fenced code blocks) and return
+    (start_index, level, end_index_exclusive). Raises SystemExit if the
+    heading text is ambiguous (matches more than once)."""
+    wanted = heading_text.strip().lower()
+    matches = [(i, m) for i, m in _heading_lines(lines) if m.group(2).strip().lower() == wanted]
+    if not matches:
         return None
+    if len(matches) > 1:
+        lines_found = ", ".join(str(i + 1) for i, _ in matches)
+        raise SystemExit(
+            f"error: heading {heading_text!r} matches {len(matches)} times "
+            f"(lines {lines_found}) — use a more specific --heading or disambiguate manually"
+        )
+    start, m = matches[0]
+    level = len(m.group(1))
+
     end = len(lines)
-    for j in range(start + 1, len(lines)):
-        m = HEADING_RE.match(lines[j])
-        if m and len(m.group(1)) <= level:
+    for j, m2 in _heading_lines(lines):
+        if j > start and len(m2.group(1)) <= level:
             end = j
             break
     return start, level, end
@@ -50,6 +78,12 @@ def decompose(skill_md, heading_text, target_name, summary=None, dry_run=False):
     skill_md = Path(skill_md).expanduser().resolve()
     if not skill_md.exists():
         raise SystemExit(f"error: {skill_md} not found")
+
+    target_parts = Path(target_name).parts
+    if Path(target_name).is_absolute() or len(target_parts) != 1 or target_name in (".", ".."):
+        raise SystemExit(
+            f"error: --target must be a plain filename in the skill directory, got {target_name!r}"
+        )
 
     text = skill_md.read_text()
     lines = text.splitlines()
@@ -77,14 +111,15 @@ def decompose(skill_md, heading_text, target_name, summary=None, dry_run=False):
     new_lines = lines[:start] + replacement + lines[end:]
     new_text = "\n".join(new_lines) + "\n"
 
+    if target_path.exists():
+        raise SystemExit(f"error: {target_path} already exists — pick a different --target")
+
     if dry_run:
         print(f"-- would write {target_path} ({len(new_file_lines)} lines) --")
         print(new_file_text)
         print(f"-- would rewrite {skill_md} (section '{heading_title}' -> pointer) --")
         return
 
-    if target_path.exists():
-        raise SystemExit(f"error: {target_path} already exists — pick a different --target")
     target_path.write_text(new_file_text)
     skill_md.write_text(new_text)
     print(f"extracted '{heading_title}' -> {target_path}")

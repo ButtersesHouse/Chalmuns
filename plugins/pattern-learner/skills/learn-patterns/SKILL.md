@@ -531,7 +531,9 @@ This writes:
 
 ### Step 12.5: Format check
 
-Run the deterministic size/frontmatter check against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
+If this run touched **zero** domains (e.g. a `--review` or `--add` run whose only approved/written rules targeted `CLAUDE.md`), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
+
+Otherwise, run the deterministic size/frontmatter check against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
 
 ```
 $BIN audit-format <skills-dir>/<domain1>/SKILL.md <skills-dir>/<domain2>/SKILL.md ...
@@ -615,7 +617,8 @@ Stale rules (last_seen_pr is 200+ below current watermark):
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
 RAG hints in skill files:   <yes | no>
 Format check (audit-format):
-  <"all domain skills within budget, no frontmatter issues" |
+  <"skipped — no domain skill files touched this run" |
+   "all domain skills within budget, no frontmatter issues" |
    list per flagged domain: "<domain>: <N> lines (over budget|approaching) — <split proposed and applied | split proposed, declined | not yet resolved>" and/or "<domain>: frontmatter issue — <finding> — <fixed | declined>">
 ─────────────────────────────────────────────────────
 ```
