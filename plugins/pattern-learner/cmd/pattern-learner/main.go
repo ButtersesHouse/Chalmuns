@@ -117,6 +117,7 @@ func runWriteOutputs(args []string) error {
 		RAGHints:     ragHints,
 		ClaudeMDPath: flagValue(args, "--claude-md", ""),
 		SkillsDir:    flagValue(args, "--skills-dir", ""),
+		AgentsMDPath: flagValue(args, "--agents-md", ""),
 	}
 	return output.Write(s, outputDir, opts)
 }

@@ -534,6 +534,7 @@ Build the flags based on available tools:
 $BIN write-outputs \
   --state .claude/pattern-learner/state.json \
   --claude-md CLAUDE.md \
+  --agents-md AGENTS.md \
   --skills-dir .claude/skills \
   [--rag-hints] [--rag]
 ```
@@ -544,6 +545,11 @@ If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched 
 
 This writes:
 - `CLAUDE.md` at the path given by `--claude-md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
+- `AGENTS.md` at the path given by `--agents-md` (default `<output-dir>/AGENTS.md`;
+  `none` suppresses) — the cross-agent convention (https://agents.md) read by Codex,
+  Cursor, Gemini CLI, and other agents that never load `CLAUDE.md` or `.claude/skills`.
+  Carries the same universal rules plus a **domain index** (globs → skill file path)
+  routing those agents to the per-domain files and their companions.
 - `<skills-dir>/<domain>/SKILL.md` — one skill per domain, generated with progressive
   disclosure so the always-loaded body stays lean (skill bodies are a recurring token
   cost once loaded):
@@ -591,6 +597,7 @@ New rules proposed:         <N>
 Supersessions accepted:     <N>  (existing rules replaced)
 Files written:
   CLAUDE.md                 (<N> rules)
+  AGENTS.md                 (<N> universal rules + <N>-domain index)
   .claude/skills/<domain>/SKILL.md  (<N> rules, <inline | chunked index> + <N> examples/rules companion files)
   [...]
 Stale rules (last_seen_pr is 200+ below current watermark):

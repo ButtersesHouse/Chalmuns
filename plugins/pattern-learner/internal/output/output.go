@@ -31,6 +31,11 @@ type Options struct {
 	// files. When empty, defaults to <outputDir>/.claude/skills. Set this to
 	// decouple the skill files location from the CLAUDE.md location.
 	SkillsDir string
+	// AgentsMDPath is the destination for AGENTS.md (the agents.md convention
+	// read by Codex and other coding agents that don't load CLAUDE.md or
+	// .claude/skills). When empty, defaults to <outputDir>/AGENTS.md. The
+	// special values "none" and os.DevNull suppress the output.
+	AgentsMDPath string
 }
 
 // Write generates CLAUDE.md and per-domain skill files.
@@ -55,6 +60,15 @@ func Write(s state.State, outputDir string, opts Options) error {
 			return err
 		}
 	}
+	agentsMDPath := opts.AgentsMDPath
+	if agentsMDPath == "" {
+		agentsMDPath = filepath.Join(outputDir, "AGENTS.md")
+	}
+	if agentsMDPath != "none" && agentsMDPath != os.DevNull {
+		if err := writeAgentsMD(s, agentsMDPath, skillsDir); err != nil {
+			return err
+		}
+	}
 	return writeSkillFiles(s, skillsDir, opts)
 }
 
@@ -71,15 +85,95 @@ func writeCLAUDEMD(s state.State, path string) error {
 	b.WriteString("# Coding Conventions\n\n")
 	b.WriteString("These conventions were extracted from PR review history.")
 	b.WriteString(" See `.claude/pattern-learner/state.json` for provenance.\n\n")
+	renderUniversalRules(&b, rules, "##")
 
+	return atomicWrite(path, b.String())
+}
+
+// renderUniversalRules writes CLAUDE.md-targeted rules at the given heading level.
+func renderUniversalRules(b *strings.Builder, rules []state.Rule, heading string) {
 	for _, r := range rules {
-		b.WriteString(fmt.Sprintf("## %s\n\n", r.Title))
-		renderExamples(&b, r, 1)
+		b.WriteString(fmt.Sprintf("%s %s\n\n", heading, r.Title))
+		renderExamples(b, r, 1)
 		b.WriteString(r.Rule + "\n\n")
 		b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
 	}
+}
+
+// writeAgentsMD writes an AGENTS.md (https://agents.md — the cross-agent
+// convention read by Codex, Cursor, Gemini CLI, and others). It carries the
+// universal rules and, because those agents do not auto-load .claude/skills,
+// an index routing them to each domain's skill file by glob.
+func writeAgentsMD(s state.State, path, skillsDir string) error {
+	universal := approvedRules(s, "CLAUDE.md")
+	if len(universal) > maxCLAUDERules {
+		universal = universal[:maxCLAUDERules]
+	}
+
+	type domainInfo struct {
+		name  string
+		globs []string
+	}
+	byDomain := map[string][]string{}
+	for _, r := range s.Rules {
+		if r.Status != "approved" || r.Target.Location == "CLAUDE.md" || r.Target.Location == "" {
+			continue
+		}
+		byDomain[r.Target.Location] = append(byDomain[r.Target.Location], r.Target.FileGlob...)
+	}
+	var domains []domainInfo
+	for name, globs := range byDomain {
+		domains = append(domains, domainInfo{name, dedupeStrings(globs)})
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i].name < domains[j].name })
+
+	if len(universal) == 0 && len(domains) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	b.WriteString("# Coding Conventions\n\n")
+	b.WriteString("Conventions extracted from this repo's PR review history by pattern-learner.")
+	b.WriteString(" This file follows the AGENTS.md convention (https://agents.md) so any coding agent can use it.")
+	b.WriteString(" See `.claude/pattern-learner/state.json` for provenance.\n\n")
+
+	if len(universal) > 0 {
+		b.WriteString("## Universal rules\n\n")
+		b.WriteString("These apply to every file in the repository.\n\n")
+		renderUniversalRules(&b, universal, "###")
+	}
+
+	if len(domains) > 0 {
+		b.WriteString("## Domain conventions\n\n")
+		b.WriteString("Rules scoped to parts of the codebase live in per-domain files (plain markdown).")
+		b.WriteString(" Before editing files matching a domain's globs, read that domain's file and follow its links to the `examples/` or `rules/` companion files for code samples.\n\n")
+		for _, d := range domains {
+			ref := filepath.Join(skillsDir, d.name, "SKILL.md")
+			if rel, err := filepath.Rel(filepath.Dir(path), ref); err == nil && !strings.HasPrefix(rel, "..") {
+				ref = rel
+			}
+			scope := d.name
+			if len(d.globs) > 0 {
+				scope = "`" + strings.Join(d.globs, "`, `") + "`"
+			}
+			b.WriteString(fmt.Sprintf("- %s → `%s`\n", scope, ref))
+		}
+		b.WriteString("\n")
+	}
 
 	return atomicWrite(path, b.String())
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // writeSkillFiles writes per-domain skill files under skillsDir.

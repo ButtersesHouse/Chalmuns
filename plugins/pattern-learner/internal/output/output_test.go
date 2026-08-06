@@ -724,6 +724,61 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 	}
 }
 
+func TestAgentsMDWritten(t *testing.T) {
+	dir := t.TempDir()
+	universal := approvedRule("No abbreviations", "Never abbreviate identifiers", "CLAUDE.md", "stated", 1)
+	domain := approvedRule("API rule", "do it in api", "api", "stated", 2)
+	domain.Target.FileGlob = []string{"src/api/**/*.go"}
+	if err := Write(stateWith(universal, domain), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
+	if !strings.Contains(content, "https://agents.md") {
+		t.Error("AGENTS.md should name the convention it follows")
+	}
+	if !strings.Contains(content, "Never abbreviate identifiers") {
+		t.Error("AGENTS.md should carry the universal rules")
+	}
+	if !strings.Contains(content, "`src/api/**/*.go`") {
+		t.Error("domain index should list the domain's globs")
+	}
+	if !strings.Contains(content, filepath.Join(".claude", "skills", "api", "SKILL.md")) {
+		t.Errorf("domain index should link the skill file relatively; got:\n%s", content)
+	}
+}
+
+func TestAgentsMDDomainOnlyStillWritten(t *testing.T) {
+	// Even with no universal rules, other agents need the domain index since
+	// they never auto-load .claude/skills.
+	dir := t.TempDir()
+	domain := approvedRule("API rule", "do it in api", "api", "stated", 1)
+	domain.Target.FileGlob = []string{"src/api/**/*.go"}
+	if err := Write(stateWith(domain), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
+	if !strings.Contains(content, "## Domain conventions") {
+		t.Error("AGENTS.md should be written for domain-only states")
+	}
+	if strings.Contains(content, "## Universal rules") {
+		t.Error("empty universal section should be omitted")
+	}
+}
+
+func TestAgentsMDSuppressedWithNone(t *testing.T) {
+	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
+	for _, target := range []string{"none", os.DevNull} {
+		out := t.TempDir()
+		if err := Write(stateWith(r), out, Options{AgentsMDPath: target}); err != nil {
+			t.Fatalf("AgentsMDPath=%q: %v", target, err)
+		}
+		if _, err := os.Stat(filepath.Join(out, "AGENTS.md")); !os.IsNotExist(err) {
+			t.Errorf("AgentsMDPath=%q: AGENTS.md should not be written", target)
+		}
+	}
+}
+
 func TestSkillFrontmatterPathsGate(t *testing.T) {
 	dir := t.TempDir()
 	withGlobs := approvedRule("API rule", "do it", "api", "stated", 1)
