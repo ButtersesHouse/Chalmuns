@@ -724,6 +724,26 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 	}
 }
 
+func TestSkillFrontmatterPathsGate(t *testing.T) {
+	dir := t.TempDir()
+	withGlobs := approvedRule("API rule", "do it", "api", "stated", 1)
+	withGlobs.Target.FileGlob = []string{"src/api/**/*.go", "src/api/**/*.sql"}
+	noGlobs := approvedRule("Docs rule", "do it", "docs", "stated", 2)
+	noGlobs.Target.FileGlob = nil
+	if err := Write(stateWith(withGlobs, noGlobs), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	api := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(api, "paths: src/api/**/*.go, src/api/**/*.sql\n") {
+		t.Errorf("skill with globs should emit a paths gate; got header:\n%s", api[:200])
+	}
+	docs := readFile(t, filepath.Join(dir, ".claude", "skills", "docs", "SKILL.md"))
+	if strings.Contains(docs, "paths:") {
+		t.Error("skill without globs must omit paths so it can still auto-load")
+	}
+}
+
 func TestSlugify(t *testing.T) {
 	cases := map[string]string{
 		"Use errors.As for type checks": "use-errors-as-for-type-checks",

@@ -125,7 +125,7 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 	}
 
 	slugs := ruleSlugs(rules)
-	header := renderSkillHeader(domain, desc, rules)
+	header := renderSkillHeader(domain, desc, globs, rules)
 
 	// Examples always live in companion files (progressive disclosure): the
 	// SKILL.md body is a recurring token cost once loaded, so it carries only
@@ -157,11 +157,16 @@ const maxSkillLines = 450
 // maxExamplePairs caps rendered do/don't pairs; state caps the arrays at 4.
 const maxExamplePairs = 4
 
-func renderSkillHeader(domain, desc string, rules []state.Rule) string {
+func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString(fmt.Sprintf("name: %s\n", domain))
 	b.WriteString(fmt.Sprintf("description: %s\n", desc))
+	// paths gates auto-loading to work on matching files, so chain-loading
+	// several domain skills only ever pulls in the ones actually in play.
+	if len(globs) > 0 {
+		b.WriteString(fmt.Sprintf("paths: %s\n", strings.Join(globs, ", ")))
+	}
 	b.WriteString("---\n\n")
 	b.WriteString(fmt.Sprintf("# %s Conventions\n\n", capitalize(domain)))
 
