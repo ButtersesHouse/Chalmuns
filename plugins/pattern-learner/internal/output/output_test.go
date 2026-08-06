@@ -666,7 +666,7 @@ func TestStalenessNoteOnOldRule(t *testing.T) {
 			return r
 		}(),
 	)
-	s.LastExtractedPRNumber = 200 // watermark 195 ahead of last_seen_pr=5
+	s.LastExtractedPRNumber = 250 // watermark 245 ahead of last_seen_pr=5
 
 	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
@@ -674,7 +674,7 @@ func TestStalenessNoteOnOldRule(t *testing.T) {
 
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if !strings.Contains(content, "verify this convention is still current") {
-		t.Error("staleness note should appear for rules 100+ PRs behind watermark")
+		t.Error("staleness note should appear for rules 200+ PRs behind watermark")
 	}
 	if !strings.Contains(content, "last seen: PR #5") {
 		t.Error("staleness note should include last_seen_pr number")
@@ -698,7 +698,28 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if strings.Contains(content, "verify this convention is still current") {
-		t.Error("staleness note should not appear for rules within 100 PRs of watermark")
+		t.Error("staleness note should not appear for rules within 200 PRs of watermark")
+	}
+}
+
+func TestClaudeMDSuppressedWithNone(t *testing.T) {
+	// --claude-md none must skip the CLAUDE.md output entirely while still
+	// writing skill files (the /dev/null form used to abort write-outputs).
+	s := stateWith(
+		approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1),
+		approvedRule("API rule", "do it in api", "api", "stated", 2),
+	)
+	for _, target := range []string{"none", os.DevNull} {
+		out := t.TempDir()
+		if err := Write(s, out, Options{ClaudeMDPath: target, SkillsDir: filepath.Join(out, "skills")}); err != nil {
+			t.Fatalf("ClaudeMDPath=%q: %v", target, err)
+		}
+		if _, err := os.Stat(filepath.Join(out, "CLAUDE.md")); !os.IsNotExist(err) {
+			t.Errorf("ClaudeMDPath=%q: CLAUDE.md should not be written", target)
+		}
+		if _, err := os.Stat(filepath.Join(out, "skills", "api", "SKILL.md")); err != nil {
+			t.Errorf("ClaudeMDPath=%q: skill file should still be written: %v", target, err)
+		}
 	}
 }
 

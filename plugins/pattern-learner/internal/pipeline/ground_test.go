@@ -161,6 +161,48 @@ func TestVerifyGrounding_caseInsensitive(t *testing.T) {
 	}
 }
 
+func TestVerifyGrounding_snippetWithQuotes(t *testing.T) {
+	// A snippet containing double quotes is stored JSON-escaped (\") in the
+	// cache file; grounding must match against the decoded value.
+	dir := t.TempDir()
+	snippet := `we prefer errors.New("not found") over fmt.Errorf here`
+	writePRCache(t, dir, snippet, 11)
+	sig := makeSignal(t, snippet, 11)
+	result, err := VerifyGrounding([]json.RawMessage{sig}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stats.Kept != 1 {
+		t.Errorf("quote-containing snippet should be kept; kept=%d not_found=%d",
+			result.Stats.Kept, result.Stats.NotFound)
+	}
+}
+
+func TestVerifyGrounding_multilineSnippet(t *testing.T) {
+	// Priority-0 suggestion-block snippets are multi-line code. In the cache
+	// file newlines are stored as the escape sequence \n, which is not
+	// whitespace in the raw bytes — grounding must decode before matching.
+	dir := t.TempDir()
+	snippet := "ctx, cancel := context.WithTimeout(ctx, 5*time.Second)\ndefer cancel()"
+	writePRCache(t, dir, snippet, 12)
+	sig := makeSignal(t, snippet, 12)
+	result, err := VerifyGrounding([]json.RawMessage{sig}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stats.Kept != 1 {
+		t.Errorf("multi-line snippet should be kept; kept=%d not_found=%d",
+			result.Stats.Kept, result.Stats.NotFound)
+	}
+}
+
+func TestGroundableText_invalidJSONFallsBack(t *testing.T) {
+	raw := "not json at all { but contains the snippet text"
+	if got := groundableText([]byte(raw)); got != raw {
+		t.Errorf("invalid JSON should fall back to raw text; got %q", got)
+	}
+}
+
 func TestVerifyGrounding_missingCacheFile(t *testing.T) {
 	dir := t.TempDir()
 	snippet := "could we use context.WithTimeout here?"

@@ -97,7 +97,7 @@ func VerifyGrounding(rawSignals []json.RawMessage, cacheDir string) (GroundingRe
 				result.Stats.NotFound++
 				continue
 			}
-			fileContent = NormalizeForGrounding(string(data))
+			fileContent = NormalizeForGrounding(groundableText(data))
 			fileCache[prNum] = fileContent
 		}
 
@@ -111,6 +111,39 @@ func VerifyGrounding(rawSignals []json.RawMessage, cacheDir string) (GroundingRe
 	}
 
 	return result, nil
+}
+
+// groundableText returns the text of a cache file to ground snippets against.
+// The cache is JSON, so string values are stored escaped (a quote as `\"`, a
+// newline as the two characters `\n`); matching against the raw bytes would
+// falsely drop any multi-line or quote-containing snippet. Decode the JSON and
+// concatenate its decoded string values instead. Falls back to the raw text
+// when the file does not parse as JSON.
+func groundableText(data []byte) string {
+	var doc interface{}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return string(data)
+	}
+	var b strings.Builder
+	collectStrings(doc, &b)
+	return b.String()
+}
+
+// collectStrings walks a decoded JSON document appending every string value.
+func collectStrings(v interface{}, b *strings.Builder) {
+	switch t := v.(type) {
+	case string:
+		b.WriteString(t)
+		b.WriteByte('\n')
+	case []interface{}:
+		for _, e := range t {
+			collectStrings(e, b)
+		}
+	case map[string]interface{}:
+		for _, e := range t {
+			collectStrings(e, b)
+		}
+	}
 }
 
 // NormalizeForGrounding lowercases s and collapses all whitespace runs

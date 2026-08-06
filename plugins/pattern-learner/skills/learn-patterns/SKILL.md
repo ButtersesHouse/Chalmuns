@@ -25,6 +25,11 @@ subcommands are the only sanctioned implementations of their logic.**
 - **If a subcommand is missing, errors, or seems unable to do what you need: STOP and
   report it to the user. Do not write a workaround script.** A gap in the tooling is a
   bug to fix in the binary, not something to paper over.
+- Two non-Go edges are sanctioned by design and are not policy violations: **PR fetch**
+  (GitHub MCP, or the `gh`/`jq`/`xargs` inline path in the Step 5 large-repo note — the
+  binary is zero-network) and **cursor-agent** (optional enhancement for `--discover`,
+  `--rag`, and RAG hints; every cursor-agent feature degrades gracefully when absent).
+  Everything else the pipeline runs is the Go binary.
 
 This policy is mechanically enforced: while a run is in progress (Step 2 creates a
 run-lock at `.claude/pattern-learner/.run-lock`), a PreToolUse hook blocks interpreter
@@ -59,7 +64,7 @@ If `--add` is set, jump to the **Add Mode** section after Step 4.
 ### Step 2: Pre-flight checks and binary build
 
 **Pre-flight checks** (run first, abort with a clear message on failure):
-- `which go` — Go must be installed to build the binary. If missing, tell the user: "Go (1.21+) is required to build the pattern-learner binary. Install Go from https://go.dev/dl/ and retry."
+- `go version` — Go **1.21+** must be installed to build the binary. Parse the `goX.Y` token from the output; if the command fails or the version is below 1.21, tell the user: "Go (1.21+) is required to build the pattern-learner binary. Install Go from https://go.dev/dl/ and retry." (An older Go may appear to build the binary today but fails confusingly on modern syntax — check the version, not just presence.)
 - Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review`, `--discover`, and `--add` modes since no PR fetching happens.)
 - `which cursor-agent` — check if cursor-agent is available. Store result as `HAS_CURSOR_AGENT` (true/false). In `--discover` mode, if cursor-agent is not found, abort: "cursor-agent is required for --discover mode. Install Cursor and ensure cursor-agent is on your PATH." In other modes, cursor-agent is optional — absence is not an error.
 
@@ -160,6 +165,18 @@ Keep PRs where `merged_at != null` AND `number > since_pr`. Stop when an entire 
      "raw": <full PR data including all comments and reviews>
    }
    ```
+   The `raw` object is the contract `extract-lean` parses. It MUST use exactly these
+   top-level keys, each in its GitHub API shape:
+   - `review_comments[]` — diff-level comments: `id`, `user.login`, `body`, `created_at`,
+     `in_reply_to_id`, `path`, `diff_hunk`
+   - `reviews[]` — review submissions: `id`, `user.login`, `body`, `submitted_at`
+   - `issue_comments[]` — discussion comments: `id`, `user.login`, `body`, `created_at`
+   - `files[]` — touched files: `filename`
+
+   Nesting these under different names silently yields zero extracted comments.
+   `extract-lean` prints a warning when a cache's `comment_sources` counts promise
+   comments but none parse — treat that warning as a cache bug and fix the cache,
+   do not proceed.
 
 Collect newly-cached PR numbers into batches of up to 20. Carry `max_pr_seen` forward to Step 11.
 
@@ -477,6 +494,9 @@ Build the complete updated state JSON:
 - `reviewed_snapshot` and `conflicted` per rule: both fields are part of the `Rule` struct and round-trip through `state-write` automatically. `reviewed_snapshot` is set by the `s` action and cleared on approve/reject (not on edit). `conflicted` is set by Step 8A-cross and cleared when the user resolves the conflict during review.
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
 - Updated `last_run`, `repo`, `stats`
+- `updated_at` per rule: `state-write` stamps only rules whose `updated_at` is **empty**.
+  Clear the field on every rule you created or modified this run so it gets a fresh
+  timestamp; leave untouched rules' existing values in place (that is their change history).
 - Rules with `status: "rejected"` should also appear in `rejected_signals` with their rule text preserved for future matching
 - **`domain_descriptions`**: for each domain that now has approved rules, set or refresh the entry. Read all approved rules in that domain and synthesize a 1–2 sentence description (max 200 chars) that:
   - Names what the skill is for (e.g. "HTTP API endpoint conventions")
@@ -520,7 +540,7 @@ $BIN write-outputs \
 
 Using `--claude-md` and `--skills-dir` directly avoids any ambiguity about where the files land — even if the project has an unusual layout — and prevents the tool from writing an unwanted `CLAUDE.md` at a wrong depth.
 
-If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched domain skills), add `--claude-md /dev/null` to suppress that output.
+If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched domain skills), add `--claude-md none` to suppress that output entirely (`/dev/null` is also accepted and treated the same — the tool never writes through to the device).
 
 This writes:
 - `CLAUDE.md` at the path given by `--claude-md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
@@ -650,9 +670,13 @@ Read each extracted candidate and construct a candidate rule:
 - `dont_examples`: from cursor-agent output
 - `target`: `{location: domain, file_glob: globs}`
 - `confidence`: map cursor-agent confidence → rule confidence: `"high"` → `"established"`, `"medium"` → `"emerging"`, `"low"` → `"emerging"` (a single observed instance, not a stated preference — treat with the same human-review level as implicit emerging rules)
-- `sources`: `[]` (empty — no PR source; codebase-derived)
+- `sources`: one synthetic Signal — `{"reviewer": "cursor-agent", "date": "<today>",
+  "snippet": "<the rule statement verbatim>", "strength": "explicit", "pr_number": 0}`.
+  The rule schema has no top-level strength field — explicitness lives on the source
+  signal (same pattern as Add mode). An empty `sources` list would make any later
+  re-classification treat the rule as implicit and `--auto` triage defer it as a
+  singleton, losing the "authoritative" status this mode intends.
 - `signal_count`: 1
-- `strength`: `"explicit"` (AI-curated from real code; treat as authoritative)
 - `status`: `"proposed"`
 
 ---
@@ -671,7 +695,7 @@ Skip Step 8A (intra-batch dedup) — run it across all domains' candidates combi
 
 ### Discover Step D5: Apply threshold
 
-All discover candidates have `strength: "explicit"` so they are kept unconditionally regardless of count. Confidence was already set in D3 from cursor-agent's rating.
+All discover candidates carry an explicit source signal (D3) so they are kept unconditionally regardless of count. Confidence was already set in D3 from cursor-agent's rating.
 
 Then continue with **Step 10** (approval UI), **Step 11** (state write), **Step 12** (generate outputs), **Step 13** (summary).
 

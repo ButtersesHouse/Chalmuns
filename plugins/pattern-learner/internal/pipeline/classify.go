@@ -88,6 +88,9 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 	for _, raw := range rawCandidates {
 		var c classifyInput
 		if err := json.Unmarshal(raw, &c); err != nil {
+			// Parse failures are a malformed-input bug, not a recency drop —
+			// make them visible instead of silently folding into Dropped.
+			fmt.Fprintf(os.Stderr, "warn: classify: dropping unparseable candidate: %v\n", err)
 			result.Dropped++
 			continue
 		}

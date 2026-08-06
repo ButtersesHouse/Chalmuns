@@ -105,8 +105,9 @@ func ExtractLean(cacheDir string, prs []int) ([]LeanPR, error) {
 // --- internal types for parsing GitHub API responses ---
 
 type rawCache struct {
-	PRNumber int             `json:"pr_number"`
-	Raw      json.RawMessage `json:"raw"`
+	PRNumber       int             `json:"pr_number"`
+	CommentSources map[string]int  `json:"comment_sources"`
+	Raw            json.RawMessage `json:"raw"`
 }
 
 // rawPR mirrors the GitHub REST API PR response shape stored in cache files.
@@ -243,6 +244,20 @@ func extractFromCacheFile(path string) (LeanPR, error) {
 			Type:       "issue_comment",
 			Body:       ic.Body,
 		})
+	}
+
+	// Guard against a silently mis-shaped cache: if the cache's own
+	// comment_sources counts promise comments but none parsed, the raw payload
+	// almost certainly nests them under different keys than the contract.
+	declared := 0
+	for _, n := range cache.CommentSources {
+		declared += n
+	}
+	if declared > 0 && len(comments) == 0 {
+		fmt.Fprintf(os.Stderr,
+			"warn: %s: comment_sources declares %d comment(s) but none parsed from raw — "+
+				"raw must use the keys review_comments, reviews, issue_comments, files\n",
+			path, declared)
 	}
 
 	return LeanPR{

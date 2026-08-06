@@ -12,6 +12,11 @@ import (
 
 const maxCLAUDERules = 30
 
+// staleAfterPRs is how far behind the PR watermark a rule's last_seen_pr may
+// fall before its rendered source line asks the reader to re-verify it. Keep
+// in sync with the "Stale rules" threshold in SKILL.md Step 13.
+const staleAfterPRs = 200
+
 // Options controls optional output features.
 type Options struct {
 	// RAGHints adds a cursor-agent query hint after each rule in domain skill
@@ -19,7 +24,8 @@ type Options struct {
 	RAGHints bool
 	// ClaudeMDPath is the explicit destination for CLAUDE.md. When empty,
 	// defaults to <outputDir>/CLAUDE.md. Set this to place CLAUDE.md at any
-	// path independently of where the skill files are written.
+	// path independently of where the skill files are written. The special
+	// values "none" and os.DevNull suppress the CLAUDE.md output entirely.
 	ClaudeMDPath string
 	// SkillsDir is the explicit destination directory for per-domain skill
 	// files. When empty, defaults to <outputDir>/.claude/skills. Set this to
@@ -41,8 +47,13 @@ func Write(s state.State, outputDir string, opts Options) error {
 	if skillsDir == "" {
 		skillsDir = filepath.Join(outputDir, ".claude", "skills")
 	}
-	if err := writeCLAUDEMD(s, claudeMDPath); err != nil {
-		return err
+	// "none" (or the null device) suppresses the CLAUDE.md output; writing
+	// through atomicWrite to /dev/null would fail (and must never rename over
+	// a device), so skip rather than write.
+	if claudeMDPath != "none" && claudeMDPath != os.DevNull {
+		if err := writeCLAUDEMD(s, claudeMDPath); err != nil {
+			return err
+		}
 	}
 	return writeSkillFiles(s, skillsDir, opts)
 }
@@ -127,7 +138,7 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
 		if r.Origin == "" || r.Origin == "pr-review" {
-			if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= 100 {
+			if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= staleAfterPRs {
 				b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
 					sourceLabel(r), r.LastSeenPR))
 			} else {
@@ -279,7 +290,7 @@ func prList(sources []state.Signal) string {
 func exemplaryFiles(rules []state.Rule) []string {
 	freq := map[string]int{}
 	for _, r := range rules {
-		for _, ex := range r.DoExamples {
+		for _, ex := range effectiveDoExamples(r) {
 			if ex.FileRef == "" {
 				continue
 			}
@@ -340,6 +351,9 @@ func collectGlobs(rules []state.Rule) []string {
 // a generic fallback is constructed from the domain name and globs.
 func buildDescription(domain string, globs []string, override string) string {
 	if override != "" {
+		// The override is model-supplied; a newline would break the YAML
+		// frontmatter line it is rendered into.
+		override = strings.Join(strings.Fields(override), " ")
 		if len(override) > 200 {
 			return override[:197] + "..."
 		}

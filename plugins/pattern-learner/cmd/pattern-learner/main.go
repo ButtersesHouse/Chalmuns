@@ -4,8 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/detect"
@@ -121,11 +125,7 @@ func runWriteOutputs(args []string) error {
 // of each approved rule's pattern and sets FileRef when found. Falls back to
 // grep-based anchorExamples if cursor-agent is unavailable or returns no result.
 func anchorExamplesRAG(s *state.State, outputDir string) {
-	// Check cursor-agent is available before looping over rules.
-	if _, err := os.Stat("/dev/null"); err != nil { // dummy — actual check below
-	}
-	cursorAvail := isCursorAgentAvailable()
-	if !cursorAvail {
+	if !isCursorAgentAvailable() {
 		anchorExamples(s, outputDir)
 		return
 	}
@@ -154,9 +154,11 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 			continue
 		}
 
-		// Extract the first token that looks like path:Lnum.
+		// Extract the first token that looks like path:Lnum, and only trust
+		// it once verified against the actual file — cursor-agent output is
+		// not provenance until it is grounded.
 		ref := extractFileRef(out)
-		if ref != "" {
+		if ref != "" && refExists(ref, outputDir) {
 			r.DoExamples[0].FileRef = ref
 		} else {
 			anchorSingleRule(r, outputDir)
@@ -166,70 +168,50 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 
 // isCursorAgentAvailable checks whether cursor-agent is on PATH.
 func isCursorAgentAvailable() bool {
-	_, err := findExecutable("cursor-agent")
+	_, err := exec.LookPath("cursor-agent")
 	return err == nil
 }
 
-// findExecutable walks PATH to find an executable — stdlib equivalent of exec.LookPath
-// without importing os/exec (keeps zero-dep policy).
-func findExecutable(name string) (string, error) {
-	pathEnv := os.Getenv("PATH")
-	for _, dir := range strings.Split(pathEnv, ":") {
-		full := filepath.Join(dir, name)
-		info, err := os.Stat(full)
-		if err == nil && info.Mode()&0111 != 0 {
-			return full, nil
-		}
+// runCursorAgent runs `cursor-agent -p --mode=ask <prompt>` and returns stdout.
+func runCursorAgent(prompt string) (string, error) {
+	cmd := exec.Command("cursor-agent", "-p", "--mode=ask", prompt)
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("cursor-agent: %w", err)
 	}
-	return "", fmt.Errorf("%s not found in PATH", name)
+	return string(out), nil
 }
 
-// runCursorAgent runs cursor-agent with -p --mode=ask and returns stdout.
-// Uses os.StartProcess to avoid importing os/exec.
-func runCursorAgent(prompt string) (string, error) {
-	bin, err := findExecutable("cursor-agent")
+// refExists reports whether ref ("path/file.go:L42") names an existing file
+// under root with at least that many lines.
+func refExists(ref, root string) bool {
+	idx := strings.LastIndex(ref, ":L")
+	if idx <= 0 {
+		return false
+	}
+	n, err := strconv.Atoi(ref[idx+2:])
+	if err != nil || n < 1 {
+		return false
+	}
+	rel := filepath.Clean(ref[:idx])
+	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	f, err := os.Open(filepath.Join(root, rel))
 	if err != nil {
-		return "", err
+		return false
 	}
-
-	// Write prompt to a temp file to avoid shell escaping issues.
-	tmp, err := os.CreateTemp("", "cursor-prompt-*.txt")
-	if err != nil {
-		return "", err
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	lines := 0
+	for scanner.Scan() {
+		lines++
+		if lines >= n {
+			return true
+		}
 	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(prompt); err != nil {
-		tmp.Close()
-		return "", err
-	}
-	tmp.Close()
-
-	// cursor-agent -p --mode=ask "<prompt>"
-	outFile, err := os.CreateTemp("", "cursor-out-*.txt")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(outFile.Name())
-	outPath := outFile.Name()
-	outFile.Close()
-
-	proc, err := os.StartProcess(bin, []string{bin, "-p", "--mode=ask", prompt},
-		&os.ProcAttr{
-			Files: []*os.File{nil, func() *os.File { f, _ := os.Create(outPath); return f }(), os.Stderr},
-		})
-	if err != nil {
-		return "", err
-	}
-	ps, err := proc.Wait()
-	if err != nil || !ps.Success() {
-		return "", fmt.Errorf("cursor-agent exited non-zero")
-	}
-
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return false
 }
 
 // extractFileRef scans text for the first token matching path:Lnum.
@@ -266,11 +248,7 @@ func anchorSingleRule(r *state.Rule, outputDir string) {
 		return
 	}
 	for _, glob := range r.Target.FileGlob {
-		matches, err := filepath.Glob(filepath.Join(outputDir, glob))
-		if err != nil {
-			continue
-		}
-		for _, file := range matches {
+		for _, file := range globFiles(outputDir, glob) {
 			lineNum, ok := findInFile(file, token)
 			if !ok {
 				continue
@@ -299,6 +277,59 @@ func anchorExamples(s *state.State, outputDir string) {
 		}
 		anchorSingleRule(&s.Rules[i], outputDir)
 	}
+}
+
+// globFiles returns files under root matching glob. Unlike filepath.Glob it
+// supports "**" for any number of directories — the form SKILL.md instructs
+// subagents to emit (e.g. "src/api/**/*.go").
+func globFiles(root, glob string) []string {
+	if !strings.Contains(glob, "**") {
+		matches, _ := filepath.Glob(filepath.Join(root, glob))
+		return matches
+	}
+	pat := strings.Split(path.Clean(filepath.ToSlash(glob)), "/")
+	var out []string
+	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		if matchSegments(pat, strings.Split(filepath.ToSlash(rel), "/")) {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
+}
+
+// matchSegments matches path segments against pattern segments where "**"
+// matches zero or more segments and other segments use path.Match rules.
+func matchSegments(pat, segs []string) bool {
+	if len(pat) == 0 {
+		return len(segs) == 0
+	}
+	if pat[0] == "**" {
+		if matchSegments(pat[1:], segs) {
+			return true
+		}
+		return len(segs) > 0 && matchSegments(pat, segs[1:])
+	}
+	if len(segs) == 0 {
+		return false
+	}
+	if ok, err := path.Match(pat[0], segs[0]); err != nil || !ok {
+		return false
+	}
+	return matchSegments(pat[1:], segs[1:])
 }
 
 // firstMeaningfulLine returns the first non-blank, non-comment line from code.
