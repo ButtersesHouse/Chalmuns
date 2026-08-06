@@ -766,6 +766,37 @@ func TestAgentsMDDomainOnlyStillWritten(t *testing.T) {
 	}
 }
 
+func TestAgentsMDNeverClobbersHandWrittenFile(t *testing.T) {
+	dir := t.TempDir()
+	handWritten := "# My own agent instructions\n\nDo not touch.\n"
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(handWritten), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir, "AGENTS.md")); got != handWritten {
+		t.Errorf("hand-written AGENTS.md must be left untouched; got:\n%s", got)
+	}
+}
+
+func TestAgentsMDRegeneratesItsOwnFile(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	r2 := approvedRule("Second rule", "also do this", "CLAUDE.md", "stated", 2)
+	if err := Write(stateWith(r, r2), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
+	if !strings.Contains(content, "also do this") {
+		t.Error("generator-owned AGENTS.md should be regenerated on later runs")
+	}
+}
+
 func TestAgentsMDSuppressedWithNone(t *testing.T) {
 	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
 	for _, target := range []string{"none", os.DevNull} {
