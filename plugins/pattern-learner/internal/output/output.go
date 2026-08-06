@@ -114,7 +114,50 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 
 	globs := collectGlobs(rules)
 	desc := buildDescription(domain, globs, override)
+	skillDir := filepath.Join(skillsDir, domain)
 
+	// examples/ and rules/ are generator-owned: regenerate from scratch so
+	// renamed or removed rules leave no stale files behind.
+	for _, sub := range []string{"examples", "rules"} {
+		if err := os.RemoveAll(filepath.Join(skillDir, sub)); err != nil {
+			return err
+		}
+	}
+
+	slugs := ruleSlugs(rules)
+	header := renderSkillHeader(domain, desc, rules)
+
+	// Examples always live in companion files (progressive disclosure): the
+	// SKILL.md body is a recurring token cost once loaded, so it carries only
+	// the imperative rules plus pointers the consuming agent follows at its
+	// discretion when it wants the do/don't code.
+	inline := header + renderInlineRules(rules, slugs, watermark, opts)
+	if lineCount(inline) <= maxSkillLines {
+		if err := writeExampleFiles(skillDir, rules, slugs); err != nil {
+			return err
+		}
+		return atomicWrite(filepath.Join(skillDir, "SKILL.md"), inline)
+	}
+
+	// Very large skill: chunk per the Claude Code guidance ("Keep SKILL.md
+	// under 500 lines. Move detailed reference material to separate files.").
+	// SKILL.md becomes a rule index; each rule lives in rules/<slug>.md with
+	// its examples inline (the chunk itself is loaded on demand), and the
+	// chunk corpus doubles as a grep target for full-text lookup.
+	if err := writeRuleChunks(skillDir, rules, slugs, watermark, opts); err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join(skillDir, "SKILL.md"), header+renderRuleIndex(rules, slugs))
+}
+
+// maxSkillLines is the chunking threshold for a generated domain SKILL.md,
+// with headroom under the documented limit ("Keep SKILL.md under 500 lines").
+const maxSkillLines = 450
+
+// maxExamplePairs caps rendered do/don't pairs; state caps the arrays at 4.
+const maxExamplePairs = 4
+
+func renderSkillHeader(domain, desc string, rules []state.Rule) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString(fmt.Sprintf("name: %s\n", domain))
@@ -130,36 +173,161 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 		}
 		b.WriteString("\n")
 	}
+	return b.String()
+}
 
+func renderInlineRules(rules []state.Rule, slugs []string, watermark int, opts Options) string {
+	var b strings.Builder
 	b.WriteString("## Rules\n\n")
-
-	for _, r := range rules {
+	b.WriteString("Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.\n\n")
+	for i, r := range rules {
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
-		renderExamples(&b, r, 3)
 		b.WriteString(r.Rule + "\n\n")
-		if r.Origin == "" || r.Origin == "pr-review" {
-			if watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= staleAfterPRs {
-				b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
-					sourceLabel(r), r.LastSeenPR))
-			} else {
-				b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
-			}
-		} else {
-			b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
+		if hasExamples(r) {
+			b.WriteString(fmt.Sprintf("_Examples: `examples/%s.md`_\n\n", slugs[i]))
 		}
-		if opts.RAGHints {
-			b.WriteString(fmt.Sprintf(
-				"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
-				r.Title,
-			))
-		}
+		writeSourceLine(&b, r, watermark)
+		writeRAGHint(&b, r, opts)
 	}
+	return b.String()
+}
 
-	skillDir := filepath.Join(skillsDir, domain)
-	if err := os.MkdirAll(skillDir, 0755); err != nil {
-		return err
+// writeExampleFiles writes one examples/<slug>.md per rule that has examples,
+// holding every do/don't pair plus real-instance refs.
+func writeExampleFiles(skillDir string, rules []state.Rule, slugs []string) error {
+	for i, r := range rules {
+		if !hasExamples(r) {
+			continue
+		}
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("# Examples — %s\n\n", r.Title))
+		b.WriteString(r.Rule + "\n\n")
+		renderExamples(&b, r, maxExamplePairs)
+		if err := atomicWrite(filepath.Join(skillDir, "examples", slugs[i]+".md"), b.String()); err != nil {
+			return err
+		}
 	}
-	return atomicWrite(filepath.Join(skillDir, "SKILL.md"), b.String())
+	return nil
+}
+
+// writeRuleChunks writes one rules/<slug>.md per rule for the chunked layout.
+func writeRuleChunks(skillDir string, rules []state.Rule, slugs []string, watermark int, opts Options) error {
+	for i, r := range rules {
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("# %s\n\n", r.Title))
+		meta := fmt.Sprintf("**Confidence:** %s", r.Confidence)
+		if len(r.Target.FileGlob) > 0 {
+			meta += " · **Applies to:** `" + strings.Join(r.Target.FileGlob, "`, `") + "`"
+		}
+		b.WriteString(meta + "\n\n")
+		renderExamples(&b, r, maxExamplePairs)
+		b.WriteString(r.Rule + "\n\n")
+		writeSourceLine(&b, r, watermark)
+		writeRAGHint(&b, r, opts)
+		if err := atomicWrite(filepath.Join(skillDir, "rules", slugs[i]+".md"), b.String()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renderRuleIndex(rules []state.Rule, slugs []string) string {
+	var b strings.Builder
+	b.WriteString("This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.\n\n")
+	b.WriteString("## Rule Index\n\n")
+	last := ""
+	for i, r := range rules {
+		if r.Confidence != last {
+			b.WriteString(fmt.Sprintf("### %s\n\n", confidenceHeading(r.Confidence)))
+			last = r.Confidence
+		}
+		line := fmt.Sprintf("- [%s](rules/%s.md)", r.Title, slugs[i])
+		if len(r.Target.FileGlob) > 0 {
+			line += " — `" + strings.Join(r.Target.FileGlob, "`, `") + "`"
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+func confidenceHeading(c string) string {
+	switch c {
+	case "stated":
+		return "Stated (explicit preferences)"
+	case "established":
+		return "Established"
+	case "emerging":
+		return "Emerging"
+	default:
+		return capitalize(c)
+	}
+}
+
+func writeSourceLine(b *strings.Builder, r state.Rule, watermark int) {
+	prOrigin := r.Origin == "" || r.Origin == "pr-review"
+	if prOrigin && watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= staleAfterPRs {
+		b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
+			sourceLabel(r), r.LastSeenPR))
+		return
+	}
+	b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
+}
+
+func writeRAGHint(b *strings.Builder, r state.Rule, opts Options) {
+	if !opts.RAGHints {
+		return
+	}
+	b.WriteString(fmt.Sprintf(
+		"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
+		r.Title,
+	))
+}
+
+func hasExamples(r state.Rule) bool {
+	return len(effectiveDoExamples(r)) > 0 || len(effectiveDontExamples(r)) > 0
+}
+
+// slugify converts a rule title to a filesystem-safe slug.
+func slugify(title string) string {
+	var out []rune
+	lastDash := true // also trims leading dashes
+	for _, r := range strings.ToLower(title) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			out = append(out, r)
+			lastDash = false
+		} else if !lastDash {
+			out = append(out, '-')
+			lastDash = true
+		}
+	}
+	s := strings.Trim(string(out), "-")
+	if len(s) > 60 {
+		s = strings.Trim(s[:60], "-")
+	}
+	if s == "" {
+		return "rule"
+	}
+	return s
+}
+
+// ruleSlugs returns one unique slug per rule (suffixing -2, -3, … on collision).
+func ruleSlugs(rules []state.Rule) []string {
+	seen := map[string]int{}
+	out := make([]string, len(rules))
+	for i, r := range rules {
+		s := slugify(r.Title)
+		seen[s]++
+		if n := seen[s]; n > 1 {
+			s = fmt.Sprintf("%s-%d", s, n)
+		}
+		out[i] = s
+	}
+	return out
+}
+
+func lineCount(s string) int {
+	return strings.Count(s, "\n") + 1
 }
 
 // renderExamples writes do/don't example pairs (up to maxPairs) before rule prose.

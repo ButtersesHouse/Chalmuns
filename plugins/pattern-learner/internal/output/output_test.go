@@ -1,6 +1,7 @@
 package output
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -264,31 +265,37 @@ func TestWriteCLAUDEMDPluralExamples(t *testing.T) {
 	}
 }
 
-func TestWriteSkillFilePluralExamplesUpToThree(t *testing.T) {
+func TestWriteSkillFileExamplesMovedToCompanionFile(t *testing.T) {
 	dir := t.TempDir()
 	r := approvedRule("Use errors.As", "Use errors.As", "api", "established", 1)
 	r.DoExamples = []state.Example{
 		{Code: "example one code", Language: "go"},
 		{Code: "example two code", Language: "go"},
 		{Code: "example three code", Language: "go"},
-		{Code: "example four code", Language: "go"}, // should be excluded (cap=3)
+		{Code: "example four code", Language: "go"},
 	}
 	if err := Write(stateWith(r), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
-	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
-	for _, ex := range []string{"example one code", "example two code", "example three code"} {
-		if !strings.Contains(content, ex) {
-			t.Errorf("expected %q in skill file", ex)
-		}
+	// SKILL.md carries the rule and a pointer, never the example code.
+	skill := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(skill, "example one code") || strings.Contains(skill, "```") {
+		t.Error("example code must not be inlined in SKILL.md")
 	}
-	if strings.Contains(content, "example four code") {
-		t.Error("fourth example should be excluded (cap=3)")
+	if !strings.Contains(skill, "_Examples: `examples/use-errors-as.md`_") {
+		t.Errorf("SKILL.md should point at the examples file; got:\n%s", skill)
+	}
+
+	examples := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "examples", "use-errors-as.md"))
+	for _, ex := range []string{"example one code", "example two code", "example three code", "example four code"} {
+		if !strings.Contains(examples, ex) {
+			t.Errorf("expected %q in examples file", ex)
+		}
 	}
 }
 
-func TestWriteSkillFilePluralExamplesBeforeRuleProse(t *testing.T) {
+func TestWriteSkillFileExamplesFileHasRuleContext(t *testing.T) {
 	dir := t.TempDir()
 	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "api", "established", 1)
 	r.DoExamples = []state.Example{{Code: "errors.As(err, &target)", Language: "go"}}
@@ -296,14 +303,29 @@ func TestWriteSkillFilePluralExamplesBeforeRuleProse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
-	examplePos := strings.Index(content, "errors.As(err, &target)")
-	rulePos := strings.Index(content, "Always use errors.As for type checking")
-	if examplePos == -1 || rulePos == -1 {
-		t.Fatal("both example and rule prose should be present")
+	examples := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "examples", "use-errors-as.md"))
+	rulePos := strings.Index(examples, "Always use errors.As for type checking")
+	examplePos := strings.Index(examples, "errors.As(err, &target)")
+	if rulePos == -1 || examplePos == -1 {
+		t.Fatal("examples file should contain both the rule text and the example")
 	}
-	if examplePos > rulePos {
-		t.Error("examples should appear before rule prose in skill file")
+	if rulePos > examplePos {
+		t.Error("examples file should restate the rule before the example code")
+	}
+}
+
+func TestWriteSkillFileNoExamplesNoPointer(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Bare rule", "just do it", "api", "established", 1)
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	skill := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(skill, "_Examples:") {
+		t.Error("rule without examples must not link an examples file")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "api", "examples", "bare-rule.md")); !os.IsNotExist(err) {
+		t.Error("no examples file should be written for a rule without examples")
 	}
 }
 
@@ -317,9 +339,9 @@ func TestWriteSkillFileFileRef(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "examples", "use-errors-as.md"))
 	if !strings.Contains(content, "internal/api/handler.go:L42") {
-		t.Error("FileRef should appear in skill file output")
+		t.Error("FileRef should appear in the examples file")
 	}
 	if !strings.Contains(content, "Real instance: see") {
 		t.Error("FileRef label should appear")
@@ -358,7 +380,7 @@ func TestPluralExamplesFallsBackToSingular(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "examples", "old-rule.md"))
 	if !strings.Contains(content, "singular do code") {
 		t.Error("singular do example should appear via fallback")
 	}
@@ -699,6 +721,128 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if strings.Contains(content, "verify this convention is still current") {
 		t.Error("staleness note should not appear for rules within 200 PRs of watermark")
+	}
+}
+
+func TestSlugify(t *testing.T) {
+	cases := map[string]string{
+		"Use errors.As for type checks": "use-errors-as-for-type-checks",
+		"  Weird -- punctuation!! ":     "weird-punctuation",
+		"":                              "rule",
+		"ALL CAPS":                      "all-caps",
+	}
+	for in, want := range cases {
+		if got := slugify(in); got != want {
+			t.Errorf("slugify(%q) = %q, want %q", in, got, want)
+		}
+	}
+	long := slugify(strings.Repeat("very long title ", 10))
+	if len(long) > 60 {
+		t.Errorf("slug should be capped at 60 chars, got %d", len(long))
+	}
+}
+
+func TestRuleSlugsDeduped(t *testing.T) {
+	rules := []state.Rule{{Title: "Same title"}, {Title: "Same title"}, {Title: "Same title"}}
+	slugs := ruleSlugs(rules)
+	want := []string{"same-title", "same-title-2", "same-title-3"}
+	for i := range want {
+		if slugs[i] != want[i] {
+			t.Errorf("slug[%d] = %q, want %q", i, slugs[i], want[i])
+		}
+	}
+}
+
+// bigRules builds n approved rules with enough text to force the chunked layout.
+func bigRules(n int) []state.Rule {
+	var rules []state.Rule
+	for i := 0; i < n; i++ {
+		r := approvedRule(
+			fmt.Sprintf("Convention number %03d with a reasonably long title", i),
+			strings.Repeat(fmt.Sprintf("Rule %03d body sentence stating the convention imperatively. ", i), 3),
+			"api", "established", i+1)
+		r.DoExamples = []state.Example{{Code: fmt.Sprintf("do_example_%03d()", i), Language: "go"}}
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+func TestWriteSkillFileChunkedWhenLarge(t *testing.T) {
+	dir := t.TempDir()
+	if err := Write(stateWith(bigRules(120)...), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	skill := readFile(t, filepath.Join(skillDir, "SKILL.md"))
+	if got := strings.Count(skill, "\n") + 1; got > maxSkillLines {
+		t.Errorf("chunked SKILL.md should stay within %d lines, got %d", maxSkillLines, got)
+	}
+	if !strings.Contains(skill, "## Rule Index") {
+		t.Error("chunked SKILL.md should carry a rule index")
+	}
+	if !strings.Contains(skill, "grep -ril") {
+		t.Error("chunked SKILL.md should mention the grep lookup over rules/")
+	}
+	if strings.Contains(skill, "do_example_000()") {
+		t.Error("chunked SKILL.md must not inline rule bodies or examples")
+	}
+	if !strings.Contains(skill, "(rules/convention-number-000-with-a-reasonably-long-title.md)") {
+		t.Errorf("index should link rule chunk files; got head:\n%s", skill[:600])
+	}
+
+	chunk := readFile(t, filepath.Join(skillDir, "rules", "convention-number-000-with-a-reasonably-long-title.md"))
+	for _, want := range []string{"do_example_000()", "Rule 000 body sentence", "**Confidence:** established"} {
+		if !strings.Contains(chunk, want) {
+			t.Errorf("rule chunk missing %q", want)
+		}
+	}
+	// Chunked layout keeps examples inside the chunk — no examples/ dir.
+	if _, err := os.Stat(filepath.Join(skillDir, "examples")); !os.IsNotExist(err) {
+		t.Error("chunked layout should not also write an examples/ dir")
+	}
+}
+
+func TestWriteSkillFileSmallStaysSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := Write(stateWith(bigRules(3)...), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	skill := readFile(t, filepath.Join(skillDir, "SKILL.md"))
+	if strings.Contains(skill, "## Rule Index") {
+		t.Error("small skill should keep the inline rules layout")
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "rules")); !os.IsNotExist(err) {
+		t.Error("small skill should not write rule chunks")
+	}
+}
+
+func TestStaleGeneratedFilesRemovedOnRewrite(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	// Simulate leftovers from a prior run whose rules were renamed/removed.
+	for _, stale := range []string{"examples/old-rule.md", "rules/old-rule.md"} {
+		p := filepath.Join(skillDir, stale)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("stale"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := approvedRule("Fresh rule", "do the fresh thing", "api", "established", 1)
+	r.DoExamples = []state.Example{{Code: "fresh()", Language: "go"}}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, stale := range []string{"examples/old-rule.md", "rules/old-rule.md"} {
+		if _, err := os.Stat(filepath.Join(skillDir, stale)); !os.IsNotExist(err) {
+			t.Errorf("stale generated file %s should be removed on rewrite", stale)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "examples", "fresh-rule.md")); err != nil {
+		t.Errorf("fresh examples file should exist: %v", err)
 	}
 }
 

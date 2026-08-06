@@ -544,7 +544,24 @@ If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched 
 
 This writes:
 - `CLAUDE.md` at the path given by `--claude-md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
-- `<skills-dir>/<domain>/SKILL.md` — one file per domain with approved rules; when `--rag-hints` is set, each rule includes a `cursor-agent` command for retrieving live codebase examples at skill-use time
+- `<skills-dir>/<domain>/SKILL.md` — one skill per domain, generated with progressive
+  disclosure so the always-loaded body stays lean (skill bodies are a recurring token
+  cost once loaded):
+  - **Examples live in companion files**, never inline in SKILL.md: each rule with
+    examples gets `<domain>/examples/<slug>.md` (all do/don't pairs, real-instance
+    refs, context) and the SKILL.md rule entry links it — the consuming agent reads
+    it at its discretion when it wants the code.
+  - **Very large skills are chunked** (when the rendered SKILL.md would exceed the
+    ~450-line threshold, honoring the documented "keep SKILL.md under 500 lines"
+    limit): SKILL.md becomes a **rule index** (title + globs, grouped by confidence,
+    each entry linking `<domain>/rules/<slug>.md`), and each rule file carries the
+    full rule with its examples inline. The index also tells the agent it can
+    `grep -ril "<keyword>" rules/` for full-text lookup.
+  - `examples/` and `rules/` are **generator-owned**: `write-outputs` wipes and
+    regenerates them each run, so never hand-edit files there (edit rules via the
+    pipeline instead).
+  - When `--rag-hints` is set, each rule (wherever its body lands) includes a
+    `cursor-agent` command for retrieving live codebase examples at skill-use time.
 
 ---
 
@@ -574,7 +591,7 @@ New rules proposed:         <N>
 Supersessions accepted:     <N>  (existing rules replaced)
 Files written:
   CLAUDE.md                 (<N> rules)
-  .claude/skills/<domain>/SKILL.md  (<N> rules)
+  .claude/skills/<domain>/SKILL.md  (<N> rules, <inline | chunked index> + <N> examples/rules companion files)
   [...]
 Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
