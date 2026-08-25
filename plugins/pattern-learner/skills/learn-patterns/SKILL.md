@@ -283,7 +283,7 @@ Reviewers fixing the same thing across multiple comments without stated preferen
     {"code": "...", "language": "go", "context": "optional: surrounding function (±5 lines from diff)"}
   ],
   "suggested_target": {
-    "location": "CLAUDE.md or domain-name (e.g. api, auth, models)",
+    "location": "CLAUDE.md (the universal-rule sentinel) or domain-name (e.g. api, auth, models)",
     "file_glob": ["src/api/**/*.go"]
   },
   "raw_signal": {
@@ -311,7 +311,7 @@ Reviewers fixing the same thing across multiple comments without stated preferen
 
 A single comment may produce multiple examples; return them all. Omit rather than invent when no example source is available. Use the file paths the PR touched to infer the language.
 
-`suggested_target`: use the file paths the PR touches as a hint. Pick the **most specific** domain the PR's file paths suggest — e.g. `"migrations"` not `"database"`, `"mutations"` not `"backend"`, `"workers"` not `"jobs"`. Never use coarse buckets like `"backend"`, `"frontend"`, or `"general"` as a location — always go one level more specific (e.g. `"api"`, `"auth"`, `"models"`, `"migrations"`, `"workers"`, `"components"`, `"hooks"`). Reserve `"CLAUDE.md"` **only** for rules that apply universally regardless of which file is being edited: naming conventions, commit message format, anti-patterns true everywhere in the codebase. When in doubt, prefer a specific domain over `"CLAUDE.md"`.
+`suggested_target`: use the file paths the PR touches as a hint. Pick the **most specific** domain the PR's file paths suggest — e.g. `"migrations"` not `"database"`, `"mutations"` not `"backend"`, `"workers"` not `"jobs"`. Never use coarse buckets like `"backend"`, `"frontend"`, or `"general"` as a location — always go one level more specific (e.g. `"api"`, `"auth"`, `"models"`, `"migrations"`, `"workers"`, `"components"`, `"hooks"`). Reserve `"CLAUDE.md"` **only** for rules that apply universally regardless of which file is being edited: naming conventions, commit message format, anti-patterns true everywhere in the codebase. When in doubt, prefer a specific domain over `"CLAUDE.md"`. Note that `"CLAUDE.md"` is a **sentinel value, not a file path** — nothing is ever written to a file by that name. Rules carrying it are generated into `.claude/skills/conventions/SKILL.md`, an ungated skill that auto-loads on every file.
 
 Output only the JSON array, no other text.
 
@@ -362,7 +362,7 @@ For each pair of candidates that are semantically contradictory:
 
 **B. Domain normalization**: For each candidate's `suggested_target.location`, normalize variants of the same domain to a single canonical name. Treat `"api"`, `"API"`, `"rest-api"`, `"endpoints"`, `"http"` as the same domain (pick one canonical form, e.g. `"api"`); `"auth"`, `"authentication"`, `"authn"` as the same; etc. Also unify against existing rule domain names already in state — if state already uses `"api"`, normalize new candidates' `"endpoints"` to `"api"`. The goal is one skill file per logical domain, not fragmented files.
 
-**CLAUDE.md qualification**: a rule belongs in `"CLAUDE.md"` only when it applies to every file in the repository regardless of technology or context — e.g. "no abbreviations in identifiers", "prefix commits with the ticket number", "never log PII". Rules that depend on file path, language, framework, or layer belong in domain skills, even if they appeared across many PRs. Coarse locations like `"backend"`, `"frontend"`, or `"general"` are not valid domain names — re-normalize these to the most specific subdomain the rule's file globs imply. When in doubt between `"CLAUDE.md"` and a domain, choose the domain.
+**Universal-rule qualification**: a rule belongs in the `"CLAUDE.md"` universal sentinel (generated as the `conventions` skill) only when it applies to every file in the repository regardless of technology or context — e.g. "no abbreviations in identifiers", "prefix commits with the ticket number", "never log PII". Rules that depend on file path, language, framework, or layer belong in domain skills, even if they appeared across many PRs. Coarse locations like `"backend"`, `"frontend"`, or `"general"` are not valid domain names — re-normalize these to the most specific subdomain the rule's file globs imply. When in doubt between `"CLAUDE.md"` and a domain, choose the domain.
 
 **C. Against existing state rules**: For each candidate:
 - **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text and `status`. Merge the candidate's `do_examples`/`dont_examples` into the existing rule's arrays (deduplicate by code content, cap each at 4). Do NOT create a new rule.
@@ -444,7 +444,7 @@ For each rule, display:
 ```
 ────────────────────────────────────────────────────
 Rule: <title>
-Target: <CLAUDE.md | domain>
+Target: <universal (conventions skill) | domain>
 Confidence: <stated (explicit preference) | established | emerging> (<N> signals across <M> PRs)
 [Supersedes: "<superseded rule title>"                              ← only when supersedes is non-empty
    ↳ This convention: PRs #<min_new>–<max_new> (<N_new> signals)
@@ -905,19 +905,20 @@ the new rule against each existing one. This is your judgment, not a string matc
 
 ### Add Step A3: Choose the target skill
 
-A manual rule must land in a specific skill file (or `CLAUDE.md`). Decide **with** the user:
+A manual rule must land in a specific skill. Decide **with** the user:
 
 1. Build the list of candidate targets: every domain that already has rules in state (read
-   their `target.location` and `file_glob`s), plus `CLAUDE.md`.
+   their `target.location` and `file_glob`s), plus **universal** (stored as the
+   `"CLAUDE.md"` sentinel, generated as the ungated `conventions` skill).
 2. Form a suggestion. Use the rule's content and the existing domains' file globs to pick
-   the most specific fitting domain. Reserve `CLAUDE.md` **only** for rules that apply to
+   the most specific fitting domain. Reserve **universal** **only** for rules that apply to
    every file regardless of language/layer (naming conventions, commit format, repo-wide
-   anti-patterns) — the same CLAUDE.md qualification as Step 8. When unsure between a
-   domain and `CLAUDE.md`, prefer the domain.
+   anti-patterns) — the same qualification as Step 8. When unsure between a domain and
+   universal, prefer the domain.
 3. Ask the user to confirm the target, using the existing domains as options and your
    suggestion marked as recommended — e.g. via `AskUserQuestion` with the candidate domains,
-   `CLAUDE.md`, and a "new skill" choice. The user may pick an existing domain, `CLAUDE.md`,
-   or a brand-new domain.
+   **universal (repo-wide)**, and a "new skill" choice. Present it as "universal", not as a
+   file path — no rule is ever written to a top-level `CLAUDE.md`.
 
 **If the user chooses a new domain** (one not present in state):
 - **Confirm before creating.** Ask explicitly: "No skill exists for `<domain>` yet — create

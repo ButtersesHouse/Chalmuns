@@ -293,18 +293,61 @@ func TestWriteSkillFileEstablishedBeforeEmerging(t *testing.T) {
 	}
 }
 
-func TestWriteSkillFileNoFile(t *testing.T) {
+func TestWriteNoRulesWritesNoSkills(t *testing.T) {
 	dir := t.TempDir()
-	// only CLAUDE.md rules — no skill files should be written
-	s := stateWith(approvedRule("General", "general", "CLAUDE.md", "established", 1))
+	if err := Write(state.Empty(), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills")); !os.IsNotExist(err) {
+		t.Error(".claude/skills should not be created when there are no approved rules")
+	}
+}
 
+// Universal rules get a real skill like everything else, rather than being
+// written to a repo-root file.
+func TestUniversalRulesBecomeAskill(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(approvedRule("No abbreviations", "Never abbreviate identifiers", UniversalLocation, "stated", 1))
 	if err := Write(s, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 
-	skillsDir := filepath.Join(dir, ".claude", "skills")
-	if _, err := os.Stat(skillsDir); !os.IsNotExist(err) {
-		t.Error(".claude/skills should not be created when there are no domain rules")
+	path := filepath.Join(dir, ".claude", "skills", UniversalSkillName, "SKILL.md")
+	content := readFile(t, path)
+	if !strings.Contains(content, "Never abbreviate identifiers") {
+		t.Error("universal rule should appear in the conventions skill")
+	}
+	if !strings.Contains(content, "name: "+UniversalSkillName) {
+		t.Error("skill should be named after the universal bucket")
+	}
+	// A paths gate would hide repo-wide rules on every non-matching file.
+	if strings.Contains(content, "\npaths:") {
+		t.Errorf("conventions skill must not be paths-gated; got:\n%s", content)
+	}
+}
+
+// A scoped domain that happens to be named "conventions" merges with the
+// universal rules, and the merged skill stays ungated.
+func TestUniversalRulesMergeWithCollidingDomain(t *testing.T) {
+	dir := t.TempDir()
+	scoped := approvedRule("Scoped rule", "scoped behaviour", UniversalSkillName, "stated", 2)
+	scoped.Target.FileGlob = []string{"src/**/*.go"}
+	s := stateWith(
+		approvedRule("Universal rule", "applies everywhere", UniversalLocation, "stated", 1),
+		scoped,
+	)
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", UniversalSkillName, "SKILL.md"))
+	for _, want := range []string{"applies everywhere", "scoped behaviour"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("merged skill missing %q", want)
+		}
+	}
+	if strings.Contains(content, "\npaths:") {
+		t.Errorf("merged skill must stay ungated so universal rules always load; got:\n%s", content)
 	}
 }
 

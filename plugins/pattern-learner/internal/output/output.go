@@ -17,6 +17,17 @@ const maxCLAUDERules = 30
 // in sync with the "Stale rules" threshold in SKILL.md Step 13.
 const staleAfterPRs = 200
 
+// UniversalLocation is the Target.Location sentinel meaning "this rule applies
+// to every file in the repo". It is spelled "CLAUDE.md" for backward
+// compatibility with existing state.json files written before universal rules
+// had a skill of their own; nothing is written to a file by that name.
+const UniversalLocation = "CLAUDE.md"
+
+// UniversalSkillName is the domain directory universal rules are generated
+// into. They get a real skill like every other rule rather than a repo-root
+// file, and it carries no `paths:` gate so it auto-loads everywhere.
+const UniversalSkillName = "conventions"
+
 // Options controls optional output features.
 type Options struct {
 	// RAGHints adds a cursor-agent query hint after each rule in domain skill
@@ -70,12 +81,24 @@ func dedupeStrings(in []string) []string {
 // ".claude/skills" → ".claude/skills/api/SKILL.md").
 func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 	byDomain := map[string][]state.Rule{}
+	var universal []state.Rule
 	for _, r := range s.Rules {
-		if r.Status != "approved" || r.Target.Location == "CLAUDE.md" || r.Target.Location == "" {
+		if r.Status != "approved" || r.Target.Location == "" {
 			continue
 		}
-		d := r.Target.Location
-		byDomain[d] = append(byDomain[d], r)
+		if r.Target.Location == UniversalLocation {
+			universal = append(universal, r)
+			continue
+		}
+		byDomain[r.Target.Location] = append(byDomain[r.Target.Location], r)
+	}
+
+	// Universal rules are a skill too. If a scoped domain happens to already
+	// be called "conventions", the two merge into that one skill — and
+	// writeSkillFile drops its paths gate, since gating a file that carries
+	// repo-wide rules behind a glob would hide them on every other file.
+	if len(universal) > 0 {
+		byDomain[UniversalSkillName] = append(universal, byDomain[UniversalSkillName]...)
 	}
 
 	for domain, rules := range byDomain {
@@ -96,6 +119,11 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 	})
 
 	globs := collectGlobs(rules)
+	if domain == UniversalSkillName {
+		// No paths gate: these rules apply to every file, so the skill must
+		// auto-load regardless of what is being edited.
+		globs = nil
+	}
 	desc := buildDescription(domain, globs, override)
 	skillDir := filepath.Join(skillsDir, domain)
 
@@ -151,7 +179,13 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule) 
 		b.WriteString(fmt.Sprintf("paths: %s\n", strings.Join(globs, ", ")))
 	}
 	b.WriteString("---\n\n")
-	b.WriteString(fmt.Sprintf("# %s Conventions\n\n", capitalize(domain)))
+	// "conventions" is already the noun, so don't render "Conventions Conventions".
+	if domain == UniversalSkillName {
+		b.WriteString("# Repo-Wide Conventions\n\n")
+		b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
+	} else {
+		b.WriteString(fmt.Sprintf("# %s Conventions\n\n", capitalize(domain)))
+	}
 
 	if exemplary := exemplaryFiles(rules); len(exemplary) > 0 {
 		b.WriteString("## Exemplary Files\n\n")
@@ -514,6 +548,9 @@ func buildDescription(domain string, globs []string, override string) string {
 			return override[:197] + "..."
 		}
 		return override
+	}
+	if domain == UniversalSkillName {
+		return "Repo-wide coding conventions extracted from PR review history. Applies to every file; read before writing or reviewing code anywhere in this repository."
 	}
 	base := fmt.Sprintf("Coding conventions for %s", domain)
 	if len(globs) > 0 {

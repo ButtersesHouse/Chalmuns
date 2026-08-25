@@ -157,14 +157,14 @@ func spliceBlock(doc, block string) (string, PromoteOutcome, error) {
 // The index is the point of this block for Claude Code (which auto-loads
 // .claude/skills itself) and the whole point for agents that do not.
 func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
-	universal := approvedRules(s, "CLAUDE.md")
+	universal := approvedRules(s, UniversalLocation)
 	if len(universal) > maxCLAUDERules {
 		universal = universal[:maxCLAUDERules]
 	}
 
 	byDomain := map[string][]string{}
 	for _, r := range s.Rules {
-		if r.Status != "approved" || r.Target.Location == "CLAUDE.md" || r.Target.Location == "" {
+		if r.Status != "approved" || r.Target.Location == UniversalLocation || r.Target.Location == "" {
 			continue
 		}
 		byDomain[r.Target.Location] = append(byDomain[r.Target.Location], r.Target.FileGlob...)
@@ -189,7 +189,10 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 
 	if len(universal) > 0 {
 		b.WriteString("## Universal rules\n\n")
-		b.WriteString("These apply to every file in the repository.\n\n")
+		b.WriteString("These apply to every file in the repository.")
+		b.WriteString(fmt.Sprintf(" They are also generated as `%s`, which Claude Code auto-loads;"+
+			" they are inlined here for agents that do not read that directory.\n\n",
+			filepath.Join(skillsDir, UniversalSkillName, "SKILL.md")))
 		renderUniversalRules(&b, universal, "###")
 	}
 

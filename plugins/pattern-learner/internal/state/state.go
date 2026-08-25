@@ -92,7 +92,11 @@ type Example struct {
 	Context  string `json:"context,omitempty"`  // surrounding function context from suggestion blocks
 }
 
-// Target.Location is either "CLAUDE.md" or a skill domain name (e.g. "api", "auth").
+// Target.Location is a skill domain name (e.g. "api", "auth"), or the sentinel
+// "CLAUDE.md" meaning the rule applies repo-wide. The sentinel is historical
+// spelling only — nothing is written to a file by that name. Universal rules
+// are generated into the ungated "conventions" skill; see
+// output.UniversalLocation / output.UniversalSkillName.
 type Target struct {
 	Location string   `json:"location"`
 	FileGlob []string `json:"file_glob,omitempty"`
