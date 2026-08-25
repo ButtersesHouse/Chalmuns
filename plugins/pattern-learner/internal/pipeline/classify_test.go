@@ -217,6 +217,24 @@ func TestClassify_recencyCutoffBoundary(t *testing.T) {
 	}
 }
 
+func TestClassify_syntheticPRZeroExplicit_keptAsStated(t *testing.T) {
+	// Discover/manual rules carry one synthetic explicit Signal with
+	// pr_number: 0 (no PR provenance). They must classify on the explicit
+	// path (stated) and never be dropped by the recency downgrade, however
+	// old pr_number 0 looks relative to the scanned range.
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "explicit"}})
+	out := classifyOne(t, raw, 500, 0)
+	if out == nil {
+		t.Fatal("synthetic explicit source should be kept")
+	}
+	if out["confidence"] != "stated" {
+		t.Errorf("single explicit source → stated; got %v", out["confidence"])
+	}
+}
+
 func TestClassify_refreshMode_noCutoff(t *testing.T) {
 	// Refresh where sincePR == maxPRSeen → no recency downgrade at all.
 	raw := makeCandidate(t, []struct {

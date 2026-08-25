@@ -64,8 +64,13 @@ func decide(payload []byte, allow func(), block func(string)) {
 		return
 	}
 
-	// Only enforce while a learn-patterns run is active.
-	base := in.CWD
+	// Only enforce while a learn-patterns run is active. The lock lives at the
+	// project root: prefer CLAUDE_PROJECT_DIR (set by the hook runner) so a
+	// command run from a subdirectory cwd cannot slip past the lock lookup.
+	base := os.Getenv("CLAUDE_PROJECT_DIR")
+	if base == "" {
+		base = in.CWD
+	}
 	if base == "" {
 		base, _ = os.Getwd()
 	}
@@ -80,7 +85,7 @@ func decide(payload []byte, allow func(), block func(string)) {
 			block(reason)
 			return
 		}
-	case "Write", "Edit", "NotebookEdit":
+	case "Write", "Edit":
 		if reason := forbiddenFile(in.ToolInput.FilePath); reason != "" {
 			block(reason)
 			return

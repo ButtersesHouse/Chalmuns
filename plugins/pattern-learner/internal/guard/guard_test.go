@@ -95,6 +95,9 @@ type decideResult struct {
 
 func runDecide(t *testing.T, payload map[string]any) decideResult {
 	t.Helper()
+	// Isolate from any real hook environment: lock lookup prefers
+	// CLAUDE_PROJECT_DIR, so tests pin it empty (→ fall back to payload cwd).
+	t.Setenv("CLAUDE_PROJECT_DIR", "")
 	data, _ := json.Marshal(payload)
 	var res decideResult
 	decide(data,
@@ -187,6 +190,31 @@ func TestDecide_writeJSONAllowed(t *testing.T) {
 	})
 	if !res.allowed || res.blocked {
 		t.Errorf("Write of state-pending.json should be allowed; got %+v", res)
+	}
+}
+
+func TestDecide_subdirCwdCannotEscapeLock(t *testing.T) {
+	// The run-lock lives at the project root. A command whose cwd is a
+	// subdirectory must still be guarded when CLAUDE_PROJECT_DIR points at
+	// the root — the old cwd-only lookup fail-opened here.
+	root := withLock(t)
+	sub := filepath.Join(root, "subdir")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", root)
+	data, _ := json.Marshal(map[string]any{
+		"tool_name":  "Bash",
+		"cwd":        sub,
+		"tool_input": map[string]any{"command": "python cluster.py"},
+	})
+	var res decideResult
+	decide(data,
+		func() { res.allowed = true },
+		func(reason string) { res.blocked = true; res.reason = reason },
+	)
+	if !res.blocked {
+		t.Errorf("expected block when lock is at CLAUDE_PROJECT_DIR and cwd is a subdir; got %+v", res)
 	}
 }
 

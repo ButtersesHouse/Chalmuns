@@ -150,7 +150,12 @@ func Write(path string, s State) error {
 		if s.Rules[i].CreatedAt == "" {
 			s.Rules[i].CreatedAt = now
 		}
-		s.Rules[i].UpdatedAt = now
+		// Stamp only rules whose updated_at was cleared (or never set) by the
+		// caller; blanket-stamping every rule on every write would erase the
+		// per-rule change history.
+		if s.Rules[i].UpdatedAt == "" {
+			s.Rules[i].UpdatedAt = now
+		}
 	}
 
 	// recompute stats
