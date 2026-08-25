@@ -111,3 +111,68 @@ func TestExtractFileRef(t *testing.T) {
 		t.Errorf("want empty, got %q", got)
 	}
 }
+
+// --- promote subcommand ---
+
+func promoteState(t *testing.T, dir string) string {
+	t.Helper()
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "No abbreviations", Rule: "Never abbreviate identifiers.",
+		Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "CLAUDE.md"},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "alice", Snippet: "q", Strength: "explicit"}},
+	}}
+	path := filepath.Join(dir, "state.json")
+	if err := state.Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// runPromote defaults to AGENTS.md and, without --create, must not bring a
+// repo-root file into existence.
+func TestRunPromote_defaultTargetRequiresCreate(t *testing.T) {
+	dir := t.TempDir()
+	statePath := promoteState(t, dir)
+
+	if err := runPromote([]string{"--state", statePath, "--output-dir", dir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Error("promote must not create AGENTS.md without --create")
+	}
+
+	if err := runPromote([]string{"--state", statePath, "--output-dir", dir, "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); err != nil {
+		t.Errorf("--create should have written AGENTS.md: %v", err)
+	}
+}
+
+// Both targets can be promoted in one invocation.
+func TestRunPromote_bothTargets(t *testing.T) {
+	dir := t.TempDir()
+	statePath := promoteState(t, dir)
+	agents := filepath.Join(dir, "AGENTS.md")
+	claude := filepath.Join(dir, "CLAUDE.md")
+
+	if err := runPromote([]string{
+		"--state", statePath, "--output-dir", dir,
+		"--agents-md", agents, "--claude-md", claude, "--create",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{agents, claude} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s should have been promoted: %v", filepath.Base(p), err)
+		}
+	}
+}
+
+func TestRunPromote_requiresState(t *testing.T) {
+	if err := runPromote([]string{}); err == nil {
+		t.Error("promote should require --state")
+	}
+}

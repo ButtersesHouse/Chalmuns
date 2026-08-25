@@ -1,20 +1,20 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules to CLAUDE.md and skill files. Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like "add a rule that…", "remember we always/never…", "make a convention that…", "save this as a rule", "let's standardize on…", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule.
+description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules into per-domain skill files under .claude/skills/ (never the repo's top-level CLAUDE.md — publishing there is a separate, opt-in promote step). Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like "add a rule that…", "remember we always/never…", "make a convention that…", "save this as a rule", "let's standardize on…", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule.
 argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text]]"
 ---
 
 # learn-patterns
 
-Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules to `CLAUDE.md` and domain-specific skill files. Treats reviewer preferences — including indirect, hedged, and skeptical language — as spoken-word rules captured at face value, regardless of occurrence count.
+Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules into domain-specific skill files under `.claude/skills/`. It never writes to the repo's top-level `CLAUDE.md`/`AGENTS.md`; publishing there is an explicit, opt-in `promote` step (Step 12.6). Treats reviewer preferences — including indirect, hedged, and skeptical language — as spoken-word rules captured at face value, regardless of occurrence count.
 
 ## Tooling policy (read first)
 
 Every deterministic step in this pipeline is implemented as a subcommand of the
 `pattern-learner` binary (`$BIN`): `detect-repo`, `state-read`, `state-write`,
 `write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`,
-`audit-format`. **These subcommands are the only sanctioned implementations of
-their logic.**
+`audit-format`, `promote`. **These subcommands are the only sanctioned
+implementations of their logic.**
 
 - **Do NOT** write or run ad-hoc scripts (Python, Node, Ruby, Perl, shell scripts, etc.)
   to fetch, preprocess, ground-check, deduplicate by rule, score confidence, or triage.
@@ -92,7 +92,7 @@ If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
 
-**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `audit-format`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
+**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `audit-format`, `promote`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
 
 **Create the run-lock** (enables the off-script guard for the duration of this run):
 ```
@@ -528,29 +528,24 @@ Build the flags based on available tools:
 - If `HAS_CURSOR_AGENT` is true: add `--rag-hints` (embeds live query hints in skill files) and `--rag` (uses cursor-agent for semantic anchoring instead of grep)
 - Otherwise: no extra flags
 
-`write-outputs` writes two independent outputs: `CLAUDE.md` and per-domain skill files under `.claude/skills/`. **These paths are independently controllable** — use `--claude-md` to target an existing `CLAUDE.md` at a non-root location, and `--skills-dir` to target a non-default skills directory. When both are omitted, `--output-dir` provides the base for both (for backward compat: `<dir>/CLAUDE.md` and `<dir>/.claude/skills`).
+`write-outputs` writes **only** into the skills directory. It never creates or
+modifies a file above it — no `CLAUDE.md`, no `AGENTS.md`, nothing at the repo
+root. That tree is generator-owned and safe to regenerate wholesale, whereas a
+top-level instruction file is hand-maintained and lives in the user's git
+history. Publishing there is a separate, explicitly-requested step (Step 12.6).
 
-**Typical invocation** (target repo has `CLAUDE.md` at its root and skills under `.claude/skills/`):
+Use `--skills-dir` to target a non-default skills directory; when omitted,
+`--output-dir` provides the base (`<dir>/.claude/skills`).
+
+**Typical invocation:**
 ```
 $BIN write-outputs \
   --state .claude/pattern-learner/state.json \
-  --claude-md CLAUDE.md \
-  --agents-md AGENTS.md \
   --skills-dir .claude/skills \
   [--rag-hints] [--rag]
 ```
 
-Using `--claude-md` and `--skills-dir` directly avoids any ambiguity about where the files land — even if the project has an unusual layout — and prevents the tool from writing an unwanted `CLAUDE.md` at a wrong depth.
-
-If `CLAUDE.md` should not be modified in this run (e.g. `--review` only touched domain skills), add `--claude-md none` to suppress that output entirely (`/dev/null` is also accepted and treated the same — the tool never writes through to the device).
-
 This writes:
-- `CLAUDE.md` at the path given by `--claude-md` — approved rules targeting `CLAUDE.md`, max 30, stated first then established then emerging
-- `AGENTS.md` at the path given by `--agents-md` (default `<output-dir>/AGENTS.md`;
-  `none` suppresses) — the cross-agent convention (https://agents.md) read by Codex,
-  Cursor, Gemini CLI, and other agents that never load `CLAUDE.md` or `.claude/skills`.
-  Carries the same universal rules plus a **domain index** (globs → skill file path)
-  routing those agents to the per-domain files and their companions.
 - `<skills-dir>/<domain>/SKILL.md` — one skill per domain, generated with progressive
   disclosure so the always-loaded body stays lean (skill bodies are a recurring token
   cost once loaded):
@@ -626,6 +621,52 @@ This step never edits a file or state on its own.
 
 ---
 
+### Step 12.6: Promote to a top-level file (only when explicitly asked)
+
+**Do not run this step as part of a normal run.** The pipeline's outputs are
+the per-domain skills; Claude Code auto-loads `.claude/skills/` on its own, so
+nothing needs to be copied to the repo root for this repo's own use.
+
+Run it **only** when the user explicitly asks for a top-level `AGENTS.md` or
+`CLAUDE.md` — e.g. "publish these to AGENTS.md", "I want Codex to see these",
+"promote the conventions". The usual reason is agents other than Claude Code
+(Codex, Cursor, Gemini CLI) which never read `.claude/skills/`.
+
+```
+$BIN promote --state .claude/pattern-learner/state.json \
+  --skills-dir .claude/skills \
+  [--agents-md AGENTS.md] [--claude-md CLAUDE.md] [--create]
+```
+
+Defaults to `AGENTS.md` when neither target flag is given. Pass both to write
+both. The command prints a JSON array of `{path, outcome, reason}`.
+
+What it writes is confined to a marked block:
+
+```
+<!-- pattern-learner:begin -->  ...generated...  <!-- pattern-learner:end -->
+```
+
+Everything outside those markers is preserved byte-for-byte, so a
+hand-written file keeps its content and a re-run only refreshes our section.
+Outcomes: `created` (with `--create`), `updated` (block replaced), `appended`
+(no block yet — added at the end, nothing overwritten), `unchanged`
+(identical, no write), `skipped` (nothing to promote, or the file is absent
+and `--create` was not passed).
+
+Two rules for this step:
+
+- **Never pass `--create` unless the user asked for the file to be created.**
+  Without it, a missing target is skipped rather than created, which is what
+  keeps `promote` from introducing a repo-root file nobody asked for. If the
+  result comes back `skipped` for that reason, report it and ask before
+  re-running with `--create`.
+- **If it errors about malformed markers**, do not try to repair the file by
+  hand — report it. A half-present marker pair means someone edited the
+  delimiters, and guessing the block bounds risks destroying their content.
+
+---
+
 ### Step 13: Summary
 
 Report to the user:
@@ -650,11 +691,10 @@ New rules proposed:         <N>
   Rejected:                 <N>
   Skipped (deferred):       <N>
 Supersessions accepted:     <N>  (existing rules replaced)
-Files written:
-  CLAUDE.md                 (<N> rules)
-  AGENTS.md                 (<N> universal rules + <N>-domain index)
+Files written (skills only — nothing at the repo root):
   .claude/skills/<domain>/SKILL.md  (<N> rules, <inline | chunked index> + <N> examples/rules companion files)
   [...]
+Promoted to top level:      <"not requested" | "<path> — <created|updated|appended|unchanged|skipped>">
 Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
@@ -920,8 +960,8 @@ editing" hint from the globs).
 ### Add Step A5: Persist and generate
 
 Proceed to **Step 11** (write the updated state via `state-write`), then **Step 12**
-(`write-outputs` regenerates `CLAUDE.md` and the affected `.claude/skills/<domain>/SKILL.md` using
-`--claude-md` and `--skills-dir` as described there).
+(`write-outputs` regenerates the affected `.claude/skills/<domain>/SKILL.md` using
+`--skills-dir` as described there; it writes nothing at the repo root).
 `last_extracted_pr_number` is unchanged in this mode — manual add does not touch the PR
 watermark.
 
@@ -933,9 +973,9 @@ Replace the Step 13 summary with a short confirmation:
 ```
 ── Manual Rule Added ────────────────────────────────
 Rule:        <title>
-Target:      <CLAUDE.md | domain>  (<new skill created | existing skill>)
+Target:      <universal | domain>  (<new skill created | existing skill>)
 Action:      <added new rule | strengthened existing rule | replaced existing rule | superseded "<old title>">
-File:        <CLAUDE.md | .claude/skills/<domain>/SKILL.md>
+File:        .claude/skills/<domain>/SKILL.md  <or "universal rule — stored in state; appears in a promoted file only if you run Step 12.6">
 ─────────────────────────────────────────────────────
 ```
 

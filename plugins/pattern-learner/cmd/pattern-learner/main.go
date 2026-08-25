@@ -25,7 +25,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
 		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
-		fmt.Fprintln(os.Stderr, "             audit-format, guard")
+		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard")
 		os.Exit(1)
 	}
 
@@ -49,6 +49,8 @@ func main() {
 		err = pipeline.RunTriage(os.Args[2:])
 	case "audit-format":
 		err = format.RunAuditFormat(os.Args[2:])
+	case "promote":
+		err = runPromote(os.Args[2:])
 	case "guard":
 		err = guard.Run()
 	default:
@@ -118,12 +120,66 @@ func runWriteOutputs(args []string) error {
 	}
 
 	opts := output.Options{
-		RAGHints:     ragHints,
-		ClaudeMDPath: flagValue(args, "--claude-md", ""),
-		SkillsDir:    flagValue(args, "--skills-dir", ""),
-		AgentsMDPath: flagValue(args, "--agents-md", ""),
+		RAGHints:  ragHints,
+		SkillsDir: flagValue(args, "--skills-dir", ""),
 	}
 	return output.Write(s, outputDir, opts)
+}
+
+// runPromote publishes the conventions into a top-level agent instruction
+// file. Separate from write-outputs on purpose: a pipeline run never writes
+// above the skills directory, so escalating to the repo root stays an
+// explicit act. The write is confined to a marked block, leaving any
+// hand-written content in the file intact.
+//
+// Usage: promote --state <path> [--agents-md P] [--claude-md P]
+//
+//	[--skills-dir D] [--create]
+func runPromote(args []string) error {
+	statePath := flagValue(args, "--state", "")
+	if statePath == "" {
+		return fmt.Errorf("--state required")
+	}
+	outputDir := flagValue(args, "--output-dir", ".")
+
+	s, err := state.Read(statePath)
+	if err != nil {
+		return err
+	}
+
+	skillsDir := flagValue(args, "--skills-dir", "")
+	if skillsDir == "" {
+		skillsDir = filepath.Join(outputDir, ".claude", "skills")
+	}
+
+	// Default to AGENTS.md (the cross-agent convention) when no target is
+	// named; agents other than Claude Code have no other entry point.
+	agentsMD := flagValue(args, "--agents-md", "")
+	claudeMD := flagValue(args, "--claude-md", "")
+	var targets []string
+	if agentsMD != "" {
+		targets = append(targets, agentsMD)
+	}
+	if claudeMD != "" {
+		targets = append(targets, claudeMD)
+	}
+	if len(targets) == 0 {
+		targets = append(targets, filepath.Join(outputDir, "AGENTS.md"))
+	}
+
+	opts := output.PromoteOptions{SkillsDir: skillsDir, Create: hasFlag(args, "--create")}
+	results := make([]output.PromoteResult, 0, len(targets))
+	for _, t := range targets {
+		res, err := output.Promote(s, t, opts)
+		if err != nil {
+			return err
+		}
+		results = append(results, res)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(results)
 }
 
 // anchorExamplesRAG uses cursor-agent to semantically find real codebase instances

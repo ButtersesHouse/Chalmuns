@@ -32,111 +32,21 @@ func stateWith(rules ...state.Rule) state.State {
 	return s
 }
 
+// promoted renders the managed block for s into a fresh AGENTS.md and returns
+// the file content. Universal-rule rendering moved out of a generated
+// CLAUDE.md and into the promoted block when top-level writes became opt-in,
+// so the rendering assertions that used to run against CLAUDE.md run here.
+func promoted(t *testing.T, s state.State) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	if _, err := Promote(s, path, PromoteOptions{Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	return readFile(t, path)
+}
+
 // CLAUDE.md tests
-
-func TestWriteCLAUDEMDBasicContent(t *testing.T) {
-	dir := t.TempDir()
-	s := stateWith(approvedRule("Use errors.As", "Always use errors.As", "CLAUDE.md", "established", 1, 2))
-
-	if err := Write(s, dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	if !strings.Contains(content, "# Coding Conventions") {
-		t.Error("missing heading")
-	}
-	if !strings.Contains(content, "Use errors.As") {
-		t.Error("missing rule title")
-	}
-	if !strings.Contains(content, "Always use errors.As") {
-		t.Error("missing rule text")
-	}
-	if !strings.Contains(content, "#1") || !strings.Contains(content, "#2") {
-		t.Error("missing PR source citations")
-	}
-}
-
-func TestWriteCLAUDEMDOnlyApproved(t *testing.T) {
-	dir := t.TempDir()
-	s := stateWith(
-		approvedRule("Approved rule", "do this", "CLAUDE.md", "established", 1),
-		func() state.Rule {
-			r := approvedRule("Proposed rule", "maybe this", "CLAUDE.md", "emerging", 2)
-			r.Status = "proposed"
-			return r
-		}(),
-		func() state.Rule {
-			r := approvedRule("Rejected rule", "not this", "CLAUDE.md", "established", 3)
-			r.Status = "rejected"
-			return r
-		}(),
-	)
-
-	if err := Write(s, dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	if !strings.Contains(content, "Approved rule") {
-		t.Error("approved rule should be present")
-	}
-	if strings.Contains(content, "Proposed rule") {
-		t.Error("proposed rule should not appear in CLAUDE.md")
-	}
-	if strings.Contains(content, "Rejected rule") {
-		t.Error("rejected rule should not appear in CLAUDE.md")
-	}
-}
-
-func TestWriteCLAUDEMDEstablishedBeforeEmerging(t *testing.T) {
-	dir := t.TempDir()
-	s := stateWith(
-		approvedRule("Emerging rule", "emerging", "CLAUDE.md", "emerging", 1),
-		approvedRule("Established rule", "established", "CLAUDE.md", "established", 2),
-	)
-
-	if err := Write(s, dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	estPos := strings.Index(content, "Established rule")
-	emgPos := strings.Index(content, "Emerging rule")
-	if estPos == -1 || emgPos == -1 {
-		t.Fatal("both rules should be present")
-	}
-	if estPos > emgPos {
-		t.Error("established rule should appear before emerging rule")
-	}
-}
-
-func TestWriteCLAUDEMDStatedBeforeEstablishedBeforeEmerging(t *testing.T) {
-	dir := t.TempDir()
-	s := stateWith(
-		approvedRule("Emerging rule", "emerging text", "CLAUDE.md", "emerging", 1),
-		approvedRule("Established rule", "established text", "CLAUDE.md", "established", 2),
-		approvedRule("Stated rule", "stated text", "CLAUDE.md", "stated", 3),
-	)
-
-	if err := Write(s, dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	statedPos := strings.Index(content, "Stated rule")
-	estPos := strings.Index(content, "Established rule")
-	emgPos := strings.Index(content, "Emerging rule")
-	if statedPos == -1 || estPos == -1 || emgPos == -1 {
-		t.Fatal("all three rules should be present")
-	}
-	if statedPos > estPos {
-		t.Error("stated rule should appear before established rule")
-	}
-	if estPos > emgPos {
-		t.Error("established rule should appear before emerging rule")
-	}
-}
 
 func TestWriteSkillFileStatedFirst(t *testing.T) {
 	dir := t.TempDir()
@@ -162,106 +72,6 @@ func TestWriteSkillFileStatedFirst(t *testing.T) {
 	}
 	if estPos > emgPos {
 		t.Error("established rule should appear before emerging in skill file")
-	}
-}
-
-func TestWriteCLAUDEMDMaxThirtyRules(t *testing.T) {
-	dir := t.TempDir()
-	var rules []state.Rule
-	for i := 0; i < 35; i++ {
-		rules = append(rules, approvedRule("Rule", "text", "CLAUDE.md", "established", i+1))
-	}
-	if err := Write(stateWith(rules...), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	// count "## Rule" headings
-	count := strings.Count(content, "## Rule")
-	if count != 30 {
-		t.Errorf("expected 30 rules in CLAUDE.md, got %d", count)
-	}
-}
-
-func TestWriteCLAUDEMDNotCreatedWhenEmpty(t *testing.T) {
-	dir := t.TempDir()
-	// only a skill-domain rule — no CLAUDE.md rules
-	s := stateWith(approvedRule("API rule", "use handler", "api", "established", 1))
-
-	if err := Write(s, dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
-		t.Error("CLAUDE.md should not be created when there are no CLAUDE.md-targeted rules")
-	}
-}
-
-func TestWriteCLAUDEMDWithExamples(t *testing.T) {
-	dir := t.TempDir()
-	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
-	r.DoExample = &state.Example{Code: "errors.As(err, &target)", Language: "go"}
-	r.DontExample = &state.Example{Code: "err.(*MyErr)", Language: "go"}
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	if !strings.Contains(content, "errors.As(err, &target)") {
-		t.Error("do example missing")
-	}
-	if !strings.Contains(content, "err.(*MyErr)") {
-		t.Error("dont example missing")
-	}
-	if !strings.Contains(content, "**Do:**") {
-		t.Error("Do label missing")
-	}
-	if !strings.Contains(content, "**Don't:**") {
-		t.Error("Don't label missing")
-	}
-}
-
-func TestWriteCLAUDEMDExamplesBeforeRuleProse(t *testing.T) {
-	dir := t.TempDir()
-	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "CLAUDE.md", "established", 1)
-	r.DoExample = &state.Example{Code: "errors.As(err, &target)", Language: "go"}
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	examplePos := strings.Index(content, "errors.As(err, &target)")
-	rulePos := strings.Index(content, "Always use errors.As for type checking")
-	if examplePos == -1 || rulePos == -1 {
-		t.Fatal("both example and rule prose should be present")
-	}
-	if examplePos > rulePos {
-		t.Error("examples should appear before rule prose")
-	}
-}
-
-func TestWriteCLAUDEMDPluralExamples(t *testing.T) {
-	dir := t.TempDir()
-	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
-	r.DoExamples = []state.Example{
-		{Code: "errors.As(err, &target)", Language: "go"},
-		{Code: "errors.As(err, &myErr)", Language: "go"},
-	}
-	r.DontExamples = []state.Example{
-		{Code: "err.(*MyErr)", Language: "go"},
-	}
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	// CLAUDE.md caps at 1 pair; only first do example should appear
-	if !strings.Contains(content, "errors.As(err, &target)") {
-		t.Error("first do example missing")
-	}
-	// second do example should NOT appear in CLAUDE.md (capped at 1 pair)
-	if strings.Contains(content, "errors.As(err, &myErr)") {
-		t.Error("second do example should not appear in CLAUDE.md (max 1 pair)")
 	}
 }
 
@@ -553,7 +363,6 @@ func TestWriteSkillFileUsesDomainDescription(t *testing.T) {
 // PR list deduplication (tested via output content)
 
 func TestPRListDeduplicatesInOutput(t *testing.T) {
-	dir := t.TempDir()
 	r := approvedRule("Rule", "text", "CLAUDE.md", "established")
 	// same PR number appears twice in sources
 	r.Sources = []state.Signal{
@@ -561,11 +370,7 @@ func TestPRListDeduplicatesInOutput(t *testing.T) {
 		{PRNumber: 5, Reviewer: "bob", Snippet: "b"},
 		{PRNumber: 3, Reviewer: "carol", Snippet: "c"},
 	}
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
+	content := promoted(t, stateWith(r))
 	// #5 should appear exactly once; #3 should appear; no duplicate
 	if strings.Count(content, "#5") != 1 {
 		t.Errorf("PR #5 should appear exactly once, content:\n%s", content)
@@ -617,19 +422,6 @@ func TestRAGHintsAbsentWhenDisabled(t *testing.T) {
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if strings.Contains(content, "cursor-agent") {
 		t.Error("cursor-agent hint should not appear when RAGHints is false")
-	}
-}
-
-func TestRAGHintsNotInCLAUDEMD(t *testing.T) {
-	dir := t.TempDir()
-	r := approvedRule("Use errors.As", "Use errors.As", "CLAUDE.md", "established", 1)
-	if err := Write(stateWith(r), dir, Options{RAGHints: true}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "CLAUDE.md"))
-	if strings.Contains(content, "cursor-agent") {
-		t.Error("cursor-agent hint should not appear in CLAUDE.md")
 	}
 }
 
@@ -721,92 +513,6 @@ func TestStalenessNoteAbsentForRecentRule(t *testing.T) {
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if strings.Contains(content, "verify this convention is still current") {
 		t.Error("staleness note should not appear for rules within 200 PRs of watermark")
-	}
-}
-
-func TestAgentsMDWritten(t *testing.T) {
-	dir := t.TempDir()
-	universal := approvedRule("No abbreviations", "Never abbreviate identifiers", "CLAUDE.md", "stated", 1)
-	domain := approvedRule("API rule", "do it in api", "api", "stated", 2)
-	domain.Target.FileGlob = []string{"src/api/**/*.go"}
-	if err := Write(stateWith(universal, domain), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-
-	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
-	if !strings.Contains(content, "https://agents.md") {
-		t.Error("AGENTS.md should name the convention it follows")
-	}
-	if !strings.Contains(content, "Never abbreviate identifiers") {
-		t.Error("AGENTS.md should carry the universal rules")
-	}
-	if !strings.Contains(content, "`src/api/**/*.go`") {
-		t.Error("domain index should list the domain's globs")
-	}
-	if !strings.Contains(content, filepath.Join(".claude", "skills", "api", "SKILL.md")) {
-		t.Errorf("domain index should link the skill file relatively; got:\n%s", content)
-	}
-}
-
-func TestAgentsMDDomainOnlyStillWritten(t *testing.T) {
-	// Even with no universal rules, other agents need the domain index since
-	// they never auto-load .claude/skills.
-	dir := t.TempDir()
-	domain := approvedRule("API rule", "do it in api", "api", "stated", 1)
-	domain.Target.FileGlob = []string{"src/api/**/*.go"}
-	if err := Write(stateWith(domain), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
-	if !strings.Contains(content, "## Domain conventions") {
-		t.Error("AGENTS.md should be written for domain-only states")
-	}
-	if strings.Contains(content, "## Universal rules") {
-		t.Error("empty universal section should be omitted")
-	}
-}
-
-func TestAgentsMDNeverClobbersHandWrittenFile(t *testing.T) {
-	dir := t.TempDir()
-	handWritten := "# My own agent instructions\n\nDo not touch.\n"
-	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(handWritten), 0644); err != nil {
-		t.Fatal(err)
-	}
-	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := readFile(t, filepath.Join(dir, "AGENTS.md")); got != handWritten {
-		t.Errorf("hand-written AGENTS.md must be left untouched; got:\n%s", got)
-	}
-}
-
-func TestAgentsMDRegeneratesItsOwnFile(t *testing.T) {
-	dir := t.TempDir()
-	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
-	if err := Write(stateWith(r), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	r2 := approvedRule("Second rule", "also do this", "CLAUDE.md", "stated", 2)
-	if err := Write(stateWith(r, r2), dir, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	content := readFile(t, filepath.Join(dir, "AGENTS.md"))
-	if !strings.Contains(content, "also do this") {
-		t.Error("generator-owned AGENTS.md should be regenerated on later runs")
-	}
-}
-
-func TestAgentsMDSuppressedWithNone(t *testing.T) {
-	r := approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1)
-	for _, target := range []string{"none", os.DevNull} {
-		out := t.TempDir()
-		if err := Write(stateWith(r), out, Options{AgentsMDPath: target}); err != nil {
-			t.Fatalf("AgentsMDPath=%q: %v", target, err)
-		}
-		if _, err := os.Stat(filepath.Join(out, "AGENTS.md")); !os.IsNotExist(err) {
-			t.Errorf("AgentsMDPath=%q: AGENTS.md should not be written", target)
-		}
 	}
 }
 
@@ -952,60 +658,41 @@ func TestStaleGeneratedFilesRemovedOnRewrite(t *testing.T) {
 	}
 }
 
-func TestClaudeMDSuppressedWithNone(t *testing.T) {
-	// --claude-md none must skip the CLAUDE.md output entirely while still
-	// writing skill files (the /dev/null form used to abort write-outputs).
-	s := stateWith(
-		approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1),
-		approvedRule("API rule", "do it in api", "api", "stated", 2),
-	)
-	for _, target := range []string{"none", os.DevNull} {
-		out := t.TempDir()
-		if err := Write(s, out, Options{ClaudeMDPath: target, SkillsDir: filepath.Join(out, "skills")}); err != nil {
-			t.Fatalf("ClaudeMDPath=%q: %v", target, err)
-		}
-		if _, err := os.Stat(filepath.Join(out, "CLAUDE.md")); !os.IsNotExist(err) {
-			t.Errorf("ClaudeMDPath=%q: CLAUDE.md should not be written", target)
-		}
-		if _, err := os.Stat(filepath.Join(out, "skills", "api", "SKILL.md")); err != nil {
-			t.Errorf("ClaudeMDPath=%q: skill file should still be written: %v", target, err)
-		}
-	}
-}
-
-func TestWriteOutputsIndependentPaths(t *testing.T) {
-	// ClaudeMDPath and SkillsDir can be set independently so they don't have
-	// to share a common outputDir root — the core of the "clobber" bug.
+func TestWriteOutputsSkillsDirIsIndependent(t *testing.T) {
+	// SkillsDir can point outside outputDir so the skills tree doesn't have to
+	// live under the repo root being scanned — the core of the "clobber" bug.
 	repoRoot := t.TempDir()
-	customClaude := filepath.Join(t.TempDir(), "docs", "CLAUDE.md")
 	customSkills := filepath.Join(t.TempDir(), "my-skills")
 
 	s := stateWith(
-		approvedRule("CLAUDE rule", "global rule", "CLAUDE.md", "established", 1),
+		approvedRule("Universal rule", "global rule", "CLAUDE.md", "established", 1),
 		approvedRule("API rule", "api rule", "api", "established", 2),
 	)
-	opts := Options{
-		ClaudeMDPath: customClaude,
-		SkillsDir:    customSkills,
-	}
-	if err := Write(s, repoRoot, opts); err != nil {
+	if err := Write(s, repoRoot, Options{SkillsDir: customSkills}); err != nil {
 		t.Fatal(err)
 	}
 
-	// CLAUDE.md must land at the custom path, not under repoRoot.
-	if _, err := os.Stat(customClaude); err != nil {
-		t.Errorf("CLAUDE.md not written to custom path %s: %v", customClaude, err)
-	}
-	if _, err := os.Stat(filepath.Join(repoRoot, "CLAUDE.md")); err == nil {
-		t.Error("CLAUDE.md must not be written under repoRoot when ClaudeMDPath is set")
-	}
-
-	// Skill files must land under customSkills, not under repoRoot/.claude/skills.
 	if _, err := os.Stat(filepath.Join(customSkills, "api", "SKILL.md")); err != nil {
 		t.Errorf("skill file not written under custom skills dir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(repoRoot, ".claude", "skills", "api", "SKILL.md")); err == nil {
 		t.Error("skill file must not be written under repoRoot when SkillsDir is set")
+	}
+}
+
+func TestPromoteTargetIsIndependentOfSkillsDir(t *testing.T) {
+	// The promoted index must point at wherever the skills actually live.
+	target := filepath.Join(t.TempDir(), "AGENTS.md")
+	customSkills := filepath.Join(t.TempDir(), "my-skills")
+
+	domain := approvedRule("API rule", "api rule", "api", "established", 1)
+	domain.Target.FileGlob = []string{"src/api/**/*.go"}
+	if _, err := Promote(stateWith(domain), target, PromoteOptions{SkillsDir: customSkills, Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, target)
+	if !strings.Contains(content, filepath.Join(customSkills, "api", "SKILL.md")) {
+		t.Errorf("index should point at the real skills dir; got:\n%s", content)
 	}
 }
 
@@ -1016,4 +703,244 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("readFile %s: %v", path, err)
 	}
 	return string(data)
+}
+
+// --- promotion ---
+//
+// Write never touches anything above the skills directory; publishing to a
+// repo-root instruction file is the explicit `promote` step. These cover both
+// halves of that split, plus the marker-scoped merge that lets a promoted
+// block coexist with hand-written content.
+
+func TestWriteNeverWritesTopLevelFiles(t *testing.T) {
+	dir := t.TempDir()
+	s := stateWith(
+		approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1),
+		approvedRule("API rule", "do it in api", "api", "stated", 2),
+	)
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"CLAUDE.md", "AGENTS.md"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("write-outputs must not create %s; promotion is opt-in", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "api", "SKILL.md")); err != nil {
+		t.Errorf("skill files should still be written: %v", err)
+	}
+}
+
+func TestPromoteBasicContent(t *testing.T) {
+	content := promoted(t, stateWith(
+		approvedRule("Use errors.As", "Always use errors.As", "CLAUDE.md", "established", 1, 2),
+	))
+	for _, want := range []string{"# Coding Conventions", "Use errors.As", "Always use errors.As", "#1", "#2", BeginMarker, EndMarker} {
+		if !strings.Contains(content, want) {
+			t.Errorf("promoted block missing %q", want)
+		}
+	}
+}
+
+func TestPromoteOnlyApprovedRules(t *testing.T) {
+	proposed := approvedRule("Proposed rule", "maybe this", "CLAUDE.md", "emerging", 2)
+	proposed.Status = "proposed"
+	rejected := approvedRule("Rejected rule", "not this", "CLAUDE.md", "established", 3)
+	rejected.Status = "rejected"
+	content := promoted(t, stateWith(
+		approvedRule("Approved rule", "do this", "CLAUDE.md", "established", 1),
+		proposed, rejected,
+	))
+	if !strings.Contains(content, "Approved rule") {
+		t.Error("approved rule should be present")
+	}
+	for _, bad := range []string{"Proposed rule", "Rejected rule"} {
+		if strings.Contains(content, bad) {
+			t.Errorf("%s should not be promoted", bad)
+		}
+	}
+}
+
+func TestPromoteConfidenceOrdering(t *testing.T) {
+	content := promoted(t, stateWith(
+		approvedRule("Emerging rule", "emerging text", "CLAUDE.md", "emerging", 1),
+		approvedRule("Established rule", "established text", "CLAUDE.md", "established", 2),
+		approvedRule("Stated rule", "stated text", "CLAUDE.md", "stated", 3),
+	))
+	stated, est, emg := strings.Index(content, "Stated rule"), strings.Index(content, "Established rule"), strings.Index(content, "Emerging rule")
+	if stated < 0 || est < 0 || emg < 0 {
+		t.Fatal("all three rules should be present")
+	}
+	if !(stated < est && est < emg) {
+		t.Errorf("want stated < established < emerging, got %d/%d/%d", stated, est, emg)
+	}
+}
+
+func TestPromoteCapsUniversalRules(t *testing.T) {
+	var rules []state.Rule
+	for i := 0; i < 35; i++ {
+		rules = append(rules, approvedRule("Rule", "text", "CLAUDE.md", "established", i+1))
+	}
+	if got := strings.Count(promoted(t, stateWith(rules...)), "### Rule"); got != maxCLAUDERules {
+		t.Errorf("expected %d promoted rules, got %d", maxCLAUDERules, got)
+	}
+}
+
+func TestPromoteExamplesRenderBeforeProse(t *testing.T) {
+	r := approvedRule("Use errors.As", "Always use errors.As for type checking", "CLAUDE.md", "established", 1)
+	r.DoExamples = []state.Example{
+		{Code: "errors.As(err, &target)", Language: "go"},
+		{Code: "errors.As(err, &myErr)", Language: "go"},
+	}
+	r.DontExamples = []state.Example{{Code: "err.(*MyErr)", Language: "go"}}
+	content := promoted(t, stateWith(r))
+
+	for _, want := range []string{"errors.As(err, &target)", "err.(*MyErr)", "**Do:**", "**Don't:**"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if strings.Contains(content, "errors.As(err, &myErr)") {
+		t.Error("promoted rules cap at one example pair")
+	}
+	if ex, prose := strings.Index(content, "errors.As(err, &target)"), strings.Index(content, "Always use errors.As for type checking"); ex > prose {
+		t.Error("examples should appear before rule prose")
+	}
+}
+
+func TestPromoteDomainIndex(t *testing.T) {
+	domain := approvedRule("API rule", "do it in api", "api", "stated", 1)
+	domain.Target.FileGlob = []string{"src/api/**/*.go"}
+	content := promoted(t, stateWith(domain))
+	if !strings.Contains(content, "## Domain conventions") {
+		t.Error("domain index should be present for domain-only states")
+	}
+	if !strings.Contains(content, "`src/api/**/*.go`") {
+		t.Error("index should list the domain's globs")
+	}
+	if strings.Contains(content, "## Universal rules") {
+		t.Error("empty universal section should be omitted")
+	}
+}
+
+func TestPromoteSkipsMissingFileWithoutCreate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	res, err := Promote(stateWith(approvedRule("R", "t", "CLAUDE.md", "stated", 1)), path, PromoteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != PromoteSkipped {
+		t.Errorf("want skipped without --create, got %q", res.Outcome)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("promote must not create the file without Create")
+	}
+}
+
+func TestPromotePreservesHandWrittenContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	handWritten := "# My own agent instructions\n\nDo not touch this line.\n"
+	if err := os.WriteFile(path, []byte(handWritten), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := stateWith(approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1))
+
+	res, err := Promote(s, path, PromoteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != PromoteAppended {
+		t.Errorf("want appended, got %q", res.Outcome)
+	}
+	got := readFile(t, path)
+	if !strings.Contains(got, "Do not touch this line.") {
+		t.Error("hand-written content must survive promotion")
+	}
+	if !strings.Contains(got, "always do it") {
+		t.Error("promoted block should have been appended")
+	}
+
+	// A second promotion with new rules replaces only the block.
+	s2 := stateWith(
+		approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1),
+		approvedRule("Second rule", "also do this", "CLAUDE.md", "stated", 2),
+	)
+	res2, err := Promote(s2, path, PromoteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Outcome != PromoteUpdated {
+		t.Errorf("want updated, got %q", res2.Outcome)
+	}
+	got = readFile(t, path)
+	if !strings.Contains(got, "Do not touch this line.") {
+		t.Error("hand-written content must survive a refresh")
+	}
+	if !strings.Contains(got, "also do this") {
+		t.Error("refreshed block should carry the new rule")
+	}
+	if strings.Count(got, BeginMarker) != 1 {
+		t.Errorf("refresh must not duplicate the block, got %d markers", strings.Count(got, BeginMarker))
+	}
+}
+
+func TestPromoteIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	s := stateWith(approvedRule("Universal rule", "always do it", "CLAUDE.md", "stated", 1))
+	if _, err := Promote(s, path, PromoteOptions{Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	first := readFile(t, path)
+	res, err := Promote(s, path, PromoteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != PromoteUnchanged {
+		t.Errorf("re-promoting identical state should report unchanged, got %q", res.Outcome)
+	}
+	if readFile(t, path) != first {
+		t.Error("re-promoting identical state must not change the file")
+	}
+}
+
+func TestPromoteRefusesMalformedMarkers(t *testing.T) {
+	s := stateWith(approvedRule("R", "t", "CLAUDE.md", "stated", 1))
+	cases := map[string]string{
+		"begin only":       "# Doc\n\n" + BeginMarker + "\nstuff\n",
+		"end only":         "# Doc\n\n" + EndMarker + "\n",
+		"end before begin": "# Doc\n\n" + EndMarker + "\nstuff\n" + BeginMarker + "\n",
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "AGENTS.md")
+			if err := os.WriteFile(path, []byte(doc), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Promote(s, path, PromoteOptions{}); err == nil {
+				t.Error("expected an error rather than guessing the block bounds")
+			}
+			if readFile(t, path) != doc {
+				t.Error("file must be left untouched when markers are malformed")
+			}
+		})
+	}
+}
+
+func TestPromoteSkipsEmptyState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	res, err := Promote(state.Empty(), path, PromoteOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != PromoteSkipped {
+		t.Errorf("nothing to promote should skip, got %q", res.Outcome)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("no file should be created when there is nothing to promote")
+	}
 }

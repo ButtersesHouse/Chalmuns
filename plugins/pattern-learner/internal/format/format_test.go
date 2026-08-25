@@ -161,10 +161,7 @@ func genSkill(t *testing.T, domain string, nRules int) string {
 	s.Rules = rules
 	s.DomainDescriptions = map[string]string{domain: "Conventions for " + domain + "."}
 	skillsDir := filepath.Join(dir, ".claude", "skills")
-	if err := output.Write(s, dir, output.Options{
-		ClaudeMDPath: filepath.Join(dir, "CLAUDE.md"),
-		SkillsDir:    skillsDir,
-	}); err != nil {
+	if err := output.Write(s, dir, output.Options{SkillsDir: skillsDir}); err != nil {
 		t.Fatal(err)
 	}
 	return filepath.Join(skillsDir, domain, "SKILL.md")
