@@ -574,56 +574,55 @@ This writes:
 
 ### Step 12.5: Format check
 
+`write-outputs` already keeps generated skills inside the documented body-line
+budget itself (inline rules while the render fits under ~450 lines, otherwise
+the chunked `rules/` index described in Step 12). So this step is **not** a
+size-management step — it verifies the one thing the generator does not check:
+that the **frontmatter it emitted is valid**. The domain name is written to
+`name:` verbatim and the description comes from your `domain_descriptions`
+entry; neither is validated or sanitized by the generator.
+
 If this run touched **zero** domains (e.g. a `--review` or `--add` run whose only approved/written rules targeted `CLAUDE.md`), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
 
-Otherwise, run the deterministic size/frontmatter check against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
+Otherwise, run it against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
 
 ```
 $BIN audit-format <skills-dir>/<domain1>/SKILL.md <skills-dir>/<domain2>/SKILL.md ...
 ```
 
-This mirrors the size/frontmatter budget the `skill-right-sizing` plugin's
-`right-format-skills` skill checks hand-authored skills against (500-line
-body budget; `name`/`description` frontmatter validity) — see that skill's
-`references/rubric.md` for the full citations. `audit-format` is a narrower,
-Go-native port scoped to what `write-outputs`' fixed template can actually
-produce.
+The thresholds it applies are the ones documented in Anthropic's
+Skill-authoring guidance; the `skill-right-sizing` plugin's
+`right-format-skills` skill checks hand-authored skills against the same
+rubric (`references/rubric.md` there carries the citations).
 
 For each result:
-- **`frontmatter_issues` non-empty** — the domain name or its generated
-  description violates the documented frontmatter rules (e.g. Step 8B/A3
-  picked a domain name with an underscore or uppercase letter, or
-  `domain_descriptions[domain]` grew past 1024 chars). This is a **state
-  problem**, not a text-edit problem.
-- **`over_budget`** (>500 lines) or **`approaching_budget`** (400–499
-  lines) — the domain has accumulated enough rules that the generated file
-  is, or is about to be, oversized.
 
-**Do not hand-edit the generated `SKILL.md` to fix either finding** (e.g. by
-extracting a section into a reference file the way `right-format-skills`
-would for a hand-authored skill). `write-outputs` does a full atomic
-rewrite of that file from state on *every* run — a hand-split reference
-file would be silently orphaned the next time pattern-learner runs. The
-durable fix lives at the **state** level:
+- **`frontmatter_issues` non-empty — act on this.** The domain name or its
+  generated description violates a documented frontmatter rule (e.g. Step
+  8B/A3 canonicalized a domain to `Legacy_API`, which breaks the
+  lowercase/digits/hyphens charset rule, or `domain_descriptions[domain]`
+  grew past 1024 chars). A skill whose `name` breaks the charset rule may
+  fail to register, so this is worth fixing.
 
-- **Frontmatter issue**: propose a corrected domain name (valid charset) or
-  a shortened `domain_descriptions[domain]` entry to the user.
-- **Over/approaching budget**: read that domain's approved rules (already
-  in memory from Step 4 / assembled in Step 11) and propose splitting them
-  into narrower sub-domains — the same judgment call as Step 8B's domain
-  normalization, run in reverse. Look for a natural split (shared
-  `file_glob` sub-paths, or a sub-topic within the domain) rather than an
-  arbitrary line-count cut. Present the proposed split — which rules move
-  to which new domain name(s) — and ask the user to approve it.
+  Fix it at the **state** level, never by hand-editing the generated file —
+  `write-outputs` rewrites that file wholesale from state on every run, so a
+  hand-edit is silently discarded next run. Propose to the user a corrected
+  domain name (valid charset) or a shortened `domain_descriptions[domain]`
+  entry. On approval, re-target the affected rules' `target.location` and/or
+  update the description, then re-run **Step 11** (state-write) and **Step
+  12** (write-outputs), and re-run this check to confirm it comes back
+  clean. On decline, note it in the Step 13 summary and continue.
 
-On approval: re-target the affected rules' `target.location` to the new
-domain name(s), refresh `domain_descriptions` for every domain touched, then
-re-run **Step 11** (state-write) and **Step 12** (write-outputs) so the split
-is regenerated durably. Re-run this step on the new files to confirm they're
-now within budget.
+- **`over_budget` / `approaching_budget` — this is a generator bug, not
+  something to fix by hand.** Step 12's chunking is supposed to make this
+  unreachable: a domain large enough to exceed the budget should already
+  have been chunked into a `rules/` index. If a generated skill still
+  reports over budget, `write-outputs`' chunking did not do its job.
+  Per the Tooling policy, **STOP and report it** — do not re-split the
+  domain by hand and do not edit the emitted file. Include the domain name
+  and the reported `body_lines` so the generator can be fixed.
 
-On decline: note the finding in the Step 13 summary and continue without
-changing state — this step never edits a file or state on its own.
+This step never edits a file or state on its own.
 
 ---
 
@@ -662,8 +661,9 @@ RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "no
 RAG hints in skill files:   <yes | no>
 Format check (audit-format):
   <"skipped — no domain skill files touched this run" |
-   "all domain skills within budget, no frontmatter issues" |
-   list per flagged domain: "<domain>: <N> lines (over budget|approaching) — <split proposed and applied | split proposed, declined | not yet resolved>" and/or "<domain>: frontmatter issue — <finding> — <fixed | declined>">
+   "frontmatter valid for all <N> domain skills" |
+   list per flagged domain: "<domain>: frontmatter issue — <finding> — <fixed | declined>"
+   and/or "<domain>: BUG — <N> lines, over budget despite Step 12 chunking (reported, not hand-fixed)">
 ─────────────────────────────────────────────────────
 ```
 

@@ -1,16 +1,31 @@
-// Package format implements deterministic SKILL.md size/frontmatter checks
-// for pattern-learner's own generated output, so a format-budget check can
-// run as a sanctioned $BIN subcommand instead of an ad-hoc script (which the
+// Package format implements deterministic SKILL.md frontmatter/size checks
+// for pattern-learner's own generated output, so the check can run as a
+// sanctioned $BIN subcommand instead of an ad-hoc script (which the
 // learn-patterns guard blocks during a run — see internal/guard).
 //
-// This is a narrower port of the skill-right-sizing plugin's
-// right-format-skills audit (plugins/skill-right-sizing/skills/
-// right-format-skills/scripts/audit_format.py, rubric in that skill's
-// references/rubric.md): it covers only the checks meaningful for
-// write-outputs' shape — a single flat SKILL.md per domain, never a
-// multi-file skill with bundled references — so reference-nesting, TOC, and
-// path-style checks are intentionally omitted here. If write-outputs ever
-// starts bundling reference files, port those checks over too.
+// Scope, and why it is narrow. output.Write already keeps generated skills
+// within the documented body-line budget itself: it renders rules inline
+// while the result fits under maxSkillLines (450) and otherwise chunks the
+// domain into rules/<slug>.md plus an index, and it emits examples/<slug>.md
+// companion files. Those companions are one link-hop from SKILL.md by
+// construction, so the reference-nesting and TOC checks in the sibling
+// Python audit (plugins/skill-right-sizing/skills/right-format-skills/
+// scripts/audit_format.py, rubric in that skill's references/rubric.md)
+// have nothing to catch here and are deliberately not ported.
+//
+// What is left is the gap output.Write does *not* close:
+//
+//   - Frontmatter validity. The domain name is written to `name:` verbatim
+//     (renderSkillHeader), and the description comes from the model-authored
+//     domain_descriptions entry. Neither is validated or sanitized, so a
+//     domain canonicalized to e.g. "Legacy_API" yields a SKILL.md whose
+//     name breaks the documented charset rule. This is the check with real
+//     residual value.
+//   - Body lines, as a regression assertion on the chunking above rather
+//     than a budget the model is expected to act on: if a generated skill
+//     ever reports over budget, output.Write's chunking failed to do its
+//     job, which is a bug in the generator, not something to hand-fix in
+//     the emitted file (write-outputs rewrites it wholesale next run).
 package format
 
 import (
