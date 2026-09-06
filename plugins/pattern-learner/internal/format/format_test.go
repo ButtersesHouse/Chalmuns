@@ -101,6 +101,56 @@ func TestAuditFile_frontmatterIssues(t *testing.T) {
 	}
 }
 
+// The block is parsed as YAML, as Claude Code reads it. The two unquoted
+// shapes below used to slip past the old line-based reader and then fail at
+// load time; they must be reported here instead. Quoted forms must pass, and
+// the .claude/rules list form of paths is accepted.
+func TestAuditFile_yamlValidity(t *testing.T) {
+	cases := []struct {
+		name        string
+		frontmatter string
+		wantIssue   string // "" means no YAML issue expected
+	}{
+		{"unquoted colon in description", "name: api\ndescription: API endpoints: errors, auth.", "not valid YAML"},
+		{"unquoted star glob", "name: ui\ndescription: x.\npaths: *.tsx,src/**/*.ts", "not valid YAML"},
+		{"quoted colon and star", "name: \"ui\"\ndescription: \"API endpoints: errors, auth.\"\npaths: \"*.tsx,src/**/*.ts\"", ""},
+		{"paths as list", "name: ui\ndescription: x.\npaths:\n  - \"*.tsx\"\n  - \"src/**/*.ts\"", ""},
+		{"empty glob", "name: ui\ndescription: x.\npaths: \"*.tsx,,src/**/*.ts\"", "empty glob"},
+		{"nested value", "name: ui\ndescription:\n  text: x\n", "nested value"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeSkill(t, t.TempDir(), "SKILL.md", tc.frontmatter, "# body\n")
+			res := AuditFile(path)
+			if res.FrontmatterIssues == nil {
+				t.Fatal("frontmatter_issues must be a list, not null")
+			}
+			var matched []string
+			for _, issue := range res.FrontmatterIssues {
+				if tc.wantIssue != "" && strings.Contains(issue, tc.wantIssue) {
+					matched = append(matched, issue)
+				}
+			}
+			switch {
+			case tc.wantIssue == "" && len(res.FrontmatterIssues) != 0:
+				t.Errorf("expected clean, got %v", res.FrontmatterIssues)
+			case tc.wantIssue != "" && len(matched) == 0:
+				t.Errorf("expected an issue containing %q, got %v", tc.wantIssue, res.FrontmatterIssues)
+			}
+		})
+	}
+}
+
+// A YAML failure still reports the name (recovered leniently) so the caller
+// can say which domain is broken.
+func TestAuditFile_yamlFailureStillReportsName(t *testing.T) {
+	path := writeSkill(t, t.TempDir(), "SKILL.md", "name: api\ndescription: A: b", "# body\n")
+	res := AuditFile(path)
+	if res.Name != "api" {
+		t.Errorf("name should be recovered on parse failure, got %q", res.Name)
+	}
+}
+
 func TestAuditFile_missingFile(t *testing.T) {
 	res := AuditFile("/nonexistent/SKILL.md")
 	if res.Error == "" {
@@ -152,14 +202,16 @@ func genSkill(t *testing.T, domain string, nRules int) string {
 			ID: fmt.Sprintf("rule_%d", i), Status: "approved", Confidence: "established",
 			Title:        fmt.Sprintf("Rule number %d about things", i),
 			Rule:         strings.Repeat("Do the thing carefully and consistently. ", 5),
-			Target:       state.Target{Location: domain, FileGlob: []string{"src/**/*.go"}},
+			Target:       state.Target{Location: domain, FileGlob: []string{"**/*.go", "src/**/*.go"}},
 			DoExamples:   []state.Example{{Code: "good()", Language: "go"}},
 			DontExamples: []state.Example{{Code: "bad()", Language: "go"}},
 		})
 	}
 	s := state.Empty()
 	s.Rules = rules
-	s.DomainDescriptions = map[string]string{domain: "Conventions for " + domain + "."}
+	// The description shape Step 11 asks for, colon included, and a glob
+	// starting with "*": the generator must quote both so this parses.
+	s.DomainDescriptions = map[string]string{domain: "Conventions for " + domain + ": errors, naming. Use when editing src/."}
 	skillsDir := filepath.Join(dir, ".claude", "skills")
 	if err := output.Write(s, dir, output.Options{SkillsDir: skillsDir}); err != nil {
 		t.Fatal(err)
@@ -175,6 +227,9 @@ func TestGeneratedSkill_staysWithinBudget(t *testing.T) {
 		res := AuditFile(genSkill(t, "api", n))
 		if res.Error != "" {
 			t.Fatalf("n=%d: %s", n, res.Error)
+		}
+		if len(res.FrontmatterIssues) != 0 {
+			t.Errorf("n=%d: generated frontmatter should be clean, got %v", n, res.FrontmatterIssues)
 		}
 		if res.OverBudget || res.ApproachingBudget {
 			t.Errorf("n=%d rules: generator emitted a skill at %d body lines (over=%v approaching=%v); "+

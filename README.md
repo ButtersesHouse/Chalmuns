@@ -18,8 +18,9 @@ Then browse with `/plugin`, or install directly:
 
 ### `pattern-learner`
 Extracts recurring coding conventions from PR review history and writes approved
-rules to CLAUDE.md and skill files. Go-based (builds a `pattern-learner` binary
-into the target repo; requires Go 1.21+). Source in `plugins/pattern-learner/`.
+rules to per-domain skill files under `.claude/skills/` (with an opt-in `promote`
+step for a top-level AGENTS.md/CLAUDE.md). Go-based (builds a `pattern-learner`
+binary into the target repo; requires Go 1.21+). Source in `plugins/pattern-learner/`.
 
 ### `skill-right-sizing`
 - **`right-size-skills`** — proposes the cheapest `model:`/`effort:` each skill

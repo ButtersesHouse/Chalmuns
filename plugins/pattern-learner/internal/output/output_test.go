@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
+	"gopkg.in/yaml.v3"
 )
 
 // helpers
@@ -227,7 +228,7 @@ func TestWriteSkillFileFrontmatter(t *testing.T) {
 	if !strings.HasPrefix(content, "---\n") {
 		t.Error("skill file should start with YAML frontmatter")
 	}
-	if !strings.Contains(content, "name: api") {
+	if !strings.Contains(content, "name: \"api\"") {
 		t.Error("frontmatter missing name field")
 	}
 	if !strings.Contains(content, "internal/api/**/*.go") {
@@ -317,7 +318,7 @@ func TestUniversalRulesBecomeAskill(t *testing.T) {
 	if !strings.Contains(content, "Never abbreviate identifiers") {
 		t.Error("universal rule should appear in the conventions skill")
 	}
-	if !strings.Contains(content, "name: "+UniversalSkillName) {
+	if !strings.Contains(content, "name: \""+UniversalSkillName+"\"") {
 		t.Error("skill should be named after the universal bucket")
 	}
 	// A paths gate would hide repo-wide rules on every non-matching file.
@@ -570,12 +571,137 @@ func TestSkillFrontmatterPathsGate(t *testing.T) {
 	}
 
 	api := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
-	if !strings.Contains(api, "paths: src/api/**/*.go, src/api/**/*.sql\n") {
+	if !strings.Contains(api, "paths: \"src/api/**/*.go,src/api/**/*.sql\"\n") {
 		t.Errorf("skill with globs should emit a paths gate; got header:\n%s", api[:200])
 	}
 	docs := readFile(t, filepath.Join(dir, ".claude", "skills", "docs", "SKILL.md"))
 	if strings.Contains(docs, "paths:") {
 		t.Error("skill without globs must omit paths so it can still auto-load")
+	}
+}
+
+// frontmatter reads back from the generated SKILL.md via a real YAML parser,
+// the way Claude Code loads it. Returns the parsed block and the raw file.
+func frontmatter(t *testing.T, path string) (map[string]any, string) {
+	t.Helper()
+	content := readFile(t, path)
+	rest := strings.TrimPrefix(content, "---\n")
+	if rest == content {
+		t.Fatalf("no frontmatter in %s:\n%s", path, content)
+	}
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		t.Fatalf("unterminated frontmatter in %s:\n%s", path, content)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(rest[:end]), &doc); err != nil {
+		t.Fatalf("frontmatter in %s is not valid YAML (%v):\n%s", path, err, content)
+	}
+	return doc, content
+}
+
+// The two shapes the pipeline produces routinely, and which an unquoted
+// frontmatter cannot carry: a description with ": " in it (the form Step 11
+// of SKILL.md asks the model to write) and a glob that starts with "*" (a
+// YAML alias when unquoted). Both must round-trip through a strict parser.
+func TestSkillFrontmatterIsValidYAML(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Hooks in hooks dir", "do it", "components", "stated", 1)
+	r.Target.FileGlob = []string{"*.tsx", "**/*.jsx", "src/components/**/*.ts"}
+	s := stateWith(r)
+	s.DomainDescriptions = map[string]string{
+		"components": `React conventions: hooks, props, "render" helpers. Use when editing *.tsx files`,
+	}
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := frontmatter(t, filepath.Join(dir, ".claude", "skills", "components", "SKILL.md"))
+	if got := doc["name"]; got != "components" {
+		t.Errorf("name = %v", got)
+	}
+	if got := doc["description"]; got != s.DomainDescriptions["components"] {
+		t.Errorf("description round-trip lost content: %v", got)
+	}
+	if got := doc["paths"]; got != "*.tsx,**/*.jsx,src/components/**/*.ts" {
+		t.Errorf("paths = %v", got)
+	}
+}
+
+func TestYAMLQuote(t *testing.T) {
+	cases := map[string]string{
+		`plain`:            `"plain"`,
+		`has: colon`:       `"has: colon"`,
+		`*.tsx`:            `"*.tsx"`,
+		`say "hi"`:         `"say \"hi\""`,
+		`back\slash`:       `"back\\slash"`,
+		"multi\nline\ttab": `"multi\nline\ttab"`,
+	}
+	for in, want := range cases {
+		got := yamlQuote(in)
+		if got != want {
+			t.Errorf("yamlQuote(%q) = %s, want %s", in, got, want)
+			continue
+		}
+		var back string
+		if err := yaml.Unmarshal([]byte(got), &back); err != nil || back != in {
+			t.Errorf("yamlQuote(%q) does not round-trip: %q, %v", in, back, err)
+		}
+	}
+}
+
+// A domain that vanishes from state (renamed, merged, all rules rejected)
+// must not leave its old skill behind to keep auto-loading; a skill that
+// pattern-learner did not write must survive a regeneration untouched.
+func TestWritePrunesStaleGeneratedSkills(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+
+	old := approvedRule("Old rule", "do it", "components", "stated", 1)
+	if err := Write(stateWith(old), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
+		t.Fatalf("first run should have written components: %v", err)
+	}
+	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md")) {
+		t.Fatal("generated SKILL.md should carry the generated marker")
+	}
+
+	// A hand-written skill sharing the root, one that even mentions the tool.
+	handWritten := filepath.Join(skills, "deploy")
+	if err := os.MkdirAll(handWritten, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(handWritten, "SKILL.md"),
+		[]byte("---\nname: deploy\ndescription: Deploy steps (see pattern-learner for conventions).\n---\n\nSteps.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Domain renamed: components -> ui.
+	renamed := approvedRule("Old rule", "do it", "ui", "stated", 1)
+	if err := Write(stateWith(renamed), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "components")); !os.IsNotExist(err) {
+		t.Error("stale generated skill 'components' should have been pruned")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "ui", "SKILL.md")); err != nil {
+		t.Errorf("renamed domain should be written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(handWritten, "SKILL.md")); err != nil {
+		t.Errorf("hand-written skill must be preserved: %v", err)
+	}
+
+	// Every rule gone: the generated skill goes too, the hand-written one stays.
+	if err := Write(state.Empty(), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "ui")); !os.IsNotExist(err) {
+		t.Error("generated skill with no remaining rules should have been pruned")
+	}
+	if _, err := os.Stat(filepath.Join(handWritten, "SKILL.md")); err != nil {
+		t.Errorf("hand-written skill must be preserved: %v", err)
 	}
 }
 

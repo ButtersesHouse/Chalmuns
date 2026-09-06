@@ -20,7 +20,9 @@
 //     domain_descriptions entry. Neither is validated or sanitized, so a
 //     domain canonicalized to e.g. "Legacy_API" yields a SKILL.md whose
 //     name breaks the documented charset rule. This is the check with real
-//     residual value.
+//     residual value. The block is parsed as real YAML (the way Claude Code
+//     reads it), so a file whose frontmatter does not parse is reported as
+//     such rather than passing on a line-by-line regex read.
 //   - Body lines, as a regression assertion on the chunking above rather
 //     than a budget the model is expected to act on: if a generated skill
 //     ever reports over budget, output.Write's chunking failed to do its
@@ -35,6 +37,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Size/frontmatter thresholds, sourced from Anthropic's Skill-authoring
@@ -75,32 +79,71 @@ func AuditFile(path string) Result {
 	}
 
 	text := string(data)
-	fields, body := parseFrontmatter(text)
+	fields, body, parseIssues := parseFrontmatter(text)
 	res.Name = fields["name"]
 	res.BodyLines = countLines(body)
 	res.OverBudget = res.BodyLines > BodyLineLimit
 	res.ApproachingBudget = !res.OverBudget && res.BodyLines >= BodyLineWarn
-	res.FrontmatterIssues = checkFrontmatter(fields)
+	res.FrontmatterIssues = append(parseIssues, checkFrontmatter(fields)...)
 	return res
 }
 
-// parseFrontmatter splits text into the YAML frontmatter fields (flat
-// key: value pairs only — sufficient for name/description) and the body
-// that follows the closing "---".
-func parseFrontmatter(text string) (map[string]string, string) {
+// parseFrontmatter splits text into the frontmatter fields and the body that
+// follows the closing "---". The block is parsed as YAML, since that is how
+// the consuming agent reads it; a block that does not parse is reported as
+// an issue, and the fields are then recovered line-by-line so the remaining
+// checks (and the reported name) still have something to work with.
+//
+// Values are flattened to strings: scalars via their string form, a list
+// (the .claude/rules form of `paths`) via a comma join. Anything else is
+// reported as an issue, since no documented field takes a nested value.
+func parseFrontmatter(text string) (map[string]string, string, []string) {
 	fields := map[string]string{}
+	issues := []string{}
 	m := reFrontmatter.FindStringSubmatchIndex(text)
 	if m == nil {
-		return fields, text
+		return fields, text, issues
 	}
 	fmText := text[m[2]:m[3]]
 	body := text[m[1]:]
+
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(fmText), &doc); err != nil {
+		issues = append(issues, "frontmatter is not valid YAML (the skill will fail to load): "+
+			strings.Join(strings.Fields(err.Error()), " "))
+		return lenientFields(fmText), body, issues
+	}
+	for k, v := range doc {
+		switch val := v.(type) {
+		case nil:
+			fields[k] = ""
+		case string:
+			fields[k] = val
+		case []any:
+			parts := make([]string, 0, len(val))
+			for _, item := range val {
+				parts = append(parts, fmt.Sprint(item))
+			}
+			fields[k] = strings.Join(parts, ",")
+		case map[string]any:
+			issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+		default:
+			fields[k] = fmt.Sprint(val)
+		}
+	}
+	return fields, body, issues
+}
+
+// lenientFields is the pre-YAML line reader, kept only as the fallback for a
+// block that failed to parse.
+func lenientFields(fmText string) map[string]string {
+	fields := map[string]string{}
 	for _, line := range strings.Split(fmText, "\n") {
 		if fm := reFMField.FindStringSubmatch(line); fm != nil {
 			fields[strings.TrimSpace(fm[1])] = strings.Trim(strings.TrimSpace(fm[2]), `"'`)
 		}
 	}
-	return fields, body
+	return fields
 }
 
 // countLines mirrors Python's len(s.splitlines()): a trailing newline does
@@ -125,7 +168,8 @@ func countLines(body string) int {
 // pattern-learner's domain names are dictated by codebase structure
 // (api, auth, models, ...), not chosen for gerund style.
 func checkFrontmatter(fields map[string]string) []string {
-	var issues []string
+	// Non-nil so the JSON output reads as an empty list, not null.
+	issues := []string{}
 	name := fields["name"]
 	desc := fields["description"]
 
@@ -150,6 +194,17 @@ func checkFrontmatter(fields map[string]string) []string {
 		issues = append(issues, "frontmatter missing required 'description'")
 	} else if len(desc) > DescMaxChars {
 		issues = append(issues, fmt.Sprintf("description exceeds %d chars (%d)", DescMaxChars, len(desc)))
+	}
+
+	// paths is optional; when present it gates auto-loading, so an empty
+	// entry (a stray comma) would silently widen or break the gate.
+	if paths, ok := fields["paths"]; ok {
+		for _, g := range strings.Split(paths, ",") {
+			if strings.TrimSpace(g) == "" {
+				issues = append(issues, "paths contains an empty glob")
+				break
+			}
+		}
 	}
 
 	return issues
