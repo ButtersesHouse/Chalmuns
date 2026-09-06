@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
@@ -110,20 +112,35 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 		byDomain[UniversalSkillName] = append(universal, byDomain[UniversalSkillName]...)
 	}
 
+	// Validate every domain before touching the tree, so a bad name fails the
+	// run with nothing written rather than after a map-ordered subset.
+	for domain := range byDomain {
+		if !validDomain(domain) {
+			return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
+		}
+	}
+
+	// Prune before writing. Pruning afterwards would, on a case-insensitive
+	// filesystem, see the directory just written under its old casing
+	// ("Api" for domain "api"), miss it in the live set, and delete it.
+	if err := pruneStaleSkills(skillsDir, byDomain); err != nil {
+		return err
+	}
 	for domain, rules := range byDomain {
 		if err := writeSkillFile(domain, rules, skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, opts); err != nil {
 			return err
 		}
 	}
-	return pruneStaleSkills(skillsDir, byDomain)
+	return nil
 }
 
 // pruneStaleSkills removes generated skill directories under skillsDir whose
 // domain no longer has approved rules. Without this, a renamed or merged
 // domain (or one whose rules were all rejected) leaves its old SKILL.md
 // behind, and the consuming agent keeps auto-loading conventions that state
-// no longer holds. Only directories whose SKILL.md carries GeneratedMarker
-// are candidates; hand-authored skills sharing the root are never removed.
+// no longer holds. Only directories whose SKILL.md this generator wrote
+// (see isGeneratedSkill) are candidates; hand-authored skills sharing the
+// root are never removed.
 func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 	entries, err := os.ReadDir(skillsDir)
 	if os.IsNotExist(err) {
@@ -150,25 +167,40 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 	return nil
 }
 
+// legacyGeneratedLines are whole lines that only the pre-marker generator
+// ever wrote (the two explanatory sentences at the top of the inline and
+// chunked layouts). They let a skill written before GeneratedMarker existed
+// be recognised and pruned on the first run of the new binary, which is the
+// population pruning was added for. Both are long, exact, and generator-only,
+// so a hand-written skill cannot match by accident.
+var legacyGeneratedLines = []string{
+	"Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.",
+	"This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.",
+}
+
 // isGeneratedSkill reports whether the SKILL.md at path was written by this
-// package, judged by an exact-line match on GeneratedMarker.
+// package, judged by an exact-line match on GeneratedMarker or, for files
+// from before the marker existed, on one of legacyGeneratedLines.
 func isGeneratedSkill(path string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(line) == GeneratedMarker {
+		line = strings.TrimSpace(line)
+		if line == GeneratedMarker {
 			return true
+		}
+		for _, legacy := range legacyGeneratedLines {
+			if line == legacy {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, opts Options) error {
-	if !validDomain(domain) {
-		return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
-	}
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -363,16 +395,20 @@ func writeSourceLine(b *strings.Builder, r state.Rule, watermark int) {
 	b.WriteString(fmt.Sprintf("_Source: %s_\n\n", sourceLabel(r)))
 }
 
+// ragHintTitle prepares a rule title for the RAG hint, which is a shell
+// command inside a markdown code span that the agent may paste verbatim.
+// Quotes, backslashes and dollars are escaped for the shell; backticks are
+// dropped because a code span cannot contain one (backslash escapes do not
+// apply inside spans), and the title reads fine without them.
+var ragHintTitle = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "")
+
 func writeRAGHint(b *strings.Builder, r state.Rule, opts Options) {
 	if !opts.RAGHints {
 		return
 	}
-	// The hint is a shell command the agent may paste verbatim, so the
-	// title must not break out of its double-quoted argument.
-	title := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", "$", `\$`).Replace(r.Title)
 	b.WriteString(fmt.Sprintf(
 		"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
-		title,
+		ragHintTitle.Replace(r.Title),
 	))
 }
 
@@ -671,10 +707,13 @@ func yamlQuote(s string) string {
 			b.WriteString(`\r`)
 		case r == '\t':
 			b.WriteString(`\t`)
-		case r < 0x20 || r == 0x7f:
-			// Other control characters are not allowed raw inside a
-			// double-quoted scalar; emit the YAML hex escape.
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+			// C0 and C1 controls are not printable per the YAML spec and a
+			// parser rejects them raw even inside quotes (U+0085 is instead a
+			// line break and would be folded to a space); emit hex escapes.
 			b.WriteString(fmt.Sprintf(`\x%02x`, r))
+		case r == 0xfffe || r == 0xffff:
+			b.WriteString(fmt.Sprintf(`\u%04x`, r))
 		default:
 			b.WriteRune(r)
 		}
@@ -683,11 +722,14 @@ func yamlQuote(s string) string {
 	return b.String()
 }
 
+// capitalize upper-cases the first rune of s (not the first byte, which would
+// corrupt a leading multi-byte character).
 func capitalize(s string) string {
-	if s == "" {
+	r, size := utf8.DecodeRuneInString(s)
+	if size == 0 || r == utf8.RuneError {
 		return s
 	}
-	return strings.ToUpper(s[:1]) + s[1:]
+	return string(unicode.ToUpper(r)) + s[size:]
 }
 
 // initialisms are domain words rendered upper-case in headings. Anything not
@@ -707,6 +749,9 @@ var initialisms = map[string]bool{
 // ("components" → "Components").
 func headingTitle(domain string) string {
 	words := strings.FieldsFunc(domain, func(r rune) bool { return r == '-' || r == '_' })
+	if len(words) == 0 {
+		return domain
+	}
 	for i, w := range words {
 		if initialisms[strings.ToLower(w)] {
 			words[i] = strings.ToUpper(w)

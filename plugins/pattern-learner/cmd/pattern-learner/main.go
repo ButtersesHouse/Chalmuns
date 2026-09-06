@@ -20,17 +20,28 @@ import (
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
 
+// Version identifies the binary's output contract. SKILL.md Step 2 compares
+// it against the version it expects and rebuilds on mismatch, so a binary
+// built from older source cannot silently keep producing the old output
+// (the usage listing alone cannot tell two builds apart when the subcommand
+// set is unchanged). Bump it whenever generated output or a subcommand's
+// behaviour changes, and update the expected value in SKILL.md and the
+// plugin manifest to match.
+const Version = "0.3.0"
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
 		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
-		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard")
+		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard, version")
 		os.Exit(1)
 	}
 
 	var err error
 	switch os.Args[1] {
+	case "version":
+		fmt.Println(Version)
 	case "detect-repo":
 		err = runDetectRepo()
 	case "state-read":

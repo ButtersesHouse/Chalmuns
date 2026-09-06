@@ -651,7 +651,7 @@ func TestBuildDescriptionTruncatesOnRunes(t *testing.T) {
 // Domain names are model-supplied; one that is not a single path segment
 // must be refused rather than written outside the skills directory.
 func TestWriteRejectsPathUnsafeDomain(t *testing.T) {
-	for _, bad := range []string{"../escape", "api/v2", "..", "."} {
+	for _, bad := range []string{"../escape", "api/v2", `api\v2`, "..", "."} {
 		dir := t.TempDir()
 		err := Write(stateWith(approvedRule("r", "do it", bad, "stated", 1)), dir, Options{})
 		if err == nil {
@@ -667,6 +667,8 @@ func TestHeadingTitle(t *testing.T) {
 		"components": "Components",
 		"db_models":  "DB Models",
 		"auth":       "Auth",
+		"état-api":   "État API", // first rune is multi-byte
+		"---":        "---",      // no words: fall back to the raw domain
 	}
 	for in, want := range cases {
 		if got := headingTitle(in); got != want {
@@ -678,13 +680,83 @@ func TestHeadingTitle(t *testing.T) {
 // The RAG hint is a shell command; a title with a quote must not break it.
 func TestRAGHintEscapesShellMetacharacters(t *testing.T) {
 	dir := t.TempDir()
-	r := approvedRule(`Use "errors.As" for $checks`, "do it", "api", "stated", 1)
+	r := approvedRule("Use \"errors.As\" for `$checks`", "do it", "api", "stated", 1)
 	if err := Write(stateWith(r), dir, Options{RAGHints: true}); err != nil {
 		t.Fatal(err)
 	}
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if !strings.Contains(content, `'Use \"errors.As\" for \$checks'`) {
-		t.Errorf("hint should escape quotes and dollars; got:\n%s", content)
+		t.Errorf("hint should escape quotes and dollars and drop backticks; got:\n%s", content)
+	}
+	// The hint must remain one intact code span.
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "_Live examples:") && strings.Count(line, "`") != 2 {
+			t.Errorf("hint line should contain exactly one code span: %s", line)
+		}
+	}
+}
+
+// Every rune the generator might be handed must survive a strict YAML
+// round-trip, including the C1 controls and non-characters the spec forbids
+// raw even inside quotes.
+func TestYAMLQuoteRoundTripsAllRunes(t *testing.T) {
+	var runes []rune
+	for r := rune(0); r <= 0x2ff; r++ {
+		runes = append(runes, r)
+	}
+	runes = append(runes, 0x2028, 0x2029, 0xfffd, 0xfffe, 0xffff, 0x1f600)
+	for _, r := range runes {
+		in := "a" + string(r) + "b"
+		var back string
+		if err := yaml.Unmarshal([]byte(yamlQuote(in)), &back); err != nil {
+			t.Errorf("U+%04X: %s does not parse: %v", r, yamlQuote(in), err)
+		} else if back != in {
+			t.Errorf("U+%04X: round-trip changed the value: %q -> %q", r, in, back)
+		}
+	}
+}
+
+// A skill written by the generator before the marker line existed must still
+// be recognised so it can be pruned on the first run of the new binary.
+func TestPrunesLegacyGeneratedSkills(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	legacy := filepath.Join(skills, "components")
+	if err := os.MkdirAll(legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := "---\nname: components\ndescription: Component conventions.\n---\n\n# Components Conventions\n\n## Rules\n\n" +
+		legacyGeneratedLines[0] + "\n\n### Old rule\n\nDo it.\n\n_Source: PRs #1_\n"
+	if err := os.WriteFile(filepath.Join(legacy, "SKILL.md"), []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("New rule", "do it", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Error("legacy generated skill should have been pruned")
+	}
+}
+
+// A bad domain must fail the run before anything is written or pruned.
+func TestBadDomainWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Old", "do it", "old", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	err := Write(stateWith(
+		approvedRule("Good", "do it", "api", "stated", 1),
+		approvedRule("Bad", "do it", "api/v2", "stated", 2),
+	), dir, Options{})
+	if err == nil {
+		t.Fatal("expected an error for the bad domain")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("no skill should be written when validation fails")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "old")); err != nil {
+		t.Error("nothing should be pruned when validation fails")
 	}
 }
 
