@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -157,7 +159,7 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 			continue
 		}
 		dir := filepath.Join(skillsDir, e.Name())
-		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md")) {
+		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name()) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -167,32 +169,51 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 	return nil
 }
 
-// legacyGeneratedLines are whole lines that only the pre-marker generator
-// ever wrote (the two explanatory sentences at the top of the inline and
-// chunked layouts). They let a skill written before GeneratedMarker existed
-// be recognised and pruned on the first run of the new binary, which is the
-// population pruning was added for. Both are long, exact, and generator-only,
-// so a hand-written skill cannot match by accident.
-var legacyGeneratedLines = []string{
+// generatedBodyLines are the fixed explanatory sentences at the top of the
+// inline and chunked layouts. The generator has written them since before
+// GeneratedMarker existed, so they identify a skill from an older build,
+// which is the population pruning was added to clean up. Both are long and
+// exact, so a hand-written skill cannot match by accident.
+var generatedBodyLines = []string{
 	"Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.",
 	"This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.",
 }
 
-// isGeneratedSkill reports whether the SKILL.md at path was written by this
-// package, judged by an exact-line match on GeneratedMarker or, for files
-// from before the marker existed, on one of legacyGeneratedLines.
-func isGeneratedSkill(path string) bool {
+var reFrontmatterName = regexp.MustCompile(`(?m)^name:\s*(.+?)\s*$`)
+
+// isGeneratedSkill reports whether the SKILL.md at path is one this package
+// wrote for the skill directory dirName. Two conditions must both hold:
+//
+//   - the frontmatter name equals dirName, so a generated skill a user
+//     copied elsewhere and adopted ("api-style/" carrying name "api") is not
+//     mistaken for the generator's own output; and
+//   - the body carries GeneratedMarker or, for a file from a build that
+//     predates the marker, one of generatedBodyLines as a whole line.
+//
+// A generated skill kept under its original directory name and hand-edited
+// is still recognised: that directory is documented as generator-owned and
+// regenerated wholesale, so its edits were never safe.
+func isGeneratedSkill(path, dirName string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	content := string(data)
+	m := reFrontmatterName.FindStringSubmatch(content)
+	if m == nil {
+		return false
+	}
+	name := strings.Trim(m[1], `"'`)
+	if name != dirName {
+		return false
+	}
+	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if line == GeneratedMarker {
 			return true
 		}
-		for _, legacy := range legacyGeneratedLines {
-			if line == legacy {
+		for _, generated := range generatedBodyLines {
+			if line == generated {
 				return true
 			}
 		}
@@ -688,38 +709,15 @@ func validDomain(domain string) bool {
 	return !strings.ContainsAny(domain, `/\`)
 }
 
-// yamlQuote renders s as a YAML double-quoted scalar. Double quotes are the
-// one YAML string form in which every character is safe once backslash and
-// the quote itself are escaped; newlines and tabs are written as escapes so
-// the value stays on its frontmatter line.
+// yamlQuote renders s as a YAML double-quoted scalar. It is strconv.Quote:
+// every escape Go emits (\a \b \f \n \r \t \v \\ \" \xNN \uNNNN \UNNNNNNNN)
+// is also a YAML double-quoted escape, and Go escapes everything that is not
+// printable — the C0/C1 controls a YAML parser rejects raw, and the line
+// separators (U+0085, U+2028, U+2029) a parser would otherwise fold together
+// with adjacent whitespace. Invalid UTF-8 is escaped byte-wise rather than
+// passed through.
 func yamlQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch {
-		case r == '\\':
-			b.WriteString(`\\`)
-		case r == '"':
-			b.WriteString(`\"`)
-		case r == '\n':
-			b.WriteString(`\n`)
-		case r == '\r':
-			b.WriteString(`\r`)
-		case r == '\t':
-			b.WriteString(`\t`)
-		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-			// C0 and C1 controls are not printable per the YAML spec and a
-			// parser rejects them raw even inside quotes (U+0085 is instead a
-			// line break and would be folded to a space); emit hex escapes.
-			b.WriteString(fmt.Sprintf(`\x%02x`, r))
-		case r == 0xfffe || r == 0xffff:
-			b.WriteString(fmt.Sprintf(`\u%04x`, r))
-		default:
-			b.WriteRune(r)
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+	return strconv.Quote(s)
 }
 
 // capitalize upper-cases the first rune of s (not the first byte, which would

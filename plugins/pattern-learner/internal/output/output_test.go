@@ -704,9 +704,11 @@ func TestYAMLQuoteRoundTripsAllRunes(t *testing.T) {
 	for r := rune(0); r <= 0x2ff; r++ {
 		runes = append(runes, r)
 	}
-	runes = append(runes, 0x2028, 0x2029, 0xfffd, 0xfffe, 0xffff, 0x1f600)
+	runes = append(runes, 0x2028, 0x2029, 0xfeff, 0xfffd, 0xfffe, 0xffff, 0x1f600)
 	for _, r := range runes {
-		in := "a" + string(r) + "b"
+		// Spaces on both sides: a rune YAML treats as a line break would
+		// otherwise be folded together with them.
+		in := "a " + string(r) + " b"
 		var back string
 		if err := yaml.Unmarshal([]byte(yamlQuote(in)), &back); err != nil {
 			t.Errorf("U+%04X: %s does not parse: %v", r, yamlQuote(in), err)
@@ -726,8 +728,17 @@ func TestPrunesLegacyGeneratedSkills(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := "---\nname: components\ndescription: Component conventions.\n---\n\n# Components Conventions\n\n## Rules\n\n" +
-		legacyGeneratedLines[0] + "\n\n### Old rule\n\nDo it.\n\n_Source: PRs #1_\n"
+		generatedBodyLines[0] + "\n\n### Old rule\n\nDo it.\n\n_Source: PRs #1_\n"
 	if err := os.WriteFile(filepath.Join(legacy, "SKILL.md"), []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// The same generated content copied to a directory of another name is a
+	// user's adopted skill, not ours: it must survive.
+	adopted := filepath.Join(skills, "components-style")
+	if err := os.MkdirAll(adopted, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(adopted, "SKILL.md"), []byte(old), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := Write(stateWith(approvedRule("New rule", "do it", "ui", "stated", 1)), dir, Options{}); err != nil {
@@ -735,6 +746,36 @@ func TestPrunesLegacyGeneratedSkills(t *testing.T) {
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
 		t.Error("legacy generated skill should have been pruned")
+	}
+	if _, err := os.Stat(filepath.Join(adopted, "SKILL.md")); err != nil {
+		t.Errorf("a copied-and-renamed skill must be preserved: %v", err)
+	}
+}
+
+// A marker-era skill copied under a different directory name is likewise
+// left alone: the frontmatter name no longer matches the directory.
+func TestCopiedMarkerSkillIsNotPruned(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	src := readFile(t, filepath.Join(skills, "api", "SKILL.md"))
+	copyDir := filepath.Join(skills, "api-mine")
+	if err := os.MkdirAll(copyDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(copyDir, "SKILL.md"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(state.Empty(), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("original generated skill should have been pruned")
+	}
+	if _, err := os.Stat(filepath.Join(copyDir, "SKILL.md")); err != nil {
+		t.Errorf("copied skill must be preserved: %v", err)
 	}
 }
 
@@ -784,6 +825,8 @@ func TestYAMLQuote(t *testing.T) {
 		"multi\nline\ttab": `"multi\nline\ttab"`,
 		"ctrl\x01char":     `"ctrl\x01char"`,
 		"em — dash":        `"em — dash"`,
+		"nel\u0085sep":     `"nel\u0085sep"`,
+		"line\u2028sep":    `"line\u2028sep"`,
 	}
 	for in, want := range cases {
 		got := yamlQuote(in)
@@ -812,7 +855,7 @@ func TestWritePrunesStaleGeneratedSkills(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
 		t.Fatalf("first run should have written components: %v", err)
 	}
-	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md")) {
+	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components") {
 		t.Fatal("generated SKILL.md should carry the generated marker")
 	}
 

@@ -37,12 +37,14 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Size/frontmatter thresholds, sourced from Anthropic's Skill-authoring
-// guidance — see the rubric cited in the package doc above.
+// guidance — see the rubric cited in the package doc above. The character
+// limits are counted in runes, matching the generator's own rune-based cap.
 const (
 	BodyLineLimit = 500
 	BodyLineWarn  = 400
@@ -176,8 +178,8 @@ func checkFrontmatter(fields map[string]string) []string {
 	if name == "" {
 		issues = append(issues, "frontmatter missing required 'name'")
 	} else {
-		if len(name) > NameMaxChars {
-			issues = append(issues, fmt.Sprintf("name exceeds %d chars (%d)", NameMaxChars, len(name)))
+		if n := utf8.RuneCountInString(name); n > NameMaxChars {
+			issues = append(issues, fmt.Sprintf("name exceeds %d chars (%d)", NameMaxChars, n))
 		}
 		if !reNameChars.MatchString(name) {
 			issues = append(issues, "name must be lowercase letters, numbers, hyphens only")
@@ -192,8 +194,8 @@ func checkFrontmatter(fields map[string]string) []string {
 
 	if desc == "" {
 		issues = append(issues, "frontmatter missing required 'description'")
-	} else if len(desc) > DescMaxChars {
-		issues = append(issues, fmt.Sprintf("description exceeds %d chars (%d)", DescMaxChars, len(desc)))
+	} else if n := utf8.RuneCountInString(desc); n > DescMaxChars {
+		issues = append(issues, fmt.Sprintf("description exceeds %d chars (%d)", DescMaxChars, n))
 	}
 
 	// paths is optional; when present it gates auto-loading, so an empty

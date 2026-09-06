@@ -83,6 +83,13 @@ func TestAuditFile_frontmatterIssues(t *testing.T) {
 		{"name too long", "name: " + strings.Repeat("a", 65) + "\ndescription: x.", "exceeds 64 chars"},
 		{"description too long", "name: api\ndescription: " + strings.Repeat("a", 1025), "exceeds 1024 chars"},
 	}
+	// Limits are characters, not bytes: 1000 two-byte runes is within budget.
+	t.Run("multibyte description within limit", func(t *testing.T) {
+		path := writeSkill(t, t.TempDir(), "SKILL.md", "name: api\ndescription: "+strings.Repeat("é", 1000), "# API\n\nbody\n")
+		if res := AuditFile(path); len(res.FrontmatterIssues) != 0 {
+			t.Errorf("1000-rune description should pass, got %v", res.FrontmatterIssues)
+		}
+	})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
