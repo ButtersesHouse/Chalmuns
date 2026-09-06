@@ -158,8 +158,20 @@ func spliceBlock(doc, block string) (string, PromoteOutcome, error) {
 // .claude/skills itself) and the whole point for agents that do not.
 func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 	universal := approvedRules(s, UniversalLocation)
+	omitted := 0
 	if len(universal) > maxCLAUDERules {
+		omitted = len(universal) - maxCLAUDERules
 		universal = universal[:maxCLAUDERules]
+	}
+
+	// Paths in the block are written relative to the target file's directory
+	// where possible, so the file reads the same from any checkout location.
+	relRef := func(parts ...string) string {
+		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
+		if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+		return ref
 	}
 
 	byDomain := map[string][]string{}
@@ -192,8 +204,12 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 		b.WriteString("These apply to every file in the repository.")
 		b.WriteString(fmt.Sprintf(" They are also generated as `%s`, which Claude Code auto-loads;"+
 			" they are inlined here for agents that do not read that directory.\n\n",
-			filepath.Join(skillsDir, UniversalSkillName, "SKILL.md")))
+			relRef(UniversalSkillName, "SKILL.md")))
 		renderUniversalRules(&b, universal, "###")
+		if omitted > 0 {
+			b.WriteString(fmt.Sprintf("_%d more universal rule(s) are not inlined here (this block shows the first %d by confidence); read `%s` for the full set._\n\n",
+				omitted, maxCLAUDERules, relRef(UniversalSkillName, "SKILL.md")))
+		}
 	}
 
 	if len(domains) > 0 {
@@ -201,10 +217,7 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 		b.WriteString("Rules scoped to parts of the codebase live in per-domain files (plain markdown).")
 		b.WriteString(" Before editing files matching a domain's globs, read that domain's file and follow its links to the `examples/` or `rules/` companion files for code samples.\n\n")
 		for _, name := range domains {
-			ref := filepath.Join(skillsDir, name, "SKILL.md")
-			if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !strings.HasPrefix(rel, "..") {
-				ref = rel
-			}
+			ref := relRef(name, "SKILL.md")
 			scope := name
 			if globs := dedupeStrings(byDomain[name]); len(globs) > 0 {
 				scope = "`" + strings.Join(globs, "`, `") + "`"

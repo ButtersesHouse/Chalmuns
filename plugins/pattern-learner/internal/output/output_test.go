@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 	"gopkg.in/yaml.v3"
@@ -628,6 +629,79 @@ func TestSkillFrontmatterIsValidYAML(t *testing.T) {
 	}
 }
 
+// A byte-indexed cut of a 200+ char description can land inside a multi-byte
+// character and leave invalid UTF-8 in the frontmatter.
+func TestBuildDescriptionTruncatesOnRunes(t *testing.T) {
+	long := strings.Repeat("é", 250) // 2 bytes each
+	desc := buildDescription("api", nil, long)
+	if !utf8.ValidString(desc) {
+		t.Fatal("truncated description is not valid UTF-8")
+	}
+	if n := utf8.RuneCountInString(desc); n > maxDescriptionRunes {
+		t.Errorf("description is %d runes, want <= %d", n, maxDescriptionRunes)
+	}
+	if !strings.HasSuffix(desc, "...") {
+		t.Error("truncated description should end in an ellipsis")
+	}
+	if short := buildDescription("api", nil, "short"); short != "short" {
+		t.Errorf("short description should be untouched, got %q", short)
+	}
+}
+
+// Domain names are model-supplied; one that is not a single path segment
+// must be refused rather than written outside the skills directory.
+func TestWriteRejectsPathUnsafeDomain(t *testing.T) {
+	for _, bad := range []string{"../escape", "api/v2", "..", "."} {
+		dir := t.TempDir()
+		err := Write(stateWith(approvedRule("r", "do it", bad, "stated", 1)), dir, Options{})
+		if err == nil {
+			t.Errorf("domain %q should be rejected", bad)
+		}
+	}
+}
+
+func TestHeadingTitle(t *testing.T) {
+	cases := map[string]string{
+		"api":        "API",
+		"rest-api":   "REST API",
+		"components": "Components",
+		"db_models":  "DB Models",
+		"auth":       "Auth",
+	}
+	for in, want := range cases {
+		if got := headingTitle(in); got != want {
+			t.Errorf("headingTitle(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The RAG hint is a shell command; a title with a quote must not break it.
+func TestRAGHintEscapesShellMetacharacters(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule(`Use "errors.As" for $checks`, "do it", "api", "stated", 1)
+	if err := Write(stateWith(r), dir, Options{RAGHints: true}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, `'Use \"errors.As\" for \$checks'`) {
+		t.Errorf("hint should escape quotes and dollars; got:\n%s", content)
+	}
+}
+
+func TestPromoteNotesOmittedUniversalRules(t *testing.T) {
+	var rules []state.Rule
+	for i := 0; i < maxCLAUDERules+5; i++ {
+		rules = append(rules, approvedRule(fmt.Sprintf("Universal rule %02d", i), "do it", UniversalLocation, "stated", i+1))
+	}
+	content := promoted(t, stateWith(rules...))
+	if !strings.Contains(content, "5 more universal rule(s) are not inlined here") {
+		t.Errorf("promoted block should say how many universal rules were omitted; got:\n%s", content)
+	}
+	if !strings.Contains(content, "`.claude/skills/conventions/SKILL.md`") {
+		t.Errorf("universal skill path should be relative to the target file; got:\n%s", content)
+	}
+}
+
 func TestYAMLQuote(t *testing.T) {
 	cases := map[string]string{
 		`plain`:            `"plain"`,
@@ -636,6 +710,8 @@ func TestYAMLQuote(t *testing.T) {
 		`say "hi"`:         `"say \"hi\""`,
 		`back\slash`:       `"back\\slash"`,
 		"multi\nline\ttab": `"multi\nline\ttab"`,
+		"ctrl\x01char":     `"ctrl\x01char"`,
+		"em — dash":        `"em — dash"`,
 	}
 	for in, want := range cases {
 		got := yamlQuote(in)

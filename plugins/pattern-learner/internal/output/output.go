@@ -166,6 +166,9 @@ func isGeneratedSkill(path string) bool {
 }
 
 func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, opts Options) error {
+	if !validDomain(domain) {
+		return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
+	}
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -248,7 +251,7 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule) 
 		b.WriteString("# Repo-Wide Conventions\n\n")
 		b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
 	} else {
-		b.WriteString(fmt.Sprintf("# %s Conventions\n\n", capitalize(domain)))
+		b.WriteString(fmt.Sprintf("# %s Conventions\n\n", headingTitle(domain)))
 	}
 
 	if exemplary := exemplaryFiles(rules); len(exemplary) > 0 {
@@ -364,9 +367,12 @@ func writeRAGHint(b *strings.Builder, r state.Rule, opts Options) {
 	if !opts.RAGHints {
 		return
 	}
+	// The hint is a shell command the agent may paste verbatim, so the
+	// title must not break out of its double-quoted argument.
+	title := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "`", "\\`", "$", `\$`).Replace(r.Title)
 	b.WriteString(fmt.Sprintf(
 		"_Live examples: `cursor-agent -p --mode=ask \"Show me 3 real examples of '%s' in this codebase with file paths\"`_\n\n",
-		r.Title,
+		title,
 	))
 }
 
@@ -607,11 +613,7 @@ func buildDescription(domain string, globs []string, override string) string {
 	if override != "" {
 		// The override is model-supplied; a newline would break the YAML
 		// frontmatter line it is rendered into.
-		override = strings.Join(strings.Fields(override), " ")
-		if len(override) > 200 {
-			return override[:197] + "..."
-		}
-		return override
+		return truncate(strings.Join(strings.Fields(override), " "), maxDescriptionRunes)
 	}
 	if domain == UniversalSkillName {
 		return "Repo-wide coding conventions extracted from PR review history. Applies to every file; read before writing or reviewing code anywhere in this repository."
@@ -620,10 +622,34 @@ func buildDescription(domain string, globs []string, override string) string {
 	if len(globs) > 0 {
 		base += fmt.Sprintf(". Use when editing files matching: %s", strings.Join(globs, ", "))
 	}
-	if len(base) > 200 {
-		base = base[:197] + "..."
+	return truncate(base, maxDescriptionRunes)
+}
+
+// maxDescriptionRunes caps the frontmatter description. Counted in runes,
+// not bytes: descriptions routinely carry em dashes and similar multi-byte
+// characters, and a byte-indexed cut can split one and leave invalid UTF-8
+// in the YAML.
+const maxDescriptionRunes = 200
+
+// truncate shortens s to at most max runes, ending in "..." when it cut.
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
 	}
-	return base
+	return strings.TrimRight(string(r[:max-3]), " ") + "..."
+}
+
+// validDomain reports whether a domain name can be used as a single skill
+// directory segment. Domain names are model-supplied; one containing a path
+// separator or "." / ".." would write outside <skillsDir>/<domain>. Charset
+// rules (lowercase, digits, hyphens) are the audit-format subcommand's job
+// and are deliberately not enforced here.
+func validDomain(domain string) bool {
+	if domain == "" || domain == "." || domain == ".." {
+		return false
+	}
+	return !strings.ContainsAny(domain, `/\`)
 }
 
 // yamlQuote renders s as a YAML double-quoted scalar. Double quotes are the
@@ -631,14 +657,30 @@ func buildDescription(domain string, globs []string, override string) string {
 // the quote itself are escaped; newlines and tabs are written as escapes so
 // the value stays on its frontmatter line.
 func yamlQuote(s string) string {
-	r := strings.NewReplacer(
-		`\`, `\\`,
-		`"`, `\"`,
-		"\n", `\n`,
-		"\r", `\r`,
-		"\t", `\t`,
-	)
-	return `"` + r.Replace(s) + `"`
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case r < 0x20 || r == 0x7f:
+			// Other control characters are not allowed raw inside a
+			// double-quoted scalar; emit the YAML hex escape.
+			b.WriteString(fmt.Sprintf(`\x%02x`, r))
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func capitalize(s string) string {
@@ -646,6 +688,33 @@ func capitalize(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// initialisms are domain words rendered upper-case in headings. Anything not
+// listed is simply capitalized; the list only needs to cover the common
+// cases so "Api Conventions" does not read as a typo.
+var initialisms = map[string]bool{
+	"api": true, "db": true, "sql": true, "http": true, "rest": true, "grpc": true,
+	"rpc": true, "ui": true, "ux": true, "cli": true, "css": true, "html": true,
+	"js": true, "ts": true, "orm": true, "dto": true, "jwt": true, "sdk": true,
+	"ci": true, "cd": true, "io": true, "id": true, "sso": true, "oauth": true,
+	"ssr": true, "i18n": true, "l10n": true, "k8s": true, "aws": true, "gcp": true,
+}
+
+// headingTitle turns a domain slug into heading text: hyphens and
+// underscores become spaces, known initialisms are upper-cased
+// ("rest-api" → "REST API"), everything else is capitalized
+// ("components" → "Components").
+func headingTitle(domain string) string {
+	words := strings.FieldsFunc(domain, func(r rune) bool { return r == '-' || r == '_' })
+	for i, w := range words {
+		if initialisms[strings.ToLower(w)] {
+			words[i] = strings.ToUpper(w)
+		} else {
+			words[i] = capitalize(w)
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 func atomicWrite(path, content string) error {

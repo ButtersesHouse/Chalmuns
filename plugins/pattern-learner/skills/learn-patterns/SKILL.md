@@ -590,9 +590,9 @@ parses the block as real YAML (the way Claude Code loads it) and then checks
 the documented field rules, so a file that would fail to load is reported as
 `frontmatter is not valid YAML` rather than passing silently.
 
-If this run touched **zero** domains (e.g. a `--review` or `--add` run whose only approved/written rules targeted `CLAUDE.md`), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
+If this run wrote **zero** skill files (e.g. a `--review` run that approved nothing), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
 
-Otherwise, run it against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
+Otherwise, run it against every skill file this run wrote or touched. That includes `<skills-dir>/conventions/SKILL.md` when any universal (`CLAUDE.md`-sentinel) rule was approved — it is a real skill with frontmatter like every other domain:
 
 ```
 $BIN audit-format <skills-dir>/<domain1>/SKILL.md <skills-dir>/<domain2>/SKILL.md ...
