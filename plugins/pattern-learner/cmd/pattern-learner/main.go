@@ -381,8 +381,16 @@ func anchorExamples(s *state.State, outputDir string) {
 
 // globFiles returns files under root matching glob. Unlike filepath.Glob it
 // supports "**" for any number of directories — the form SKILL.md instructs
-// subagents to emit (e.g. "src/api/**/*.go").
+// subagents to emit (e.g. "src/api/**/*.go") — and brace groups, expanded
+// the same way the skill frontmatter expands them.
 func globFiles(root, glob string) []string {
+	if expanded := output.ExpandBraces(glob); len(expanded) > 1 {
+		var out []string
+		for _, g := range expanded {
+			out = append(out, globFiles(root, g)...)
+		}
+		return out
+	}
 	if !strings.Contains(glob, "**") {
 		matches, _ := filepath.Glob(filepath.Join(root, glob))
 		return matches

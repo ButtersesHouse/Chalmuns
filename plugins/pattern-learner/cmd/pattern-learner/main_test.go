@@ -196,3 +196,25 @@ func TestResolveOwner(t *testing.T) {
 		t.Errorf("fallback: got %q, %v", got, err)
 	}
 }
+
+func TestGlobFiles_braceGroups(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"src/api/h.go": "a\n",
+		"src/web/h.go": "b\n",
+		"src/db/h.go":  "c\n",
+	})
+	got := globFiles(root, "src/{api,web}/**/*.go")
+	want := map[string]bool{
+		filepath.Join(root, "src/api/h.go"): true,
+		filepath.Join(root, "src/web/h.go"): true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("want %d matches, got %d: %v", len(want), len(got), got)
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Errorf("unexpected match: %s", g)
+		}
+	}
+}

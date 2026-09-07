@@ -891,7 +891,7 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 	if got != want {
 		t.Errorf("collectGlobs = %q, want %q", got, want)
 	}
-	if x := expandBraces("src/{a/**/*.go"); len(x) != 1 || x[0] != "src/{a/**/*.go" {
+	if x := ExpandBraces("src/{a/**/*.go"); len(x) != 1 || x[0] != "src/{a/**/*.go" {
 		t.Errorf("unbalanced brace should be left alone, got %v", x)
 	}
 
@@ -1042,6 +1042,65 @@ func TestLegacyUnparseableFrontmatterIsRecognised(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(skills, "old")); !os.IsNotExist(err) {
 		t.Error("stale legacy skill with unparseable frontmatter should have been pruned")
+	}
+}
+
+// In a shared skills directory, a domain another repository generated must
+// not be clobbered; inside the repo's own tree a foreign stamp is a fork or
+// rename and is regenerated (TestForkRegeneratesStampedSkill).
+func TestSharedDirRefusesOtherRepoDomain(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	repoA, repoB := t.TempDir(), t.TempDir()
+	a := stateWith(approvedRule("A rule", "do it", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, repoA, Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	b := stateWith(approvedRule("B rule", "do it", "api", "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
+	err := Write(b, repoB, Options{SkillsDir: shared})
+	if err == nil || !strings.Contains(err.Error(), "was generated for repository") {
+		t.Fatalf("expected a shared-directory refusal, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(shared, "api", "SKILL.md")); !strings.Contains(got, "A rule") {
+		t.Error("alpha's skill should be untouched")
+	}
+	// The same repo regenerating its own skill in the shared dir is fine.
+	if err := Write(a, repoA, Options{SkillsDir: shared}); err != nil {
+		t.Errorf("same owner should regenerate: %v", err)
+	}
+}
+
+func TestIsSharedSkillsDir(t *testing.T) {
+	root := t.TempDir()
+	if isSharedSkillsDir(filepath.Join(root, ".claude", "skills"), root) {
+		t.Error("a skills dir inside the repo is not shared")
+	}
+	if isSharedSkillsDir(root, root) {
+		t.Error("the repo root itself is not shared")
+	}
+	if !isSharedSkillsDir(filepath.Join(t.TempDir(), "skills"), root) {
+		t.Error("a skills dir outside the repo is shared")
+	}
+}
+
+// An interrupted first write leaves an empty directory (or only the tmp
+// file of the SKILL.md write); the next run must treat that as ours.
+func TestEmptyShellDirectoryIsRegenerated(t *testing.T) {
+	for _, leftover := range []string{"", "SKILL.md.tmp"} {
+		dir := t.TempDir()
+		skillDir := filepath.Join(dir, ".claude", "skills", "api")
+		if err := os.MkdirAll(skillDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if leftover != "" {
+			if err := os.WriteFile(filepath.Join(skillDir, leftover), []byte("partial"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+			t.Errorf("leftover %q: expected regeneration, got %v", leftover, err)
+		}
 	}
 }
 

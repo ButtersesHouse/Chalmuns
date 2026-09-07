@@ -70,7 +70,27 @@ func Write(s state.State, outputDir string, opts Options) error {
 	if skillsDir == "" {
 		skillsDir = filepath.Join(outputDir, ".claude", "skills")
 	}
-	return writeSkillFiles(s, skillsDir, opts)
+	return writeSkillFiles(s, skillsDir, isSharedSkillsDir(skillsDir, outputDir), opts)
+}
+
+// isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
+// repository being written for). A skills directory inside the repository
+// belongs to that repository alone, so a generated skill there carrying
+// another repo's stamp can only be the same repository under another
+// identity (a fork, a rename, a different remote). One outside it may be
+// shared by several repositories, where a different stamp means a
+// different repository's skill.
+func isSharedSkillsDir(skillsDir, outputDir string) bool {
+	absSkills, err1 := filepath.Abs(skillsDir)
+	absOut, err2 := filepath.Abs(outputDir)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	rel, err := filepath.Rel(absOut, absSkills)
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // renderUniversalRules writes CLAUDE.md-targeted rules at the given heading level.
@@ -98,7 +118,7 @@ func dedupeStrings(in []string) []string {
 // writeSkillFiles writes per-domain skill files under skillsDir.
 // skillsDir is the root under which per-domain subdirs are created (e.g.
 // ".claude/skills" → ".claude/skills/api/SKILL.md").
-func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
+func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options) error {
 	byDomain := map[string][]state.Rule{}
 	var universal []state.Rule
 	for _, r := range s.Rules {
@@ -150,14 +170,22 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 		// A directory already at this path that this generator did not
 		// write is someone's hand-authored skill (or hand-kept material);
 		// overwriting it and wiping its examples/ and rules/ would destroy
-		// their work. Ownership is judged on the generator's fingerprint
-		// alone: a generated skill is regeneration whichever repo identity
-		// stamped it last (forks and renames change the stamp, not the fact
-		// that we wrote it). A directory with no SKILL.md at all is foreign
-		// too: nothing in it can be ours.
+		// their work. Inside the repository's own tree, ownership is judged
+		// on the generator's fingerprint alone: a generated skill is
+		// regeneration whichever repo identity stamped it last (forks and
+		// renames change the stamp, not the fact that we wrote it). In a
+		// shared skills directory a different stamp is a different
+		// repository's skill, and clobbering it would hand that repo our
+		// conventions. A directory with no SKILL.md is foreign too, unless
+		// it is the empty shell an interrupted first write leaves behind.
 		skillDir := filepath.Join(skillsDir, domain)
-		if _, err := os.Stat(skillDir); err == nil && !isGeneratedSkill(filepath.Join(skillDir, "SKILL.md"), domain, "", true) {
+		if _, err := os.Stat(skillDir); err == nil && !isGeneratedSkill(filepath.Join(skillDir, "SKILL.md"), domain, "", true) && !isEmptyShell(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
+		}
+		if shared && owner != "" {
+			if stamped, ok := stampedOwner(filepath.Join(skillDir, "SKILL.md")); ok && stamped != "" && stamped != owner {
+				return fmt.Errorf("%s was generated for repository %q and this run is for %q; the shared skills directory cannot hold both under one domain name — rename the domain in one of them or use separate skills directories", skillDir, stamped, owner)
+			}
 		}
 	}
 
@@ -216,6 +244,38 @@ func parseOwnerLine(line string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(line, ownerStampPrefix), ownerStampSuffix), true
+}
+
+// stampedOwner returns the owner stamped into the SKILL.md at path, and
+// whether the file carries a stamp.
+func stampedOwner(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if owner, ok := parseOwnerLine(strings.TrimSpace(line)); ok {
+			return owner, true
+		}
+	}
+	return "", false
+}
+
+// isEmptyShell reports whether dir holds nothing but what an interrupted
+// first write of ours could leave: no entries, or only the SKILL.md.tmp of
+// an atomicWrite that never reached its rename. (SKILL.md is written before
+// the companion files, so a run that got any further left the marker.)
+func isEmptyShell(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.Name() != "SKILL.md.tmp" {
+			return false
+		}
+	}
+	return true
 }
 
 // pruneStaleSkills removes generated skill directories under skillsDir whose
@@ -375,12 +435,17 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// SKILL.md body is a recurring token cost once loaded, so it carries only
 	// the imperative rules plus pointers the consuming agent follows at its
 	// discretion when it wants the do/don't code.
+	//
+	// SKILL.md is written before its companion files so that a run
+	// interrupted part-way always leaves the generated marker behind; a
+	// directory of companions with no SKILL.md would otherwise look foreign
+	// to the next run's overwrite guard.
 	inline := header + renderInlineRules(rules, slugs, watermark, opts)
 	if lineCount(inline) <= maxSkillLines {
-		if err := writeExampleFiles(skillDir, rules, slugs); err != nil {
+		if err := atomicWrite(filepath.Join(skillDir, "SKILL.md"), inline); err != nil {
 			return err
 		}
-		return atomicWrite(filepath.Join(skillDir, "SKILL.md"), inline)
+		return writeExampleFiles(skillDir, rules, slugs)
 	}
 
 	// Very large skill: chunk per the Claude Code guidance ("Keep SKILL.md
@@ -388,10 +453,10 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// SKILL.md becomes a rule index; each rule lives in rules/<slug>.md with
 	// its examples inline (the chunk itself is loaded on demand), and the
 	// chunk corpus doubles as a grep target for full-text lookup.
-	if err := writeRuleChunks(skillDir, rules, slugs, watermark, opts); err != nil {
+	if err := atomicWrite(filepath.Join(skillDir, "SKILL.md"), header+renderRuleIndex(rules, slugs)); err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(skillDir, "SKILL.md"), header+renderRuleIndex(rules, slugs))
+	return writeRuleChunks(skillDir, rules, slugs, watermark, opts)
 }
 
 // maxSkillLines is the chunking threshold for a generated domain SKILL.md,
@@ -785,7 +850,7 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 	var all []string
 	for _, r := range rules {
 		for _, g := range r.Target.FileGlob {
-			for _, expanded := range expandBraces(g) {
+			for _, expanded := range ExpandBraces(g) {
 				if strings.Contains(expanded, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
 				}
@@ -796,10 +861,12 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 	return dedupeStrings(all), nil
 }
 
-// expandBraces expands the first {a,b,...} group in glob, recursing so
+// ExpandBraces expands the first {a,b,...} group in glob, recursing so
 // nested and successive groups expand fully. A glob with no group, or with
-// an unbalanced brace, is returned unchanged.
-func expandBraces(glob string) []string {
+// an unbalanced brace, is returned unchanged. It is the one brace expander
+// for rule file globs: the frontmatter paths gate and the example anchoring
+// in the CLI both go through it, so a glob means the same thing in both.
+func ExpandBraces(glob string) []string {
 	open := strings.Index(glob, "{")
 	if open < 0 {
 		return []string{glob}
@@ -814,7 +881,7 @@ func expandBraces(glob string) []string {
 			if depth == 0 {
 				var out []string
 				for _, alt := range splitTopLevel(glob[open+1 : i]) {
-					out = append(out, expandBraces(glob[:open]+alt+glob[i+1:])...)
+					out = append(out, ExpandBraces(glob[:open]+alt+glob[i+1:])...)
 				}
 				return out
 			}
