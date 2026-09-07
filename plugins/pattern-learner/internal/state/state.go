@@ -122,6 +122,11 @@ type Rule struct {
 type ReviewedSnapshot struct {
 	SignalCount     int   `json:"signal_count"`
 	SourcePRNumbers []int `json:"source_pr_numbers"`
+	// SourceReviewIDs records the captured reviews behind the rule. Review
+	// signals all report pr_number 0, so without this a rule rebuilt from
+	// entirely different reviews looks unchanged and is suppressed from the
+	// approval loop — hiding new corroboration rather than surfacing it.
+	SourceReviewIDs []string `json:"source_review_ids,omitempty"`
 }
 
 type Example struct {

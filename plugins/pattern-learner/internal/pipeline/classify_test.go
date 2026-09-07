@@ -302,3 +302,25 @@ func TestClassify_mixedSourcesJudgedOnPRSources(t *testing.T) {
 		t.Error("a candidate with a recent PR source should be kept")
 	}
 }
+
+// Step 8C merges a review signal into an existing PR rule. Judging that merged
+// rule on its one old PR number dropped it outright, despite several reviews
+// having flagged it since — the freshest evidence there is.
+func TestClassify_reviewEvidenceKeepsAnOldPRRuleAlive(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"title": "merged rule",
+		"sources": []src{
+			{PRNumber: 10, Strength: "implicit"},
+			{ReviewID: "rev-00000000000a", Strength: "implicit"},
+			{ReviewID: "rev-00000000000b", Strength: "implicit"},
+		},
+	})
+	if got := classifyOne(t, raw, 100, 0); got == nil {
+		t.Error("a rule two reviews have flagged since is not stale")
+	}
+}

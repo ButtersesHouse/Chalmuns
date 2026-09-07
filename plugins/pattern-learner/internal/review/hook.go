@@ -1,6 +1,7 @@
 package review
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"time"
@@ -67,14 +68,14 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		skill = reporter
 	}
 
+	// A reporting tool's payload is review output but names no skill of its
+	// own, so it is attributed through reportingTools above and nowhere else.
+	// Falling back to "some designated skill watcher" instead filed
+	// /code-review's findings under whatever else happened to be watched — a
+	// semgrep designation, say — so the artifact claimed a tool that never ran
+	// and the rules it produced cited it. A missed capture is recoverable; a
+	// review attributed to the wrong reviewer corrupts provenance silently.
 	matched := Match(watchers, toolName, skill, command)
-	if matched == nil && isReporting {
-		// A reporting tool's payload *is* review output, but it need not name
-		// the skill that produced it. When the user watches a review skill
-		// under some other name, attribute it to that designation rather than
-		// discarding a review they asked to be kept eyes on.
-		matched = firstSkillWatcher(watchers)
-	}
 	if matched == nil {
 		return Artifact{}, state.Watcher{}, false
 	}
@@ -122,28 +123,35 @@ func invocation(doc map[string]interface{}) (skill, command string) {
 	return skill, command
 }
 
-// firstSkillWatcher returns the first designation that can own a skill's
-// output, or nil when only command-line tools are watched.
-func firstSkillWatcher(ws []state.Watcher) *state.Watcher {
-	for i := range ws {
-		if ws[i].Kind != KindTool {
-			return &ws[i]
-		}
-	}
-	return nil
-}
-
 // PayloadCWD reads the working directory a hook payload reports, so a capture
 // can find the project when CLAUDE_PROJECT_DIR is not exported — the same
-// fallback internal/guard applies, for the same reason.
+// fallback internal/guard applies, for the same reason. It decodes only that
+// one field: the hook runs after every matching tool call, and a full decode
+// of a payload the caller may never use again is work multiplied by tool-call
+// frequency.
 func PayloadCWD(payload []byte) string {
-	var doc struct {
-		CWD string `json:"cwd"`
-	}
-	if err := json.Unmarshal(payload, &doc); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if _, err := dec.Token(); err != nil { // opening brace
 		return ""
 	}
-	return doc.CWD
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return ""
+		}
+		if name, ok := key.(string); ok && name == "cwd" {
+			var cwd string
+			if json.Unmarshal(v, &cwd) == nil {
+				return cwd
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 // hookLabel records what produced the artifact, for the approval display.

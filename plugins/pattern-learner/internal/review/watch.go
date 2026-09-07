@@ -235,21 +235,36 @@ func matchesCommand(name, command string) bool {
 // review. That breaks the invariant this whole path exists to hold: nothing is
 // captured from a tool that was not designated.
 func sanitizeCommand(command string) string {
+	// Heredoc bodies go first, on the raw text: the delimiter is itself
+	// usually quoted (`<<'EOF'`), so blanking quotes first would erase the
+	// very word the terminator has to be matched against.
+	command = stripHeredocBodies(command)
+
 	var b strings.Builder
 	b.Grow(len(command))
 	var quote rune
+	escaped := false
 	for _, r := range command {
 		switch {
+		case escaped:
+			// The character after a backslash is literal, whatever it is. A
+			// `\"` inside a double-quoted string does not end the string, and
+			// treating it as if it did re-exposed the rest of the argument as
+			// command positions: `git commit -m "fix \"; semgrep noise\""`
+			// then counted as a run of semgrep.
+			escaped = false
+			b.WriteRune(quoteMask(r, quote))
+		case r == '\\' && quote != '\'':
+			// Single quotes take no escapes; everywhere else a backslash
+			// quotes the next character.
+			escaped = true
+			b.WriteRune(quoteMask(r, quote))
 		case quote != 0:
 			// Inside quotes: keep the length, drop the meaning.
 			if r == quote {
 				quote = 0
 			}
-			if r == '\n' {
-				b.WriteRune('\n') // a newline still ends the line for the heredoc cut
-			} else {
-				b.WriteRune(' ')
-			}
+			b.WriteRune(quoteMask(r, quote))
 		case r == '\'' || r == '"':
 			quote = r
 			b.WriteRune(' ')
@@ -257,15 +272,54 @@ func sanitizeCommand(command string) string {
 			b.WriteRune(r)
 		}
 	}
-	out := b.String()
-	// A heredoc's body is input to the command, not further commands. It
-	// starts on the next line, so keep only the line the operator appears on.
-	if i := strings.Index(out, "<<"); i >= 0 {
-		if nl := strings.Index(out[i:], "\n"); nl >= 0 {
-			out = out[:i+nl]
+	return b.String()
+}
+
+// quoteMask blanks a character that is inside quotes, keeping newlines so line
+// structure survives for the heredoc scan.
+func quoteMask(r rune, quote rune) rune {
+	if r == '\n' {
+		return '\n'
+	}
+	return ' '
+}
+
+// stripHeredocBodies removes the body of each here-document, which is input to
+// a command rather than more commands, and keeps everything after it.
+//
+// Truncating at the first heredoc instead threw away the rest of the script,
+// so a designated tool run after one — `cat <<EOF > rules.yaml … EOF` then
+// `semgrep --config rules.yaml .` — was never captured, silently.
+func stripHeredocBodies(s string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		out = append(out, line)
+		delim := heredocDelimiter(line)
+		if delim == "" {
+			continue
+		}
+		// Skip to the terminator line, then carry on scanning after it.
+		for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != delim {
+			i++
+		}
+		if i+1 < len(lines) {
+			i++ // consume the terminator itself
 		}
 	}
-	return out
+	return strings.Join(out, "\n")
+}
+
+// reHeredoc matches a here-document operator and its delimiter word, quoted
+// or not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator.
+var reHeredoc = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+func heredocDelimiter(line string) string {
+	if m := reHeredoc.FindStringSubmatch(line); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // commandBase reduces an invocation token to the program's name: quotes off,
@@ -301,7 +355,11 @@ func Status(ws []state.Watcher, artifacts []Artifact) []WatcherStatus {
 				continue
 			}
 			st.Captures++
-			if a.CapturedAt > st.LastCapturedAt {
+			// Compared as times, not strings: RFC3339Nano drops trailing
+			// zeros, so a whole-second stamp is the shorter string and would
+			// always beat a later sub-second one in the same second, reporting
+			// a stale "last captured".
+			if st.LastCapturedAt == "" || capturedTime(a.CapturedAt).After(capturedTime(st.LastCapturedAt)) {
 				st.LastCapturedAt = a.CapturedAt
 			}
 		}

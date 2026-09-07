@@ -20,8 +20,9 @@ type triageRule struct {
 
 // triageSnapshot mirrors state.ReviewedSnapshot without importing the state package.
 type triageSnapshot struct {
-	SignalCount     int   `json:"signal_count"`
-	SourcePRNumbers []int `json:"source_pr_numbers"`
+	SignalCount     int      `json:"signal_count"`
+	SourcePRNumbers []int    `json:"source_pr_numbers"`
+	SourceReviewIDs []string `json:"source_review_ids,omitempty"`
 }
 
 // TriageFilterResult is the output of review-filter mode.
@@ -85,7 +86,8 @@ func RunTriage(args []string) error {
 // Defer conditions (evaluated in order; first match wins):
 //  1. supersedes is non-empty
 //  2. conflicted == true
-//  3. signal_count == 1 AND every source is a code review (unless autoThreshold)
+//  3. every source is a code review AND they cite at most one distinct review
+//     (unless autoThreshold)
 //  4. signal_count == 1 AND all sources implicit (unless autoThreshold)
 func TriageAuto(rawRules []json.RawMessage, autoThreshold bool) ([]json.RawMessage, error) {
 	out := make([]json.RawMessage, 0, len(rawRules))
@@ -120,8 +122,9 @@ func TriageAuto(rawRules []json.RawMessage, autoThreshold bool) ([]json.RawMessa
 
 // TriageReviewFilter suppresses "unchanged emerging" rules from the review
 // loop. A rule is unchanged when its confidence is "emerging", it has a
-// reviewed_snapshot, and both signal_count and sorted source PR numbers
-// exactly match the snapshot. Pass showAll=true to bypass suppression.
+// reviewed_snapshot, and its signal_count, sorted source PR numbers and sorted
+// source review ids all match the snapshot. Pass showAll=true to bypass
+// suppression.
 func TriageReviewFilter(rawRules []json.RawMessage, showAll bool) (TriageFilterResult, error) {
 	var result TriageFilterResult
 	for _, raw := range rawRules {
@@ -154,12 +157,15 @@ func autoDecision(rule triageRule, autoThreshold bool) (string, string) {
 	}
 	if !autoThreshold {
 		allImplicit, allReview := true, len(rule.Sources) > 0
+		reviews := map[string]bool{}
 		for _, src := range rule.Sources {
 			if src.Strength == "explicit" {
 				allImplicit = false
 			}
 			if src.ReviewID == "" {
 				allReview = false
+			} else {
+				reviews[src.ReviewID] = true
 			}
 		}
 		// A convention seen in exactly one code review is deferred whatever
@@ -170,7 +176,11 @@ func autoDecision(rule triageRule, autoThreshold bool) (string, string) {
 		// tripped, with nobody having read any of them. What makes a review
 		// finding a convention rather than a one-off defect is that it recurs,
 		// and one review cannot show recurrence.
-		if rule.SignalCount == 1 && allReview {
+		// Distinct reviews, not signals: one run of a linter tripping the same
+		// check in five files yields five sources and one review, and counting
+		// signals would wave that through as "established" with nobody having
+		// read it. Recurrence means several reviews agreeing.
+		if allReview && len(reviews) <= 1 {
 			return "defer", "single-review"
 		}
 		if rule.SignalCount == 1 && allImplicit {
@@ -193,8 +203,12 @@ func unchangedEmerging(rule triageRule) bool {
 	}
 
 	current := make([]int, len(rule.Sources))
+	var currentReviews []string
 	for i, s := range rule.Sources {
 		current[i] = s.PRNumber
+		if s.ReviewID != "" {
+			currentReviews = append(currentReviews, s.ReviewID)
+		}
 	}
 	sort.Ints(current)
 
@@ -207,6 +221,22 @@ func unchangedEmerging(rule triageRule) bool {
 	}
 	for i := range current {
 		if current[i] != snapPRs[i] {
+			return false
+		}
+	}
+
+	// A review signal reports pr_number 0, so a rule rebuilt from entirely
+	// different reviews has an identical PR list — [0, 0] either way — and
+	// would be suppressed as "nothing new", hiding fresh corroboration from
+	// the very reviewer the user asked to be watched. Compare the reviews too.
+	sort.Strings(currentReviews)
+	snapReviews := append([]string(nil), snap.SourceReviewIDs...)
+	sort.Strings(snapReviews)
+	if len(currentReviews) != len(snapReviews) {
+		return false
+	}
+	for i := range currentReviews {
+		if currentReviews[i] != snapReviews[i] {
 			return false
 		}
 	}

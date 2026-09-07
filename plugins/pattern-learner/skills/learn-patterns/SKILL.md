@@ -267,6 +267,16 @@ Run semantic dedup in domain-sharded reasoning passes over the verified signals 
 
 **A. Intra-batch dedup**: Find signals across the batch that express semantically equivalent conventions (same intent, even if worded differently). Merge them into one candidate with a combined `sources` list. If any of the merged signals has `strength: "explicit"`, the merged candidate is explicit. Also merge their `do_examples` and `dont_examples` arrays: deduplicate by code content (exact string match after trimming whitespace), then cap each array at 4 entries. The result is a richer set of real examples accumulated across multiple PRs that all express the same convention.
 
+**Preserve `review_id` in every intermediate representation too**, by exactly
+the same rule and for the same reason. A signal mined in Review Mode carries
+`raw_signal.review_id`, and it must be copied onto the `sources` entry you
+build from it. Two binary behaviours read it and both fail silently without it:
+`triage` holds back a convention seen in only one review by counting distinct
+`review_id`s, so dropping the field lets `--learn-reviews --auto` approve
+single-review rules unread; and `write-outputs` decides a rule's provenance
+line from it, so a merged PR+review rule renders as PRs alone and a pure review
+rule as "—". Neither reports an error.
+
 **Preserve `strength` in every intermediate representation**: when candidates are stored to disk or passed between steps, carry `sources[].strength` through verbatim. Do NOT compute strength from raw count alone or reconstruct it later. Losing `strength` in intermediate storage causes Step 9 to mis-assign confidence — all rules will appear implicit and zero `stated` rules will be emitted. When batches are aggregated across multiple runs, re-merge their `sources` lists preserving each entry's `strength` before applying 8C/8D.
 
 **At scale (300+ signals from multiple batch runs)**: Step 8A is intra-batch only. After all batches complete, collect post-8A candidates and run a second cross-domain dedup pass before Step 8C. For very large signal sets, shard by `suggested_target.location` and run one subagent per domain shard — a narrower scope prevents context overload and produces sharper dedup. Combine each shard's output, then run Steps 8C–D on the unified candidate list.

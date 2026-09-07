@@ -163,7 +163,18 @@ func Capture(in Input) (Artifact, error) {
 
 	findings, err := parse(format, in.Data)
 	if err != nil {
-		return Artifact{}, err
+		// A sniffed format is a guess, so a parse failure means the guess was
+		// wrong, not that the review is unusable — Detect's own contract is to
+		// degrade to "the subagent reads the review" rather than to an error.
+		// A BOM, or one mistyped field inside one finding, would otherwise lose
+		// the whole review: silently under the hook, loudly via --file.
+		if !sniffed {
+			return Artifact{}, err
+		}
+		format = FormatMarkdown
+		if findings, err = parse(format, in.Data); err != nil {
+			return Artifact{}, err
+		}
 	}
 	// A parse that yields findings carrying none of the reviewer's words means
 	// the shape was guessed wrong — another tool's report that happens to use

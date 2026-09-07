@@ -299,21 +299,24 @@ func TestFromHook_reportFindingsIsTheReview(t *testing.T) {
 	}
 }
 
-// A watcher designated under another name still owns a reporting tool's
-// output — the payload names no skill, and discarding it would silently drop a
-// review the user asked to be watched.
-func TestFromHook_reportFindingsFallsBackToTheSkillWatcher(t *testing.T) {
-	ws := watchers(t, "security-review:skill")
+// A reporting tool's payload names no skill of its own, so it is attributed
+// through reportingTools and nowhere else. Falling back to "whatever skill
+// happens to be watched" filed /code-review's findings under an unrelated
+// designation — the artifact then claimed a tool that never ran, and the rules
+// mined from it cited that tool. A missed capture is recoverable; a review
+// attributed to the wrong reviewer corrupts provenance silently.
+func TestFromHook_reportFindingsIsNotMisattributed(t *testing.T) {
 	payload := `{"tool_name":"ReportFindings","tool_input":{"findings":[{"file":"a.go","summary":"Never log tokens."}]}}`
-	_, w, ok := FromHook([]byte(payload), ws, fixed)
-	if !ok || w.ID != "security-review" {
-		t.Errorf("ok=%v watcher=%q", ok, w.ID)
+
+	for _, spec := range []string{"semgrep:any", "semgrep:tool", "security-review:skill", "security-review:any"} {
+		if _, w, ok := FromHook([]byte(payload), watchers(t, spec), fixed); ok {
+			t.Errorf("watcher %q must not absorb /code-review's findings (got %q)", spec, w.Name)
+		}
 	}
 
-	// With only command-line tools designated there is no skill to attribute
-	// it to, so nothing is captured.
-	if _, _, ok := FromHook([]byte(payload), watchers(t, "semgrep:tool"), fixed); ok {
-		t.Error("a tool-only designation must not absorb a skill's findings")
+	// The designation the mapping names does own it.
+	if _, w, ok := FromHook([]byte(payload), watchers(t, "code-review:any"), fixed); !ok || w.ID != "code-review" {
+		t.Errorf("ok=%v watcher=%q", ok, w.ID)
 	}
 }
 
@@ -419,5 +422,46 @@ func TestSkillFromCommand(t *testing.T) {
 		if got := SkillFromCommand(cmd); got != want {
 			t.Errorf("SkillFromCommand(%q) = %q, want %q", cmd, got, want)
 		}
+	}
+}
+
+// Quoting and here-documents are data, not commands. Each of these once
+// produced a false capture or a false miss.
+func TestMatch_quotingAndHeredocs(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	cases := []struct {
+		name, command string
+		want          bool
+	}{
+		{"escaped quote inside a quoted arg", `git commit -m "fix \"; semgrep noise\" here"`, false},
+		{"single-quoted arg", `git commit -m 'fix; semgrep noise'`, false},
+		{"heredoc body", "git commit -F- <<'EOF'\nsemgrep runs on every PR\nEOF", false},
+		{"unquoted heredoc body", "cat <<EOF\nsemgrep\nEOF", false},
+		{"indented heredoc body", "cat <<-\"END\"\nsemgrep\nEND\necho done", false},
+		// A command *after* a heredoc is still a command: truncating there
+		// meant a designated tool run later in the script was never captured.
+		{"run after a heredoc", "cat <<EOF > rules.yaml\nrules: []\nEOF\nsemgrep --config rules.yaml .", true},
+		{"escaped quote then a real run", `echo "a \" " && semgrep .`, true},
+		{"plain run", "semgrep --json .", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Match(ws, "Bash", "", tc.command) != nil; got != tc.want {
+				t.Errorf("want %v got %v\n  command:   %q\n  sanitized: %q", tc.want, got, tc.command, sanitizeCommand(tc.command))
+			}
+		})
+	}
+}
+
+// RFC3339Nano drops trailing zeros, so a whole-second stamp is the shorter
+// string and would beat a later sub-second one in a raw string compare.
+func TestStatus_lastCapturedComparesTimes(t *testing.T) {
+	ws := watchers(t, "code-review:any")
+	got := Status(ws, []Artifact{
+		{ReviewID: "rev-a", Source: "code-review", CapturedAt: "2026-01-15T12:00:05.5Z"},
+		{ReviewID: "rev-b", Source: "code-review", CapturedAt: "2026-01-15T12:00:05Z"},
+	})
+	if got[0].LastCapturedAt != "2026-01-15T12:00:05.5Z" {
+		t.Errorf("last captured should be the later time; got %q", got[0].LastCapturedAt)
 	}
 }

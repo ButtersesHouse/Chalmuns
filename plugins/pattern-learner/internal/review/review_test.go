@@ -604,3 +604,64 @@ func TestCapture_findingOrderDoesNotChangeTheReviewID(t *testing.T) {
 		t.Error("different findings must be a different review")
 	}
 }
+
+// A sniffed format is a guess, so a parse failure means the guess was wrong,
+// not that the review is unusable. A BOM or one mistyped field would otherwise
+// lose the whole review — silently under the hook.
+func TestCapture_sniffedParseFailureFallsBackToProse(t *testing.T) {
+	cases := map[string]string{
+		"BOM before the array":  "\xef\xbb\xbf" + `[{"file":"a.go","summary":"Use the shared logger everywhere."}]`,
+		"wrong type in a field": `{"findings":[{"file":"a.go","line":"42","summary":"Use the shared logger."}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			a, err := Capture(Input{Data: []byte(body), Source: "code-review", Format: FormatAuto, Now: fixed})
+			if err != nil {
+				t.Fatalf("a sniffed guess that fails to parse should degrade, not error: %v", err)
+			}
+			if !strings.Contains(Lean([]Artifact{a})[0].Text, "shared logger") {
+				t.Error("the reviewer's words must still reach the extraction step")
+			}
+		})
+	}
+	// An explicit format is the caller asserting a shape, so it still errors.
+	bad := `{"findings":[{"file":"a.go","line":"42","summary":"x"}]}`
+	if _, err := Capture(Input{Data: []byte(bad), Source: "x", Format: FormatFindings, Now: fixed}); err == nil {
+		t.Error("an explicitly-requested format should report the parse failure")
+	}
+}
+
+// A null or absent findings list is a clean review, not a malformed one.
+func TestCapture_nullFindingsIsACleanReview(t *testing.T) {
+	a, err := Capture(Input{Data: []byte(`{"findings":null}`), Source: "code-review", Format: FormatFindings, Now: fixed})
+	if err != nil {
+		t.Fatalf("a null findings list should parse as empty: %v", err)
+	}
+	if len(a.Findings) != 0 {
+		t.Errorf("want no findings, got %d", len(a.Findings))
+	}
+}
+
+// Reviewers normally write a path in a code span; capturing the delimiter into
+// the path names a file that does not exist.
+func TestCapture_markdownFileRefInCodeSpan(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## A finding\n\nFlagged at `internal/api/handler.go:42` in the handler chain.\n")
+	f := a.Findings[0]
+	if f.File != "internal/api/handler.go" || f.Line != 42 {
+		t.Errorf("file ref: got %q:%d", f.File, f.Line)
+	}
+}
+
+// A block dropped as nested still has to advance the cursor: its code would
+// otherwise sit in the next fence's lead, and a cue word inside it would label
+// that fence — teaching the reverse of the convention.
+func TestCapture_droppedFenceDoesNotLabelTheNextOne(t *testing.T) {
+	body := "## A finding\n\nCurrently:\n\n```go\nfoo()\n\n```go\nbar()\n```\n\n```go\nbaz()\n```\n"
+	a := capture(t, "code-review", FormatMarkdown, body)
+	for _, f := range a.Findings {
+		if strings.Contains(f.CodeBefore, "Currently") || strings.Contains(f.CodeAfter, "Currently") {
+			t.Errorf("prose stored as code: before=%q after=%q", f.CodeBefore, f.CodeAfter)
+		}
+	}
+}

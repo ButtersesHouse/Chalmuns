@@ -17,9 +17,9 @@
    ```
    cat proposed.json | $BIN triage --mode auto [--auto-threshold]
    ```
-   The tool applies the ordered predicate and returns the same rules with `status` patched to `"approved"` or left as `"proposed"` (deferred). Defer conditions (first match wins): `supersedes` non-empty → defer; `conflicted: true` → defer; `signal_count == 1` AND every source carries a `review_id` → defer; `signal_count == 1` AND all sources implicit → defer. The last two are skipped under `--auto-threshold`. Otherwise → approve.
+   The tool applies the ordered predicate and returns the same rules with `status` patched to `"approved"` or left as `"proposed"` (deferred). Defer conditions (first match wins): `supersedes` non-empty → defer; `conflicted: true` → defer; every source carries a `review_id` AND they cite at most one distinct review → defer; `signal_count == 1` AND all sources implicit → defer. The last two are skipped under `--auto-threshold`. Otherwise → approve.
 
-   The single-review condition is why one run of a linter cannot write standing rules unattended: a finding states a rule id every time, so strength alone would mark all of them explicit. A review finding earns a rule by **recurring**, and one review cannot show that.
+   The single-review condition is why one run of a linter cannot write standing rules unattended: a finding states a rule id every time, so strength alone would mark all of them explicit. It counts **distinct reviews, not signals** — one run tripping the same check in five files is five sources and still one review. A review finding earns a rule by recurring, and one review cannot show that.
 3. Replace the proposed rules in the state with the triage output.
 
 Skip the confirmation prompt. Proceed automatically to Step 11. Print a single summary line:
@@ -45,7 +45,7 @@ Group by target: `CLAUDE.md` rules first, then alphabetically by domain.
 cat proposed.json | $BIN triage --mode review-filter [--all]
 ```
 
-The tool compares each emerging rule's current `signal_count` and sorted source PR numbers against its `reviewed_snapshot` (set by a previous `s` action). Rules where both match are "unchanged" and suppressed — the user already saw them and nothing new has arrived. Pass `--all` when `IS_SHOW_ALL` is true.
+The tool compares each emerging rule's current `signal_count`, sorted source PR numbers and sorted source review ids against its `reviewed_snapshot` (set by a previous `s` action). Rules where all three match are "unchanged" and suppressed — the user already saw them and nothing new has arrived. Pass `--all` when `IS_SHOW_ALL` is true.
 
 Output: `{"show": [...rules to display...], "suppressed": N, "suppressed_ids": [...]}`.
 
@@ -120,7 +120,7 @@ Wait for user input per rule:
 - `a` → set `status: "approved"`; clear `reviewed_snapshot`. If the rule has non-empty `supersedes`, also set the superseded rule's `status: "superseded"` and `superseded_by: "<this_rule_id>"` (the binary will fill `<this_rule_id>` at write time if not yet assigned — pass the rule's index for now).
 - `r` → set `status: "rejected"`; clear `reviewed_snapshot`; this rule will move to `rejected_signals` in state
 - `e` → prompt user to edit title, rule text, or examples inline; re-display updated rule for confirmation
-- `s` → leave as `status: "proposed"` and save a review snapshot: `reviewed_snapshot = {signal_count: <current signal_count>, source_pr_numbers: <sorted list of PR numbers from sources>}`. On the next run the rule will be suppressed unless new signals arrive (i.e. signal_count increases or new PR numbers are added to sources).
+- `s` → leave as `status: "proposed"` and save a review snapshot: `reviewed_snapshot = {signal_count: <current signal_count>, source_pr_numbers: <sorted list of PR numbers from sources>, source_review_ids: <sorted list of review_ids from sources, omitted when there are none>}`. On the next run the rule will be suppressed unless new signals arrive (signal_count increases, new PR numbers appear, or the rule is now backed by different reviews). Recording `source_review_ids` is what makes that last case work: every review signal reports `pr_number: 0`, so a rule rebuilt from two entirely different reviews has the same PR list as before and would be suppressed as unchanged — hiding exactly the new corroboration the user asked to be watched for.
 
 After all rules are reviewed, display a summary of decisions:
 ```

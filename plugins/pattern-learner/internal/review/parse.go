@@ -1,6 +1,7 @@
 package review
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -28,13 +29,20 @@ type rcFinding struct {
 }
 
 func parseFindings(data []byte) ([]Finding, error) {
-	var list []rcFinding
 	// Both shapes are real: the tool call carries {"findings": [...]}, while a
-	// saved report is often just the array.
-	var wrapper struct {
-		Findings []rcFinding `json:"findings"`
-	}
-	if err := json.Unmarshal(data, &wrapper); err == nil && wrapper.Findings != nil {
+	// saved report is often just the array. Which one this is decides which
+	// error to report — falling through to the array attempt for an object
+	// input blamed the container shape for what was actually a bad field
+	// inside one finding, pointing the reader at the wrong thing entirely.
+	var list []rcFinding
+	if bytes.HasPrefix(bytes.TrimLeft(data, " \t\r\n\ufeff"), []byte("{")) {
+		var wrapper struct {
+			Findings []rcFinding `json:"findings"`
+		}
+		if err := json.Unmarshal(data, &wrapper); err != nil {
+			return nil, fmt.Errorf("parse findings JSON: %w", err)
+		}
+		// A null or absent list is a clean review, not a malformed one.
 		list = wrapper.Findings
 	} else if err := json.Unmarshal(data, &list); err != nil {
 		return nil, fmt.Errorf("parse findings JSON: %w", err)
@@ -273,8 +281,11 @@ var (
 	// location. The character class excludes only separators and punctuation
 	// that cannot appear in a path — an ASCII-only class silently truncated
 	// any path containing a non-ASCII byte ("café/naïve.go:12" matched as
-	// "ve.go"), attributing the finding to a file that does not exist.
-	reMDFileRef = regexp.MustCompile(`([^\s:;,()\[\]{}'"<>|*?]+\.[A-Za-z0-9]+):L?(\d+)`)
+	// "ve.go"), attributing the finding to a file that does not exist. The
+	// backtick and "#" are excluded for the same reason from the other side:
+	// reviewers normally write a path in a code span, and capturing the
+	// delimiter into the path names a file just as absent.
+	reMDFileRef = regexp.MustCompile("([^\\s:;,()\\[\\]{}'\"<>|*?`#]+\\.[A-Za-z0-9]+):L?(\\d+)")
 	// Words that label the fence that follows them. Kept narrow on purpose:
 	// guessing wrong swaps a rule's do and don't examples, which teaches the
 	// exact opposite of the convention. "instead" is deliberately absent from
@@ -285,10 +296,15 @@ var (
 )
 
 // fenceBlock is one closed fenced code block and where it sits in the section.
+// A block dropped as nested is still reported, with keep false: its extent has
+// to advance the caller's cursor even though its code is unusable, or the text
+// it spans becomes part of the *next* fence's label and a cue word inside it
+// decides that fence.
 type fenceBlock struct {
 	start int // byte offset of the opening fence line
 	end   int // byte offset just past the closing fence line
 	code  string
+	keep  bool
 }
 
 // fenceBlocks finds the closed code fences in s, scanning line by line rather
@@ -334,9 +350,8 @@ func fenceBlocks(s string) []fenceBlock {
 			// to the next bare ``` is code, but in a review it is the
 			// reviewer's prose plus the next example. Dropping the block loses
 			// an example; keeping it files prose as the code to imitate.
-			if !nested {
-				out = append(out, block)
-			}
+			block.keep = !nested
+			out = append(out, block)
 			open = false
 		case open:
 			if isFence {
@@ -410,11 +425,16 @@ func parseMarkdown(text string) []Finding {
 func labelledFences(section string) (before, after string) {
 	prevEnd := 0
 	for _, block := range fenceBlocks(section) {
-		code := strings.TrimRight(block.code, "\n")
 		// Only the run of text since the previous fence closed can label this
-		// one; anything earlier belongs to the previous example.
+		// one; anything earlier belongs to the previous example. The cursor
+		// advances past every block, kept or not — a dropped block's code
+		// would otherwise sit in the next fence's lead and label it.
 		lead := section[prevEnd:block.start]
 		prevEnd = block.end
+		if !block.keep {
+			continue
+		}
+		code := strings.TrimRight(block.code, "\n")
 		switch nearestCue(lead) {
 		case cueAfter:
 			if after == "" {

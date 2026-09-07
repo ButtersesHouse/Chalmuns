@@ -117,7 +117,11 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 		isExplicit := false
 		maxSourcePR := 0
 		hasPRSource := false
+		hasReviewSource := false
 		for _, src := range c.Sources {
+			if src.ReviewID != "" {
+				hasReviewSource = true
+			}
 			if src.Strength == "explicit" {
 				isExplicit = true
 			}
@@ -150,7 +154,12 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 		// is older than the midpoint of the scanned range are suspect. A
 		// candidate with no PR source is not old, it is elsewhere — see the
 		// function doc.
-		if !isExplicit && hasPRSource && recencyCutoff > 0 && float64(maxSourcePR) < recencyCutoff {
+		// A candidate carrying review evidence is not stale whatever its PR
+		// numbers say: Step 8C merges a review signal into an existing PR rule,
+		// and judging that merged rule on its one old PR number dropped it
+		// outright — despite several reviews having flagged it since, which is
+		// the freshest evidence there is.
+		if !isExplicit && hasPRSource && !hasReviewSource && recencyCutoff > 0 && float64(maxSourcePR) < recencyCutoff {
 			switch confidence {
 			case "established":
 				confidence = "emerging"

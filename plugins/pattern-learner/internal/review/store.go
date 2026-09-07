@@ -191,7 +191,11 @@ func Select(all []Artifact, ids []string, since string) []Artifact {
 	mark := capturedTime(since)
 	var out []Artifact
 	for _, a := range all {
-		if capturedTime(a.CapturedAt).After(mark) {
+		// An unparseable stamp is included rather than dropped. It sorts
+		// first, so it is visible at the head of the batch — whereas skipping
+		// it makes the review captured, counted by `watch --list`, and
+		// permanently unmineable with nothing to explain the silence.
+		if t := capturedTime(a.CapturedAt); t.IsZero() || t.After(mark) {
 			out = append(out, a)
 		}
 	}

@@ -326,3 +326,74 @@ func TestTriageAuto_singleExplicitPRSignalStillApproves(t *testing.T) {
 		t.Errorf("one explicit PR signal should still approve; got %q", got)
 	}
 }
+
+// The count is of distinct reviews, not signals. One linter run tripping the
+// same check in five files yields five sources and one review; counting
+// signals would wave that through as established on the strength of one run.
+func TestTriageAuto_manySignalsFromOneReviewStillDefers(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	build := func(ids ...string) json.RawMessage {
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{Strength: "explicit", ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{
+			"title": "r", "confidence": "established",
+			"signal_count": len(ss), "status": "proposed", "sources": ss,
+		})
+		return b
+	}
+
+	one := build("rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001")
+	if got := triageStatus(t, one, false); got != "proposed" {
+		t.Errorf("five findings from one review is still one review; got %q", got)
+	}
+	two := build("rev-000000000001", "rev-000000000002")
+	if got := triageStatus(t, two, false); got != "approved" {
+		t.Errorf("two reviews agreeing should approve; got %q", got)
+	}
+}
+
+// Review signals all report pr_number 0, so a rule rebuilt from entirely
+// different reviews has an identical PR list and would be suppressed as
+// "nothing new" — hiding fresh corroboration from the watched reviewer.
+func TestTriageReviewFilter_newReviewsAreNotSuppressed(t *testing.T) {
+	rule := func(ids ...string) json.RawMessage {
+		type src struct {
+			PRNumber int    `json:"pr_number"`
+			ReviewID string `json:"review_id,omitempty"`
+		}
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{
+			"id": "rule_1", "confidence": "emerging", "signal_count": len(ss), "sources": ss,
+			"reviewed_snapshot": map[string]interface{}{
+				"signal_count": 2, "source_pr_numbers": []int{0, 0},
+				"source_review_ids": []string{"rev-00000000000a", "rev-00000000000b"},
+			},
+		})
+		return b
+	}
+
+	unchanged, err := TriageReviewFilter([]json.RawMessage{rule("rev-00000000000a", "rev-00000000000b")}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Suppressed != 1 {
+		t.Errorf("the same two reviews is unchanged; suppressed=%d", unchanged.Suppressed)
+	}
+
+	fresh, err := TriageReviewFilter([]json.RawMessage{rule("rev-00000000000c", "rev-00000000000d")}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Suppressed != 0 {
+		t.Error("two different reviews is new corroboration and must be shown")
+	}
+}
