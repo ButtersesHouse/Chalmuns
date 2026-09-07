@@ -2985,3 +2985,40 @@ func TestPromoteSkipsEmptyState(t *testing.T) {
 		t.Error("no file should be created when there is nothing to promote")
 	}
 }
+
+// An example whose code contains a markdown fence must not close the
+// generated block early: the fence grows past the longest backtick run.
+func TestFencedCodeSurvivesNestedFence(t *testing.T) {
+	cases := []state.Example{
+		{Code: "before\n```go\nnested := true\n```\nafter", Language: "go"},
+		{Code: "a ` b `` c", Language: "go"},
+		{Code: "````\nquad\n````", Language: "md"},
+		{Code: "plain", Language: "go"},
+	}
+	for _, ex := range cases {
+		out := fencedCode(ex)
+		lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		open, close := lines[0], lines[len(lines)-1]
+		fence := strings.Repeat("`", longestBacktickRun(ex.Code)+1)
+		if len(fence) < 3 {
+			fence = "```"
+		}
+		if !strings.HasPrefix(open, fence) || close != fence {
+			t.Errorf("%q: fence %q does not wrap the block (open %q, close %q)", ex.Code, fence, open, close)
+		}
+		// No interior line may be long enough to close the block.
+		for _, l := range lines[1 : len(lines)-1] {
+			if strings.HasPrefix(strings.TrimSpace(l), fence) {
+				t.Errorf("%q: interior line %q closes the fence early", ex.Code, l)
+			}
+		}
+		if !strings.Contains(out, strings.TrimRight(ex.Code, "\n")) {
+			t.Errorf("%q: code was altered in %q", ex.Code, out)
+		}
+	}
+	// A language tag cannot break out of the opening line.
+	out := fencedCode(state.Example{Code: "x", Language: "go\n```\nevil"})
+	if got := strings.Split(out, "\n")[0]; got != "```go" {
+		t.Errorf("language tag not sanitized: %q", got)
+	}
+}

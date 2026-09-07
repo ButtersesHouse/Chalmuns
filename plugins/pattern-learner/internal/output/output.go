@@ -1376,16 +1376,58 @@ func renderExamples(b *strings.Builder, r state.Rule, maxPairs int) {
 
 	for i := 0; i < n; i++ {
 		if i < len(dos) {
-			b.WriteString(fmt.Sprintf("**Do:**\n```%s\n%s\n```\n", dos[i].Language, dos[i].Code))
+			b.WriteString("**Do:**\n" + fencedCode(dos[i]))
 			if dos[i].FileRef != "" {
 				b.WriteString(fmt.Sprintf("_Real instance: see %s_\n", dos[i].FileRef))
 			}
 			b.WriteString("\n")
 		}
 		if i < len(donts) {
-			b.WriteString(fmt.Sprintf("**Don't:**\n```%s\n%s\n```\n\n", donts[i].Language, donts[i].Code))
+			b.WriteString("**Don't:**\n" + fencedCode(donts[i]) + "\n")
 		}
 	}
+}
+
+// fencedCode renders one example as a markdown code block. The fence is
+// always longer than the longest backtick run in the code, so an example
+// that itself contains a fence (a reviewer quoting a suggestion block, say)
+// cannot close the block early and turn the rest of the snippet into prose.
+func fencedCode(ex state.Example) string {
+	fence := strings.Repeat("`", maxInt(3, longestBacktickRun(ex.Code)+1))
+	// The language tag sits on the opening fence line, and it is one word:
+	// take the first, so a newline or a backtick in a model-supplied value
+	// cannot break out of the block.
+	lang := ""
+	if fields := strings.Fields(strings.ReplaceAll(ex.Language, "`", " ")); len(fields) > 0 {
+		lang = fields[0]
+	}
+	// A trailing newline in the code would otherwise double up before the
+	// closing fence.
+	return fence + lang + "\n" + strings.TrimRight(ex.Code, "\n") + "\n" + fence + "\n"
+}
+
+// longestBacktickRun returns the length of the longest consecutive run of
+// backticks in s.
+func longestBacktickRun(s string) int {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	return longest
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func effectiveDoExamples(r state.Rule) []state.Example {
