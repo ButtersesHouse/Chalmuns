@@ -616,8 +616,8 @@ This writes:
     class). Rewrite the offending `target.file_glob` in state and rerun.
   - **Domain names must be single directory segments.** `write-outputs` refuses the
     whole run, writing nothing, if any approved rule's `target.location` contains a
-    path separator, is `.`/`..`, exceeds 231 bytes (255 minus the staging-directory
-    suffix), contains control characters or
+    path separator, is `.`/`..`, exceeds 222 bytes (255 minus the staging-directory
+    suffix and tail), contains control characters or
     any of `< > : " | ? *`, ends in a dot or space, is a Windows reserved device name
     (`con`, `aux`, `nul`, `com1`…), or differs from another domain only by letter
     case. Re-target those rules in state and rerun.

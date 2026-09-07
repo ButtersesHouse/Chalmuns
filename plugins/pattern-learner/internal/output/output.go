@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -365,8 +366,15 @@ const (
 	retiredSuffix = ".pattern-learner-old"
 )
 
+// reTransient matches exactly the names transientPath produces (and, for
+// leftovers of this branch's earlier builds, the same without the random
+// tail): the marker and tail must end the name, so a user's
+// "README.pattern-learner-old.md" or "api.pattern-learner-old-backup" is
+// never taken for one of ours.
+var reTransient = regexp.MustCompile(`^(.+)(` + regexp.QuoteMeta(stagingSuffix) + `|` + regexp.QuoteMeta(retiredSuffix) + `)(-[0-9a-f]{8})?$`)
+
 func isTransientDir(name string) bool {
-	return strings.Contains(name, stagingSuffix) || strings.Contains(name, retiredSuffix)
+	return reTransient.MatchString(name)
 }
 
 // transientPath returns a fresh sibling name for base with the given marker.
@@ -378,14 +386,19 @@ func transientPath(base, marker string) string {
 	return base + marker + "-" + hex.EncodeToString(b[:])
 }
 
+// transientExtraBytes is how much longer than its domain the longest
+// transient sibling name is; validDomain leaves this much room under the
+// file-name limit so the sibling can always be created.
+var transientExtraBytes = len(transientPath("", stagingSuffix))
+
 // liveOfRetired returns the live directory name a retired sibling belongs
 // to, and whether name is a retired sibling at all.
 func liveOfRetired(name string) (string, bool) {
-	idx := strings.Index(name, retiredSuffix)
-	if idx < 0 {
+	m := reTransient.FindStringSubmatch(name)
+	if m == nil || m[2] != retiredSuffix {
 		return "", false
 	}
-	return name[:idx], true
+	return m[1], true
 }
 
 // recoverTransients settles whatever an interrupted swap left under
@@ -1279,8 +1292,9 @@ func validDomain(domain string) bool {
 	if domain == "" || domain == "." || domain == ".." {
 		return false
 	}
-	// The longest name actually created is the staging sibling.
-	if len(domain)+len(stagingSuffix) > maxDomainBytes {
+	// The longest name actually created is the staging sibling, tail
+	// included.
+	if len(domain)+transientExtraBytes > maxDomainBytes {
 		return false
 	}
 	for _, r := range domain {

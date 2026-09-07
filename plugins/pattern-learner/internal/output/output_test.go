@@ -1152,7 +1152,7 @@ func TestValidDomainRejectsOSInvalidNames(t *testing.T) {
 			t.Errorf("validDomain(%q) should be false", bad)
 		}
 	}
-	for _, ok := range []string{"api", "rest-api", "état", strings.Repeat("a", maxDomainBytes-len(stagingSuffix))} {
+	for _, ok := range []string{"api", "rest-api", "état", strings.Repeat("a", maxDomainBytes-transientExtraBytes)} {
 		if !validDomain(ok) {
 			t.Errorf("validDomain(%q) should be true", ok)
 		}
@@ -1512,14 +1512,65 @@ func TestSharedDirRetiredCopyNotFoldedIntoForeignSkill(t *testing.T) {
 }
 
 // The staging sibling is the longest name written, so the length check
-// must leave room for its suffix.
+// must leave room for its suffix and tail — and a domain at the limit
+// must actually write, end to end.
 func TestValidDomainLeavesRoomForSuffix(t *testing.T) {
-	limit := maxDomainBytes - len(stagingSuffix)
-	if !validDomain(strings.Repeat("a", limit)) {
-		t.Error("a domain that fits with its suffix should be valid")
+	limit := maxDomainBytes - transientExtraBytes
+	longest := strings.Repeat("a", limit)
+	if !validDomain(longest) {
+		t.Error("a domain that fits with its sibling names should be valid")
 	}
 	if validDomain(strings.Repeat("a", limit+1)) {
 		t.Error("a domain whose staging name would exceed the limit should be invalid")
+	}
+	dir := t.TempDir()
+	if err := Write(stateWith(approvedRule("Rule", "do it", longest, "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("a domain at the limit must write: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", longest, "SKILL.md")); err != nil {
+		t.Errorf("skill at the limit should exist: %v", err)
+	}
+}
+
+// Only names of exactly the shape transientPath produces (optionally
+// without the random tail) are transients; a user's file or directory that
+// merely contains the marker is not.
+func TestIsTransientDirShape(t *testing.T) {
+	for _, yes := range []string{transientPath("api", stagingSuffix), transientPath("api", retiredSuffix), "api" + retiredSuffix, "api" + stagingSuffix} {
+		if !isTransientDir(yes) {
+			t.Errorf("isTransientDir(%q) should be true", yes)
+		}
+	}
+	for _, no := range []string{"README.pattern-learner-old.md", "api.pattern-learner-old-backup", "api", ".pattern-learner-old", "api.pattern-learner-old-XYZ"} {
+		if isTransientDir(no) {
+			t.Errorf("isTransientDir(%q) should be false", no)
+		}
+	}
+	if live, ok := liveOfRetired(transientPath("api", retiredSuffix)); !ok || live != "api" {
+		t.Errorf("liveOfRetired = %q, %v", live, ok)
+	}
+	if _, ok := liveOfRetired(transientPath("api", stagingSuffix)); ok {
+		t.Error("a staging sibling is not a retired one")
+	}
+}
+
+// A user's file whose name merely contains the marker survives a run.
+func TestUserFileWithMarkerLikeNameSurvives(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := os.MkdirAll(filepath.Join(skills, "api.pattern-learner-old-backup"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skills, "README.pattern-learner-old.md"), []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, keep := range []string{"api.pattern-learner-old-backup", "README.pattern-learner-old.md"} {
+		if _, err := os.Lstat(filepath.Join(skills, keep)); err != nil {
+			t.Errorf("%s should survive: %v", keep, err)
+		}
 	}
 }
 
