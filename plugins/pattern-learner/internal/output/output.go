@@ -162,11 +162,15 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 			return fmt.Errorf("skill domains %q and %q differ only by case and would share one directory; merge them into a single domain and rerun", other, domain)
 		}
 		byFold[folded] = domain
-		globs, err := collectGlobs(rules)
-		if err != nil {
-			return fmt.Errorf("skill domain %q: %w", domain, err)
+		// The universal skill carries no paths gate, so its globs are never
+		// emitted and need no validation.
+		if domain != UniversalSkillName {
+			globs, err := collectGlobs(rules)
+			if err != nil {
+				return fmt.Errorf("skill domain %q: %w", domain, err)
+			}
+			globsByDomain[domain] = globs
 		}
-		globsByDomain[domain] = globs
 		// A directory already at this path that this generator did not
 		// write is someone's hand-authored skill (or hand-kept material);
 		// overwriting it and wiping its examples/ and rules/ would destroy
@@ -182,9 +186,19 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 		if _, err := os.Stat(skillDir); err == nil && !isGeneratedSkill(filepath.Join(skillDir, "SKILL.md"), domain, "", true) && !isEmptyShell(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 		}
-		if shared && owner != "" {
+		if shared {
+			// Any stamp that is not ours, including when this run has no
+			// identity of its own, marks another repository's skill.
 			if stamped, ok := stampedOwner(filepath.Join(skillDir, "SKILL.md")); ok && stamped != "" && stamped != owner {
-				return fmt.Errorf("%s was generated for repository %q and this run is for %q; the shared skills directory cannot hold both under one domain name — rename the domain in one of them or use separate skills directories", skillDir, stamped, owner)
+				runFor := owner
+				if runFor == "" {
+					runFor = "an unidentified repository (no --repo, state.repo, or git remote)"
+				}
+				remedy := "rename the domain in one of them or use separate skills directories"
+				if domain == UniversalSkillName {
+					remedy = "the universal '" + UniversalSkillName + "' skill has a fixed name, so give each repository its own skills directory"
+				}
+				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s", skillDir, stamped, runFor, remedy)
 			}
 		}
 	}
@@ -196,8 +210,11 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 	}
 	// Prune only once every write has succeeded, so a failed run leaves the
 	// previous skills in place rather than a tree with both the old ones
-	// removed and the new ones missing.
-	return pruneStaleSkills(skillsDir, byDomain, owner)
+	// removed and the new ones missing. Ownership follows the same rule as
+	// the overwrite guard: inside the repo's own tree every generated skill
+	// is ours whatever it is stamped with; in a shared directory only those
+	// stamped for this run are.
+	return pruneStaleSkills(skillsDir, byDomain, owner, !shared)
 }
 
 // ownerKey identifies the repository a state file belongs to, so generated
@@ -293,7 +310,7 @@ func isEmptyShell(dir string) bool {
 // just written, showing under its older casing. When both casings exist as
 // separate entries (a case-sensitive filesystem after a re-cased domain),
 // the non-matching one is a stale skill and is pruned like any other.
-func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner string) error {
+func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner string, anyOwner bool) error {
 	entries, err := os.ReadDir(skillsDir)
 	if os.IsNotExist(err) {
 		return nil
@@ -323,7 +340,7 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 			continue
 		}
 		dir := filepath.Join(skillsDir, e.Name())
-		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner, false) {
+		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner, anyOwner) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {

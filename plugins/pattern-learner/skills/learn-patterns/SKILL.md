@@ -596,7 +596,11 @@ This writes:
     stamp it carries (a fork or renamed repo re-stamps it). In a skills directory
     **outside** the repo (one shared by several repos), a domain stamped by another
     repo is refused instead — two repos cannot share one domain name there; ask the
-    user to rename the domain in one of them or use separate skills directories.
+    user to rename the domain in one of them or use separate skills directories. The
+    universal `conventions` skill has a fixed name, so two repos with universal rules
+    can only share a skills directory by giving each its own; and a run with no repo
+    identity (no `--repo`, empty `state.repo`, no git remote) can neither overwrite
+    nor prune any stamped skill there.
   - **Globs must not contain commas.** `paths` is one comma-separated string, so
     `write-outputs` expands brace groups (`src/{a,b}/**` → two globs) and refuses
     the run for any glob that still contains a comma (e.g. a `[a,b]` character

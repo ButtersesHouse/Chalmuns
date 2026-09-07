@@ -218,3 +218,12 @@ func TestGlobFiles_braceGroups(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobFiles_singleAlternativeBrace(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"src/a/h.go": "a\n"})
+	got := globFiles(root, "src/{a}/*.go")
+	if len(got) != 1 || got[0] != filepath.Join(root, "src/a/h.go") {
+		t.Errorf("single-alternative brace group should expand like the paths gate does; got %v", got)
+	}
+}

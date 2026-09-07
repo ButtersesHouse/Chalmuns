@@ -831,13 +831,14 @@ func TestRefusesToOverwriteHandWrittenSkill(t *testing.T) {
 // Two repositories sharing one skills directory must not prune each other's
 // generated skills; each run only owns the skills stamped with its repo.
 func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
-	dir := t.TempDir()
-	skills := filepath.Join(dir, "shared")
+	// A shared directory lives outside every repository that writes to it.
+	skills := filepath.Join(t.TempDir(), "shared")
+	repoA, repoB, repoC := t.TempDir(), t.TempDir(), t.TempDir()
 	opts := Options{SkillsDir: skills}
 
 	a := stateWith(approvedRule("A rule", "do it", "api", "stated", 1))
 	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
-	if err := Write(a, dir, opts); err != nil {
+	if err := Write(a, repoA, opts); err != nil {
 		t.Fatal(err)
 	}
 	content := readFile(t, filepath.Join(skills, "api", "SKILL.md"))
@@ -847,7 +848,7 @@ func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
 
 	b := stateWith(approvedRule("B rule", "do it", "ui", "stated", 1))
 	b.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
-	if err := Write(b, dir, opts); err != nil {
+	if err := Write(b, repoB, opts); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(skills, "api", "SKILL.md")); err != nil {
@@ -857,7 +858,7 @@ func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
 	// Alpha drops its domain: its own skill goes, beta's stays.
 	a2 := state.Empty()
 	a2.Repo = a.Repo
-	if err := Write(a2, dir, opts); err != nil {
+	if err := Write(a2, repoA, opts); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
@@ -867,13 +868,68 @@ func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
 		t.Error("alpha must not prune beta's skill")
 	}
 
-	// A run whose state carries no repo information does not own stamped
-	// skills either.
-	if err := Write(state.Empty(), dir, opts); err != nil {
+	// A run with no repo identity of its own neither prunes nor overwrites
+	// a stamped skill in the shared directory.
+	if err := Write(state.Empty(), repoC, opts); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(skills, "ui", "SKILL.md")); err != nil {
 		t.Error("an unowned run must not prune a stamped skill")
+	}
+	unowned := stateWith(approvedRule("C rule", "do it", "ui", "stated", 1))
+	if err := Write(unowned, repoC, opts); err == nil || !strings.Contains(err.Error(), "unidentified repository") {
+		t.Errorf("an unowned run must not overwrite another repo's stamped skill, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(skills, "ui", "SKILL.md")); !strings.Contains(got, "B rule") {
+		t.Error("beta's skill should be untouched")
+	}
+}
+
+// Inside the repo's own tree, ownership ignores the stamp for pruning as
+// well as for overwriting: after a fork or rename, a stale skill stamped
+// with the previous identity is still pruned.
+func TestForkPrunesStaleSkillWithOldStamp(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	a := stateWith(approvedRule("Rule", "do it", "components", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	fork := stateWith(approvedRule("Rule", "do it", "ui", "stated", 1))
+	fork.Repo = state.RepoInfo{Owner: "bob", Repo: "alpha"}
+	if err := Write(fork, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "components")); !os.IsNotExist(err) {
+		t.Error("stale skill stamped with the old identity should be pruned inside the repo tree")
+	}
+}
+
+// The universal skill has a fixed name, so the shared-directory refusal
+// must point at the only workable remedy.
+func TestSharedDirUniversalConflictMessage(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	a := stateWith(approvedRule("A", "do it", UniversalLocation, "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	b := stateWith(approvedRule("B", "do it", UniversalLocation, "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
+	err := Write(b, t.TempDir(), Options{SkillsDir: shared})
+	if err == nil || !strings.Contains(err.Error(), "own skills directory") {
+		t.Errorf("expected the universal-skill remedy, got %v", err)
+	}
+}
+
+// Universal rules never emit a paths gate, so their globs are not validated
+// and a comma in one cannot refuse the run.
+func TestUniversalGlobsNotValidated(t *testing.T) {
+	r := approvedRule("U", "do it", UniversalLocation, "stated", 1)
+	r.Target.FileGlob = []string{"src/[a,b]/**/*.go"}
+	if err := Write(stateWith(r), t.TempDir(), Options{}); err != nil {
+		t.Errorf("universal rule globs must not be validated: %v", err)
 	}
 }
 
