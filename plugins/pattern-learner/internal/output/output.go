@@ -199,7 +199,7 @@ func (pr *Prepared) Write() error {
 	// a stale staging tree) before judging the tree, so the checks see
 	// every domain in its settled place.
 	warnings, err := recoverTransients(p.skillsDir, p.owner, !p.shared)
-	pr.warnings = append(pr.warnings, warnings...)
+	pr.warnings = warnings // this run's only; a repeated Write reports afresh
 	if err != nil {
 		return err
 	}
@@ -874,11 +874,8 @@ func sortRules(rules []state.Rule) {
 // writeSkillFile renders one domain; rules must already be in rendering
 // order (plan.validate sorts them before collecting globs).
 func writeSkillFile(domain string, rules []state.Rule, globs []string, universal bool, skillsDir string, override string, watermark int, owner string, opts Options) error {
-	if universal {
-		// No paths gate: these rules apply to every file, so the skill must
-		// auto-load regardless of what is being edited.
-		globs = nil
-	}
+	// globs is nil for the universal skill: validateRules records none for
+	// it, so it auto-loads regardless of what is being edited.
 	desc := buildDescription(domain, globs, universal, override)
 	skillDir := filepath.Join(skillsDir, domain)
 

@@ -342,3 +342,32 @@ func TestWriteOutputsDefaultsToStateRepo(t *testing.T) {
 		t.Error("nothing should be written under the current directory")
 	}
 }
+
+// Glob metacharacters in the repository path are not read as a pattern,
+// and a group with a plain and a "**" alternative lists a file once.
+func TestGlobMatcherRootMetacharsAndDedup(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "proj[1]")
+	writeTree(t, root, map[string]string{"src/a.go": "a\n", "src/deep/b.go": "b\n"})
+	m := newGlobMatcher(root, []string{"src/*.go", "src/{*.go,**/*.go}"})
+	if got := m.files("src/*.go"); len(got) != 1 || got[0] != filepath.Join(root, "src/a.go") {
+		t.Errorf("plain glob under a metachar root: got %v", got)
+	}
+	if got := m.files("src/{*.go,**/*.go}"); len(got) != 2 {
+		t.Errorf("a file matched by two alternatives must be listed once: got %v", got)
+	}
+}
+
+// A git remote that parses to an unusable identity is an error rather
+// than a silent unstamped run.
+func TestResolveOwnerRejectsUnusableRemote(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", repo, "remote", "add", "origin", "https://host/git/a b/c").CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v: %s", err, out)
+	}
+	if _, err := resolveOwner("", state.Empty(), repo); err == nil || !strings.Contains(err.Error(), "not a usable owner/repo") {
+		t.Errorf("expected an error for an unusable remote identity, got %v", err)
+	}
+}

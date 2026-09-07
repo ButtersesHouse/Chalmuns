@@ -117,10 +117,15 @@ func runWriteOutputs(args []string) error {
 	}
 	// The output directory (default skills location, anchoring root) is
 	// the repository the state belongs to, not wherever the command was
-	// run from; an explicit --output-dir overrides it.
+	// run from; an explicit --output-dir overrides it. The repository root
+	// is resolved once and reused for the shared-directory judgement.
 	outputDir := flagValue(args, "--output-dir", "")
+	root := repoRoot(statePath, ".")
 	if outputDir == "" {
-		outputDir = repoRoot(statePath, ".")
+		outputDir = root
+	} else if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+		// No git top level: the explicit output dir is the best root.
+		root = outputDir
 	}
 	ragHints := hasFlag(args, "--rag-hints")
 	ragAnchor := hasFlag(args, "--rag")
@@ -141,7 +146,6 @@ func runWriteOutputs(args []string) error {
 	// glob, or a skill directory the run would refuse to overwrite. The
 	// anchoring below walks the repository (or calls cursor-agent per
 	// rule) and should not run for a state the write would then reject.
-	root := repoRoot(statePath, outputDir)
 	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, root)
 	if err != nil {
 		return err
@@ -215,7 +219,11 @@ func resolveOwner(flag string, s state.State, repoRoot string) (string, error) {
 		return key, nil
 	}
 	if r, err := detect.Detect(repoRoot); err == nil {
-		return output.OwnerKey(r.Owner, r.Repo), nil
+		key := output.OwnerKey(r.Owner, r.Repo)
+		if key == "" {
+			return "", fmt.Errorf("the git remote of %s parses to {owner: %q, repo: %q}, which is not a usable owner/repo identity; pass --repo owner/repo", repoRoot, r.Owner, r.Repo)
+		}
+		return key, nil
 	}
 	return "", nil
 }
@@ -502,12 +510,12 @@ func (m *globMatcher) walkAll() {
 			// anchoring is advisory and simply finds nothing for it.
 			continue
 		}
+		// Every alternative, "**" or not, is matched segment-wise during
+		// the one walk. Going through filepath.Glob for the plain ones
+		// would read glob metacharacters in the repository path itself
+		// ("proj[1]") as a pattern, and would list a file twice when a
+		// group has both a plain and a "**" alternative.
 		for _, g := range expanded {
-			if !strings.Contains(g, "**") {
-				found, _ := filepath.Glob(filepath.Join(m.root, g))
-				m.matches[glob] = append(m.matches[glob], found...)
-				continue
-			}
 			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(path.Clean(filepath.ToSlash(g)), "/")})
 		}
 	}
