@@ -75,7 +75,17 @@ func WriteArtifact(cacheDir string, a Artifact) (written bool, err error) {
 }
 
 // ReadArtifact loads one artifact by ID.
+//
+// The ID is checked before it names a file. Today every caller already holds a
+// minted ID or has validated one, so this guards nothing — which is exactly
+// why it belongs here: the function is exported, takes an ID as a string, and
+// joins it into a path, so the first caller to pass one through from a model
+// or a payload turns it into a directory traversal. Confining it at the read
+// itself means that caller cannot get it wrong.
 func ReadArtifact(cacheDir, reviewID string) (Artifact, error) {
+	if !ValidReviewID(reviewID) {
+		return Artifact{}, fmt.Errorf("%q is not an artifact id", reviewID)
+	}
 	data, err := os.ReadFile(ArtifactPath(cacheDir, reviewID))
 	if err != nil {
 		return Artifact{}, err

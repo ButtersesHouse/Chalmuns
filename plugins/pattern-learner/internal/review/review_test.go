@@ -302,6 +302,14 @@ func TestWriteArtifact_idempotent(t *testing.T) {
 	if got.ReviewID != a.ReviewID || got.RawText != a.RawText {
 		t.Error("round-trip lost content")
 	}
+
+	// ReadArtifact is exported and joins its argument into a path, so it
+	// confines the id itself rather than trusting every future caller to.
+	for _, bad := range []string{"../../etc/passwd", "rev-../x", "", "not-an-id"} {
+		if _, err := ReadArtifact(dir, bad); err == nil {
+			t.Errorf("ReadArtifact(%q) should refuse a non-id", bad)
+		}
+	}
 }
 
 func TestListArtifacts_orderedAndSkipsJunk(t *testing.T) {
