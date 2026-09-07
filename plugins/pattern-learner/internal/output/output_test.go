@@ -3281,3 +3281,35 @@ func TestWriteCodeReviewRuleSourceLabelWithoutReviewers(t *testing.T) {
 		t.Errorf("want a bare 'code review' label; got:\n%s", content)
 	}
 }
+
+// A PR-origin rule can hold review signals: Step 8C merges an equivalent
+// review candidate into the existing rule and keeps that rule's origin. Those
+// sources carry pr_number 0, which used to render as a citation to "PR #0" —
+// a pull request that does not exist — on exactly the rules the review path
+// is meant to strengthen.
+func TestWriteMergedReviewSignalDoesNotCitePRZero(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_merged", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "pr-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{PRNumber: 480, Reviewer: "bob", Snippet: "we wrap with %w", Strength: "explicit"},
+			{PRNumber: 0, ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+		LastSeenPR: 480,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 500
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "#0") {
+		t.Errorf("a rule must never cite PR #0; got:\n%s", content)
+	}
+	if !strings.Contains(content, "_Source: PRs #480 and code review_") {
+		t.Errorf("a mixed-provenance rule should name both; got:\n%s", content)
+	}
+}

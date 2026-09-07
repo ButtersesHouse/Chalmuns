@@ -33,6 +33,17 @@ import (
 // output, most specific first.
 var responseKeys = []string{"tool_response", "tool_result", "tool_output", "response", "result", "output"}
 
+// reportingTools are tools whose *input* is the review. Claude Code's
+// /code-review skill does not return its findings as the skill call's result —
+// it reports them by calling ReportFindings, whose payload carries the
+// findings array as that call's arguments. Reading only a tool's response
+// therefore missed the one format this package names as its house shape, and
+// captured the skill's own prose instead. Each entry maps such a tool to the
+// reviewer it belongs to, used when the payload names no skill of its own.
+var reportingTools = map[string]string{
+	"ReportFindings": "code-review",
+}
+
 // textKeys are the fields that may carry text inside a structured response.
 var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
 
@@ -51,12 +62,24 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 
 	toolName, _ := doc["tool_name"].(string)
 	skill, command := invocation(doc)
+	reporter, isReporting := reportingTools[toolName]
+	if isReporting && skill == "" {
+		skill = reporter
+	}
+
 	matched := Match(watchers, toolName, skill, command)
+	if matched == nil && isReporting {
+		// A reporting tool's payload *is* review output, but it need not name
+		// the skill that produced it. When the user watches a review skill
+		// under some other name, attribute it to that designation rather than
+		// discarding a review they asked to be kept eyes on.
+		matched = firstSkillWatcher(watchers)
+	}
 	if matched == nil {
 		return Artifact{}, state.Watcher{}, false
 	}
 
-	text := responseText(doc)
+	text := responseText(doc, isReporting)
 	if strings.TrimSpace(text) == "" {
 		return Artifact{}, state.Watcher{}, false
 	}
@@ -90,7 +113,37 @@ func invocation(doc map[string]interface{}) (skill, command string) {
 		}
 	}
 	command, _ = input["command"].(string)
+	// A slash command carries the skill in `command`. Match derives this too;
+	// resolving it here as well is what lets the artifact's label name the
+	// skill rather than the raw command line.
+	if skill == "" {
+		skill = SkillFromCommand(command)
+	}
 	return skill, command
+}
+
+// firstSkillWatcher returns the first designation that can own a skill's
+// output, or nil when only command-line tools are watched.
+func firstSkillWatcher(ws []state.Watcher) *state.Watcher {
+	for i := range ws {
+		if ws[i].Kind != KindTool {
+			return &ws[i]
+		}
+	}
+	return nil
+}
+
+// PayloadCWD reads the working directory a hook payload reports, so a capture
+// can find the project when CLAUDE_PROJECT_DIR is not exported — the same
+// fallback internal/guard applies, for the same reason.
+func PayloadCWD(payload []byte) string {
+	var doc struct {
+		CWD string `json:"cwd"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil {
+		return ""
+	}
+	return doc.CWD
 }
 
 // hookLabel records what produced the artifact, for the approval display.
@@ -115,10 +168,20 @@ func truncateLabel(s string) string {
 	return s
 }
 
-// responseText finds the tool's output in the payload. A structured response
-// is re-encoded as JSON rather than flattened, so a findings payload reaches
-// the findings parser intact.
-func responseText(doc map[string]interface{}) string {
+// responseText finds the review text in the payload. A structured response is
+// re-encoded as JSON rather than flattened, so a findings payload reaches the
+// findings parser intact.
+//
+// For a reporting tool the review is the call's *input*, so tool_input is read
+// first; for every other tool the input is the request, not the review, and is
+// never read — capturing it would record what someone asked for as what the
+// reviewer said.
+func responseText(doc map[string]interface{}, reporting bool) string {
+	if reporting {
+		if text := valueText(doc["tool_input"], 0); strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
 	for _, key := range responseKeys {
 		v, present := doc[key]
 		if !present {

@@ -89,8 +89,8 @@ func RunVerifyGrounding(args []string) error {
 // are dropped and counted.
 func VerifyGrounding(rawSignals []json.RawMessage, dirs GroundingDirs) (GroundingResult, error) {
 	var result GroundingResult
-	// Cache normalised file contents keyed by artifact path to avoid re-reading.
-	fileCache := map[string]string{}
+	// Cache normalised artifact values keyed by path to avoid re-reading.
+	fileCache := map[string][]string{}
 
 	for _, raw := range rawSignals {
 		var sig groundingSignal
@@ -120,6 +120,17 @@ func VerifyGrounding(rawSignals []json.RawMessage, dirs GroundingDirs) (Groundin
 					"signal cites review %q but no --review-cache-dir was given; "+
 						"review signals are grounded against the captured artifact, not a PR", reviewID)
 			}
+			// The ID comes from the extraction subagent and is joined into a
+			// path, so it is checked against the shape capture mints before it
+			// can name a file. Unchecked, "../state" or "../../../signals"
+			// walks out of the review cache and grounds the batch against some
+			// other JSON on disk — including, at its worst, the very file of
+			// signals being verified, which would pass every fabricated quote
+			// in it. The PR arm cannot do this because a PR number is an int.
+			if !review.ValidReviewID(reviewID) {
+				result.Stats.NotFound++
+				continue
+			}
 			path = review.ArtifactPath(dirs.ReviewCache, reviewID)
 		case sig.RawSignal.PRNumber != 0:
 			if dirs.Cache == "" {
@@ -138,18 +149,18 @@ func VerifyGrounding(rawSignals []json.RawMessage, dirs GroundingDirs) (Groundin
 		// differences (wrapped lines, escaped newlines).
 		normSnippet := NormalizeForGrounding(snippet)
 
-		fileContent, ok := fileCache[path]
+		values, ok := fileCache[path]
 		if !ok {
 			data, err := os.ReadFile(path)
 			if err != nil {
 				result.Stats.NotFound++
 				continue
 			}
-			fileContent = NormalizeForGrounding(groundableText(data))
-			fileCache[path] = fileContent
+			values = groundableValues(data)
+			fileCache[path] = values
 		}
 
-		if !strings.Contains(fileContent, normSnippet) {
+		if !containsAny(values, normSnippet) {
 			result.Stats.NotFound++
 			continue
 		}
@@ -161,37 +172,55 @@ func VerifyGrounding(rawSignals []json.RawMessage, dirs GroundingDirs) (Groundin
 	return result, nil
 }
 
-// groundableText returns the text of a cache file to ground snippets against.
+// groundableValues returns the normalised strings a snippet may be found in.
 // The cache is JSON, so string values are stored escaped (a quote as `\"`, a
 // newline as the two characters `\n`); matching against the raw bytes would
 // falsely drop any multi-line or quote-containing snippet. Decode the JSON and
-// concatenate its decoded string values instead. Falls back to the raw text
+// take its decoded string values instead. Falls back to the whole raw text
 // when the file does not parse as JSON.
-func groundableText(data []byte) string {
+//
+// Each value is kept separate rather than concatenated, and that separation is
+// the check. A reviewer's remark lives inside one value — one comment body,
+// one finding's message. Joining every value into one corpus put unrelated
+// fields next to each other, so a snippet running from the end of one into the
+// start of another verified as something the reviewer said verbatim when no
+// such sentence was ever written. Requiring the whole snippet to sit inside a
+// single value makes a quote provably one person's words.
+func groundableValues(data []byte) []string {
 	var doc interface{}
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return string(data)
+		return []string{NormalizeForGrounding(string(data))}
 	}
-	var b strings.Builder
-	collectStrings(doc, &b)
-	return b.String()
+	var out []string
+	collectStrings(doc, &out)
+	return out
 }
 
-// collectStrings walks a decoded JSON document appending every string value.
-func collectStrings(v interface{}, b *strings.Builder) {
+// collectStrings walks a decoded JSON document appending every string value,
+// normalised for comparison.
+func collectStrings(v interface{}, out *[]string) {
 	switch t := v.(type) {
 	case string:
-		b.WriteString(t)
-		b.WriteByte('\n')
+		*out = append(*out, NormalizeForGrounding(t))
 	case []interface{}:
 		for _, e := range t {
-			collectStrings(e, b)
+			collectStrings(e, out)
 		}
 	case map[string]interface{}:
 		for _, e := range t {
-			collectStrings(e, b)
+			collectStrings(e, out)
 		}
 	}
+}
+
+// containsAny reports whether the snippet appears inside any single value.
+func containsAny(values []string, snippet string) bool {
+	for _, v := range values {
+		if strings.Contains(v, snippet) {
+			return true
+		}
+	}
+	return false
 }
 
 // NormalizeForGrounding lowercases s and collapses all whitespace runs

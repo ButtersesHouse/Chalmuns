@@ -367,3 +367,66 @@ func TestRunExtractReview_sinceWatermark(t *testing.T) {
 		t.Errorf("--reviews should select exactly what it names; got %+v", lean)
 	}
 }
+
+// state-write replaces the file wholesale from a payload the model builds by
+// hand. Every other invariant it protects is enforced here rather than asked
+// for in prose, and the designations belong in that set: dropping one silently
+// stops all future capture from that reviewer, with no error and nothing in
+// the cache to explain why.
+func TestRunStateWrite_carriesWatchersForward(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	if _, err := captureStdout(t, func() error {
+		return runWatch([]string{"--state", statePath, "--add", "code-review", "--kind", "skill"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := state.Read(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.LastIngestedReviewAt = "2026-01-15T10:04:00Z"
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+
+	// A Step 11 payload that forgets both fields — the common case, since the
+	// model retypes the whole document.
+	payload := `{"schema_version":"1","repo":{"owner":"o","repo":"r"},"last_extracted_pr_number":42,
+	  "rules":[{"title":"t","rule":"r","status":"approved","confidence":"stated","sources":[]}]}`
+	withStdin(t, payload, func() {
+		if err := runStateWrite([]string{"--state", statePath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	got, err := state.Read(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Watchers) != 1 || got.Watchers[0].ID != "code-review" {
+		t.Errorf("designations must survive a state-write that omits them; got %+v", got.Watchers)
+	}
+	if got.LastIngestedReviewAt != "2026-01-15T10:04:00Z" {
+		t.Errorf("review watermark must survive; got %q", got.LastIngestedReviewAt)
+	}
+	if got.LastExtractedPRNumber != 42 || len(got.Rules) != 1 {
+		t.Errorf("the payload's own fields must still be written: %+v", got)
+	}
+}
+
+// withStdin runs fn with stdin fed from body.
+func withStdin(t *testing.T, body string, fn func()) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdin
+	os.Stdin = r
+	go func() {
+		w.WriteString(body)
+		w.Close()
+	}()
+	defer func() { os.Stdin = saved; r.Close() }()
+	fn()
+}

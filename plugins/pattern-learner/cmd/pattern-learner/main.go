@@ -119,6 +119,24 @@ func runStateWrite(args []string) error {
 		return fmt.Errorf("decode stdin: %w", err)
 	}
 
+	// state-write replaces the file wholesale from a payload the model builds
+	// by hand, so anything the model forgets to re-type is erased. Every other
+	// invariant the write cares about is enforced here rather than asked for
+	// in prose — IDs, timestamps, stats — and the watch designations belong in
+	// that set: dropping one silently stops all future capture from that
+	// reviewer, with no error and nothing in the cache to explain why. They
+	// are managed by the `watch` subcommand alone, so a payload that omits
+	// them means "unchanged", never "remove them".
+	prior, err := state.Read(path)
+	if err == nil {
+		if len(s.Watchers) == 0 {
+			s.Watchers = prior.Watchers
+		}
+		if s.LastIngestedReviewAt == "" {
+			s.LastIngestedReviewAt = prior.LastIngestedReviewAt
+		}
+	}
+
 	if err := os.MkdirAll(dirOf(path), 0755); err != nil {
 		return err
 	}

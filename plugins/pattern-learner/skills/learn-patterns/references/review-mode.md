@@ -76,7 +76,8 @@ into the subagent prompt below. Each element:
       "category": "correctness",
       "severity": "",
       "title": "Errors wrapped without %w",
-      "body": "This codebase wraps errors with %w so callers can errors.Is them.\n\nA caller doing errors.Is(err, ErrNotFound) gets false and falls into the generic 500 branch.",
+      "body": "This codebase wraps errors with %w so callers can errors.Is them.",
+      "evidence": "A caller doing errors.Is(err, ErrNotFound) gets false and falls into the generic 500 branch.",
       "code_before": "return fmt.Errorf(\"lookup: %v\", err)",
       "code_after": "return fmt.Errorf(\"lookup: %w\", err)",
       "verdict": "CONFIRMED"
@@ -132,14 +133,20 @@ same underlying rule in more than one review, emit it once with one entry in
 
 **Strength**
 
-- `"strength": "explicit"` — the finding **states the rule itself**: it says what
-  this codebase does, names the convention, cites a configured lint rule, or
-  explains the general principle ("this codebase wraps errors with %w so callers
-  can errors.Is them"). A named rule id from a tool the team configured
-  (`no-console`, `py.no-requests`) is a stated convention: the team chose to
-  enforce it.
+- `"strength": "explicit"` — the finding **states the rule itself in prose**: it
+  says what this codebase does, names the convention, or explains the general
+  principle ("this codebase wraps errors with %w so callers can errors.Is
+  them").
 - `"strength": "implicit"` — the finding shows the correction without stating a
   rule, and you inferred the convention from it.
+
+**A rule id is not a stated convention.** `no-console`, `py.no-requests` and
+every SARIF `ruleId` are put in a finding's `title` by the parser, on every
+finding those tools emit — so treating an id as a statement would make
+*everything* a linter reports explicit, which is the same as having no
+distinction at all. Nothing in the finding tells you whether the id came from a
+ruleset the team chose or from a vendor's default pack. Judge the prose, not
+the identifier.
 
 Do not mark a finding explicit merely because the tool sounded confident. A
 tool's `verdict` or `severity` says how sure it is that this is a *problem*, not
@@ -194,8 +201,14 @@ input — a signal whose `review_id` does not name a real captured review is
 dropped in Step R4.
 
 `snippet` — the reviewer's exact words, at least 20 characters, copied from the
-finding's `title`, `body`, or (for an unstructured review) its `text`. **Do not
-paraphrase, do not stitch words from different places, do not summarize.** Step
+finding's `title`, `body`, `evidence`, or (for an unstructured review) its
+`text`. **Quote from one of those fields, not across two.** `body` is the
+reviewer's claim and `evidence` is the separate statement supporting it; they
+are separate fields precisely so that a quote running from the end of one into
+the start of the other cannot be passed off as something the reviewer wrote.
+Step R4 checks each snippet against one field at a time and drops any that
+spans a seam. **Do not paraphrase, do not stitch words from different places,
+do not summarize.** Step
 R4 checks every snippet against the stored review and silently drops any that is
 not found. If you cannot quote the finding in support of the rule, the rule is
 yours rather than the reviewer's — omit it.
@@ -269,18 +282,29 @@ and run Steps 8 through 13 as written, with these five differences:
    mark every review rule stale.
 4. **Step 11 also sets `last_ingested_review_at`** to the `captured_at` of the
    newest review mined this run (the last element of the `extract-review`
-   output). Leave `last_extracted_pr_number` untouched — this mode does not
+   output) — but **only on a watermark run**. Leave it untouched after an
+   explicit `--reviews <ids>` run: that run deliberately mined out of order,
+   and advancing the mark past reviews it skipped would make them unmineable
+   for good, with R1 then reporting them as already consumed. Leave
+   `last_extracted_pr_number` untouched in either case — this mode does not
    read PRs.
 5. **Step 13's summary** replaces the PR counters with the Review Mode block
    below.
 
 Approval is unchanged and still required: `--learn-reviews` alone presents
 every candidate for decision, and `--learn-reviews --auto` applies the same
-`triage --mode auto` predicate as everywhere else. Note that a convention a
-reviewer raised exactly once, without stating it as a rule, is a single
-implicit signal and so is **deferred** rather than auto-approved — which is the
-behaviour you want, because that is precisely the shape a one-off defect takes
-if one slips through R3.
+`triage --mode auto` predicate as everywhere else.
+
+That predicate holds back **any** candidate whose signals all come from a
+single review, whatever their strength — `triage` reads `review_id` on the
+sources to tell. This is enforced in the binary rather than left to R3's
+judgement, because strength cannot carry it: a finding is explicit when it
+states a rule, and one run of a linter states a rule id on every finding it
+emits, so a strength-only rule would auto-approve one standing convention per
+check the tool tripped with nobody having read any of them. What makes a review
+finding a convention rather than a one-off defect is that it **recurs**, and
+one review cannot show recurrence. Two reviews agreeing clears the bar;
+`--auto-threshold` is the explicit opt-out.
 
 In the Step 13 summary, replace the PR-related counters with:
 

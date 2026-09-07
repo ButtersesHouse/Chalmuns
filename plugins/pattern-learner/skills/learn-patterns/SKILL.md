@@ -397,6 +397,15 @@ The invocation, the marked-block contract, the outcomes it reports, and the rule
 
 ### Step 13: Summary
 
+The "Watched reviewers" line needs a count the state does not carry (watchers
+store no counters by design — the cache is the source of truth), so read it
+live before printing the summary. Skip this when Step 4's state had no
+`watchers`:
+
+```
+$BIN watch --state .claude/pattern-learner/state.json --list
+```
+
 Report to the user:
 
 ```
@@ -425,9 +434,8 @@ Files written (skills only — nothing at the repo root):
 Promoted to top level:      <"not requested" | "<path> — <created|updated|appended|unchanged|skipped>">
 Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
-Watched reviewers:          <"none designated" |
-                             "<name>, <name> — <N> captured, <N> not yet mined
-                              (run /learn-patterns --learn-reviews)">
+Watched reviewers:          <"none designated" | "<name>, <name> — <N> captured
+                             (run /learn-patterns --learn-reviews to mine them)">
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
 RAG hints in skill files:   <yes | no>
 Format check (audit-format):

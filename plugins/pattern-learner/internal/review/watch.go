@@ -120,6 +120,14 @@ func FindWatcher(ws []state.Watcher, idOrName string) (state.Watcher, bool) {
 // It returns the first match in designation order; nil when nothing is watched
 // or nothing matches, which is the common case and must stay cheap.
 func Match(ws []state.Watcher, toolName, skill, command string) *state.Watcher {
+	// A slash command names a skill, not a program: "/code-review --fix" is an
+	// invocation of the code-review skill. Deriving it here rather than in the
+	// caller keeps one answer to "what did this call invoke" — a caller that
+	// forgot to derive it made a `--kind skill` watcher unmatchable, which is
+	// exactly the designation the docs recommend for /code-review.
+	if skill == "" {
+		skill = SkillFromCommand(command)
+	}
 	for i := range ws {
 		w := &ws[i]
 		if w.Kind != KindTool && matchesSkill(w.Name, toolName, skill) {
@@ -130,6 +138,24 @@ func Match(ws []state.Watcher, toolName, skill, command string) *state.Watcher {
 		}
 	}
 	return nil
+}
+
+// SkillFromCommand returns the skill a slash command invokes, or "" when the
+// command is an ordinary program.
+func SkillFromCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if !strings.HasPrefix(command, "/") {
+		return ""
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return ""
+	}
+	// A path is not a slash command: "/usr/local/bin/semgrep" runs a program.
+	if strings.Contains(strings.TrimPrefix(fields[0], "/"), "/") {
+		return ""
+	}
+	return fields[0]
 }
 
 // matchesSkill compares a designation against a skill invocation. A skill may
@@ -180,7 +206,7 @@ func matchesCommand(name, command string) bool {
 	if command == "" {
 		return false
 	}
-	for _, segment := range reCmdSeparator.Split(command, -1) {
+	for _, segment := range reCmdSeparator.Split(sanitizeCommand(command), -1) {
 		fields := strings.Fields(segment)
 		i := 0
 		for i < len(fields) && (reEnvAssign.MatchString(fields[i]) || commandWrappers[strings.ToLower(fields[i])]) {
@@ -191,6 +217,51 @@ func matchesCommand(name, command string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeCommand blanks out the parts of a command line that are data rather
+// than commands, so the separator split cannot manufacture a command position
+// inside them.
+//
+// Without this, every `;` `|` `&` `(` and newline was a separator regardless
+// of context, so the first word after one was read as a program being run.
+// `git commit -m 'fix; semgrep noise'` therefore counted as a run of semgrep,
+// and a heredoc commit message whose body line began "semgrep now runs on
+// every PR" did too — capturing git's output and filing it as semgrep's
+// review. That breaks the invariant this whole path exists to hold: nothing is
+// captured from a tool that was not designated.
+func sanitizeCommand(command string) string {
+	var b strings.Builder
+	b.Grow(len(command))
+	var quote rune
+	for _, r := range command {
+		switch {
+		case quote != 0:
+			// Inside quotes: keep the length, drop the meaning.
+			if r == quote {
+				quote = 0
+			}
+			if r == '\n' {
+				b.WriteRune('\n') // a newline still ends the line for the heredoc cut
+			} else {
+				b.WriteRune(' ')
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	// A heredoc's body is input to the command, not further commands. It
+	// starts on the next line, so keep only the line the operator appears on.
+	if i := strings.Index(out, "<<"); i >= 0 {
+		if nl := strings.Index(out[i:], "\n"); nl >= 0 {
+			out = out[:i+nl]
+		}
+	}
+	return out
 }
 
 // commandBase reduces an invocation token to the program's name: quotes off,

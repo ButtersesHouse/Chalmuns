@@ -276,3 +276,102 @@ func TestFromHook_findsOutputUnderAnyKnownKey(t *testing.T) {
 		}
 	}
 }
+
+// /code-review reports its findings by calling ReportFindings, whose payload
+// carries them as that call's *input*. Reading only tool responses missed the
+// one format this package names as its house shape and captured the skill's
+// own prose instead.
+func TestFromHook_reportFindingsIsTheReview(t *testing.T) {
+	ws := watchers(t, "code-review:skill")
+	payload := `{"tool_name":"ReportFindings","tool_input":{"findings":[{"file":"a.go","line":1,` +
+		`"summary":"Wrap errors with %w so callers can errors.Is them.","short_summary":"Wrap with %w"}],"level":"high"}}`
+
+	a, w, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok {
+		t.Fatal("a ReportFindings call is review output and should be captured")
+	}
+	if w.ID != "code-review" || a.Format != FormatFindings || len(a.Findings) != 1 {
+		t.Errorf("watcher=%q format=%q findings=%d", w.ID, a.Format, len(a.Findings))
+	}
+	if a.Findings[0].Title != "Wrap with %w" {
+		t.Errorf("findings not parsed: %+v", a.Findings[0])
+	}
+}
+
+// A watcher designated under another name still owns a reporting tool's
+// output — the payload names no skill, and discarding it would silently drop a
+// review the user asked to be watched.
+func TestFromHook_reportFindingsFallsBackToTheSkillWatcher(t *testing.T) {
+	ws := watchers(t, "security-review:skill")
+	payload := `{"tool_name":"ReportFindings","tool_input":{"findings":[{"file":"a.go","summary":"Never log tokens."}]}}`
+	_, w, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok || w.ID != "security-review" {
+		t.Errorf("ok=%v watcher=%q", ok, w.ID)
+	}
+
+	// With only command-line tools designated there is no skill to attribute
+	// it to, so nothing is captured.
+	if _, _, ok := FromHook([]byte(payload), watchers(t, "semgrep:tool"), fixed); ok {
+		t.Error("a tool-only designation must not absorb a skill's findings")
+	}
+}
+
+// For a non-reporting tool the input is the request, not the review. Capturing
+// it would file what someone asked for as what the reviewer said.
+func TestFromHook_ordinaryToolInputIsNotAReview(t *testing.T) {
+	ws := watchers(t, "code-review:skill")
+	payload := `{"tool_name":"Skill","tool_input":{"skill":"code-review","prompt":"review the diff for bugs"}}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("a call with no response carries no review")
+	}
+}
+
+// A slash command carries the skill in `command`. Without this a watcher
+// designated --kind skill — which is what the docs recommend for /code-review
+// — matched nothing, forever, with no error to show for it.
+func TestFromHook_slashCommandMatchesASkillWatcher(t *testing.T) {
+	ws := watchers(t, "code-review:skill")
+	payload := `{"tool_name":"SlashCommand","tool_input":{"command":"/code-review --fix"},` +
+		`"tool_response":"## A finding\n\nUse the shared logger everywhere."}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); !ok {
+		t.Error("a skill watcher must match its slash-command invocation")
+	}
+	if Match(ws, "SlashCommand", "", "/code-review --fix") == nil {
+		t.Error("Match should resolve the slash command to the skill")
+	}
+	// A different slash command is still not this reviewer.
+	if Match(ws, "SlashCommand", "", "/commit -m x") != nil {
+		t.Error("an unrelated slash command must not match")
+	}
+}
+
+// The invariant the whole capture path exists to hold: nothing is captured
+// from a tool that was not designated. Splitting on separators regardless of
+// quoting manufactured a command position inside quoted data, so an unrelated
+// tool's output was filed as the watched reviewer's.
+func TestMatch_quotedTextIsDataNotACommand(t *testing.T) {
+	ws := watchers(t, "semgrep:tool", "code-review:tool")
+	notRuns := []string{
+		`git commit -m 'fix; semgrep noise'`,
+		`git commit -m "fix; code-review feedback applied"`,
+		`echo "(semgrep is noisy)"`,
+		`git commit -F- <<'EOF'` + "\nsemgrep now runs on every PR\nEOF",
+		`printf '%s\n' "a | semgrep b"`,
+	}
+	for _, cmd := range notRuns {
+		if Match(ws, "Bash", "", cmd) != nil {
+			t.Errorf("not a run of the watched tool, but matched: %q", cmd)
+		}
+	}
+	// Real invocations still match, including after a genuine separator.
+	realRuns := []string{
+		`semgrep --json .`,
+		`git add -A; semgrep --json .`,
+		`echo "hi" && semgrep scan`,
+	}
+	for _, cmd := range realRuns {
+		if Match(ws, "Bash", "", cmd) == nil {
+			t.Errorf("a real invocation was missed: %q", cmd)
+		}
+	}
+}

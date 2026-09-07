@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // The review cache mirrors the PR raw-cache: one JSON file per captured
@@ -43,11 +44,31 @@ func WriteArtifact(cacheDir string, a Artifact) (written bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// The temp file must be unique per writer, not per artifact. A fixed
+	// "<path>.tmp" is shared by every process writing that ReviewID, and two
+	// captures of one review are entirely ordinary — the hook firing while the
+	// user runs `capture-review --file` on the same report, or two parallel
+	// calls of a watched tool whose output is identical. Two writers of
+	// different lengths interleaving on one temp file left a permanently
+	// corrupt artifact: the early-return above means no later capture ever
+	// repairs it, ListArtifacts skips it with a warning, and the review is
+	// never mined.
+	tmp, err := os.CreateTemp(cacheDir, a.ReviewID+".*.tmp")
+	if err != nil {
 		return false, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return false, err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
 		return false, err
 	}
 	return true, nil
@@ -93,15 +114,28 @@ func ListArtifacts(cacheDir string) ([]Artifact, error) {
 }
 
 // sortArtifacts orders by capture time, then ID so the order is total and
-// stable — two artifacts captured in the same second must not swap between
+// stable — two artifacts captured in the same instant must not swap between
 // runs, or a watermark could step over one of them.
 func sortArtifacts(as []Artifact) {
 	sort.Slice(as, func(i, j int) bool {
-		if as[i].CapturedAt != as[j].CapturedAt {
-			return as[i].CapturedAt < as[j].CapturedAt
+		ti, tj := capturedTime(as[i].CapturedAt), capturedTime(as[j].CapturedAt)
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
 		}
 		return as[i].ReviewID < as[j].ReviewID
 	})
+}
+
+// capturedTime parses a stamp for comparison. Stamps are compared as times
+// rather than as strings because the two are not equivalent once sub-second
+// precision is involved: "…05.5Z" sorts *before* "…05Z" lexically, so a string
+// compare would silently skip artifacts written by a different build. An
+// unparseable stamp sorts first, where it is visible rather than skipped.
+func capturedTime(s string) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 // LeanReview is the preprocessed view of one captured review handed to the
@@ -140,9 +174,14 @@ func Select(all []Artifact, ids []string, since string) []Artifact {
 	if since == "" {
 		return all
 	}
+	// Compared as times, not strings — see capturedTime. Stamps now carry
+	// sub-second precision so two captures in one second stay distinguishable;
+	// a second-resolution watermark from an older run still compares correctly
+	// because both sides are parsed.
+	mark := capturedTime(since)
 	var out []Artifact
 	for _, a := range all {
-		if a.CapturedAt > since {
+		if capturedTime(a.CapturedAt).After(mark) {
 			out = append(out, a)
 		}
 	}

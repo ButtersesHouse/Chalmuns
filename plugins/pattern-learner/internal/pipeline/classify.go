@@ -11,6 +11,9 @@ import (
 type classifySource struct {
 	PRNumber int    `json:"pr_number"`
 	Strength string `json:"strength,omitempty"` // "explicit" or "implicit" (empty = implicit)
+	// ReviewID marks a signal mined from a captured code review. Triage reads
+	// it to hold back a convention seen in only one review.
+	ReviewID string `json:"review_id,omitempty"`
 }
 
 // classifyInput is the minimal set of fields read from a candidate for classification.
@@ -81,13 +84,16 @@ func RunClassify(args []string) error {
 //	If max(source.pr_number) < cutoff: established → emerging; emerging → dropped.
 //	Explicit signals are exempt — a stated preference does not expire.
 //
-// A candidate with no PR source at all — every signal mined from a watched
-// code reviewer, and every rule from --add or --discover — is exempt too, and
-// this is not a detail. Recency is a judgement on the PR number line, and such
-// a candidate has no point on that line: its sources all report pr_number 0,
-// which is below every cutoff. Scoring them anyway silently dropped exactly
-// the implicit ones, so a convention a reviewing tool flagged four separate
-// times disappeared without ever reaching the approval prompt.
+// A candidate with no PR source at all is exempt too, and this is not a
+// detail. Recency is a judgement on the PR number line, and such a candidate
+// has no point on that line: its sources all report pr_number 0, which is
+// below every cutoff, so scoring them anyway drops the implicit ones outright
+// — a convention a watched reviewer flagged four separate times would
+// disappear before ever reaching the approval prompt.
+//
+// Review Mode is what makes this reachable. The other no-PR paths do not hit
+// it: --add rules bypass classify entirely, and --discover stamps its
+// synthetic source "explicit", which the exemption above already covers.
 func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (ClassifyResult, error) {
 	var result ClassifyResult
 

@@ -1594,11 +1594,33 @@ func sourceLabel(r state.Rule) string {
 		}
 		return "code review"
 	default:
-		if prs := prList(r.Sources); prs != "" {
+		// A PR-origin rule can hold review signals too: Step 8C merges an
+		// equivalent review candidate into the existing rule and keeps that
+		// rule's origin. Those sources carry pr_number 0, which prList used to
+		// render as "PR #0" — a citation to a pull request that does not
+		// exist, on exactly the rules the review path is meant to strengthen.
+		prs := prList(r.Sources)
+		reviewed := hasReviewSource(r.Sources)
+		switch {
+		case prs != "" && reviewed:
+			return "PRs " + prs + " and code review"
+		case prs != "":
 			return "PRs " + prs
+		case reviewed:
+			return "code review"
 		}
 		return "—"
 	}
+}
+
+// hasReviewSource reports whether any signal was mined from a captured review.
+func hasReviewSource(sources []state.Signal) bool {
+	for _, s := range sources {
+		if s.ReviewID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // reviewerNames lists the distinct reviewers behind a rule, for the source
@@ -1624,10 +1646,16 @@ func reviewerNames(sources []state.Signal) string {
 	return strings.Join(names, ", ")
 }
 
+// prList renders the distinct PRs behind a rule. Signals with no PR — a
+// merged review signal, a manual one — contribute nothing rather than a
+// "#0" citation.
 func prList(sources []state.Signal) string {
 	seen := map[int]bool{}
 	var nums []int
 	for _, s := range sources {
+		if s.PRNumber <= 0 {
+			continue
+		}
 		if !seen[s.PRNumber] {
 			seen[s.PRNumber] = true
 			nums = append(nums, s.PRNumber)

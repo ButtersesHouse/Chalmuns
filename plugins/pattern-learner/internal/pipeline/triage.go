@@ -85,7 +85,8 @@ func RunTriage(args []string) error {
 // Defer conditions (evaluated in order; first match wins):
 //  1. supersedes is non-empty
 //  2. conflicted == true
-//  3. signal_count == 1 AND all sources implicit (unless autoThreshold)
+//  3. signal_count == 1 AND every source is a code review (unless autoThreshold)
+//  4. signal_count == 1 AND all sources implicit (unless autoThreshold)
 func TriageAuto(rawRules []json.RawMessage, autoThreshold bool) ([]json.RawMessage, error) {
 	out := make([]json.RawMessage, 0, len(rawRules))
 	for _, raw := range rawRules {
@@ -152,12 +153,25 @@ func autoDecision(rule triageRule, autoThreshold bool) (string, string) {
 		return "defer", "conflict"
 	}
 	if !autoThreshold {
-		allImplicit := true
+		allImplicit, allReview := true, len(rule.Sources) > 0
 		for _, src := range rule.Sources {
 			if src.Strength == "explicit" {
 				allImplicit = false
-				break
 			}
+			if src.ReviewID == "" {
+				allReview = false
+			}
+		}
+		// A convention seen in exactly one code review is deferred whatever
+		// its strength. Strength cannot carry this judgement on the review
+		// path: a finding is marked explicit when it states a rule, and a
+		// linter states a rule id on every finding it emits, so one run of
+		// semgrep would otherwise auto-approve one standing rule per check it
+		// tripped, with nobody having read any of them. What makes a review
+		// finding a convention rather than a one-off defect is that it recurs,
+		// and one review cannot show recurrence.
+		if rule.SignalCount == 1 && allReview {
+			return "defer", "single-review"
 		}
 		if rule.SignalCount == 1 && allImplicit {
 			return "defer", "singleton"

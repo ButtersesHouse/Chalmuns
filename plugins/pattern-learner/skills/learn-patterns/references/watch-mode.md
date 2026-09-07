@@ -44,9 +44,15 @@ Choosing the flags:
 
 - `--kind` — `skill` for a Claude Code skill (`/code-review`, `/security-review`),
   `tool` for a command (`semgrep`, `eslint`, `golangci-lint`), `any` when the
-  user is not distinguishing. Default `any`. A `tool` watcher matches only
-  when the tool is the command actually being run: `semgrep --json .` matches,
-  `grep semgrep notes.txt` does not.
+  user is not distinguishing. **Default `any`, and prefer it unless the user
+  has a reason to narrow**: a reviewer can be reached as a skill call, a slash
+  command, or a wrapper script, and `any` matches all three. `skill` and `tool`
+  exist for the case where a tool and a skill share a name and capturing the
+  wrong one would misattribute the review.
+  A `tool` watcher matches only when the tool is the command actually being
+  run: `semgrep --json .` matches, `grep semgrep notes.txt` and
+  `git commit -m 'fix; semgrep noise'` do not — a name inside an argument or a
+  quoted string is data, not an invocation.
 - `--format` — leave at the default `auto` unless the user knows the tool emits
   a shape they want forced. `auto` sniffs each artifact, so a tool that emits
   JSON on one run and prose on the next is handled per capture.

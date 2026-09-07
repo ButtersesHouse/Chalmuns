@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -65,10 +66,12 @@ const maxArtifactBytes = 4 << 20 // 4 MiB
 // Artifact is the normalized on-disk form of one captured code review. It is
 // written to <cache-dir>/review-<ReviewID>.json.
 type Artifact struct {
-	// ReviewID is content-addressed: the same output captured twice yields the
-	// same ID and therefore the same file. That makes capture idempotent, which
-	// matters because the confidence model counts how many times a convention
-	// recurs — a hook that fires twice for one review must not look like two
+	// ReviewID is content-addressed over what the reviewer said — see
+	// artifactID. The same review captured twice yields the same ID and
+	// therefore the same file, which is what makes capture idempotent. That
+	// matters because the confidence model counts how many reviews a
+	// convention recurs across: a hook firing twice for one review, or a
+	// linter re-run over a finding nobody has fixed, must not read as two
 	// independent reviews agreeing.
 	ReviewID string `json:"review_id"`
 	// Source is the designated watcher's name ("code-review", "semgrep"), and
@@ -106,6 +109,13 @@ type Finding struct {
 	// Body is the reviewer's prose. This is the text a signal quotes, so it is
 	// stored as the tool wrote it.
 	Body string `json:"body"`
+	// Evidence is a second piece of the reviewer's prose that supports Body —
+	// a /code-review failure scenario, a SARIF rule description. It is a field
+	// of its own rather than being appended to Body because grounding checks
+	// containment: concatenating two separate statements creates a sentence
+	// spanning the join that the reviewer never wrote, and a quote of it would
+	// verify as verbatim.
+	Evidence string `json:"evidence,omitempty"`
 	// CodeBefore and CodeAfter are the flagged code and the suggested
 	// replacement when the tool provides them. They become a rule's
 	// dont_example and do_example, which is the highest-fidelity example
@@ -142,7 +152,8 @@ func Capture(in Input) (Artifact, error) {
 		return Artifact{}, fmt.Errorf("--source required: a captured review is attributed to the tool that produced it")
 	}
 	format := in.Format
-	if format == "" || format == FormatAuto {
+	sniffed := format == "" || format == FormatAuto
+	if sniffed {
 		format = Detect(in.Data)
 	}
 	if !ValidFormat(format) || format == FormatAuto {
@@ -153,6 +164,26 @@ func Capture(in Input) (Artifact, error) {
 	if err != nil {
 		return Artifact{}, err
 	}
+	// A parse that yields findings carrying none of the reviewer's words means
+	// the shape was guessed wrong — another tool's report that happens to use
+	// the same container key. Recording it would be the worst outcome
+	// available: capture reports N findings and succeeds, while the review's
+	// actual text reaches nobody, because the lean view sends RawText only
+	// when there are no findings at all. A sniffed format falls back to
+	// treating the input as prose, which always carries the text through; an
+	// explicitly-requested one is an error, because the caller asserted a
+	// shape the data does not have.
+	if !hasContent(findings) {
+		if !sniffed {
+			return Artifact{}, fmt.Errorf(
+				"parsed %d %s finding(s) but none carry any text; the input does not have the %s shape",
+				len(findings), format, format)
+		}
+		format = FormatMarkdown
+		if findings, err = parse(format, in.Data); err != nil {
+			return Artifact{}, err
+		}
+	}
 	for i := range findings {
 		findings[i].Index = i
 	}
@@ -162,26 +193,69 @@ func Capture(in Input) (Artifact, error) {
 		now = time.Now()
 	}
 	return Artifact{
-		ReviewID:   ReviewID(source, in.Data),
+		ReviewID:   artifactID(source, findings, in.Data),
 		Source:     source,
 		Format:     format,
-		CapturedAt: now.UTC().Format(time.RFC3339),
+		CapturedAt: now.UTC().Format(time.RFC3339Nano),
 		Label:      strings.TrimSpace(in.Label),
 		Findings:   findings,
 		RawText:    string(in.Data),
 	}, nil
 }
 
-// ReviewID derives an artifact's content-addressed ID. Source is part of the
-// digest so the same finding list arriving from two different watched tools
-// stays two artifacts — two tools agreeing is real corroboration and must not
-// collapse into one.
-func ReviewID(source string, data []byte) string {
+// artifactID derives an artifact's content-addressed ID from what the reviewer
+// actually said, not from the bytes it said it in.
+//
+// This distinction is the difference between counting evidence and inventing
+// it. The confidence model treats each artifact a rule cites as one
+// independent review, so two artifacts saying the same thing read as two
+// reviewers agreeing. Hashing raw bytes made that trivially false: re-running
+// a linter over a finding nobody has fixed yet emits a byte-different report
+// every time an unrelated edit shifts a line number, so an agent iterating on
+// a fix and re-linting five times manufactured a five-signal "established"
+// rule out of one unaddressed finding. Hashing the findings — without the line
+// numbers, which are exactly what shifts — makes a repeat of the same review
+// the same artifact, and re-capture the no-op it claims to be.
+//
+// Source stays in the digest: two *different* tools reporting the same thing
+// is real corroboration and must remain two artifacts.
+func artifactID(source string, findings []Finding, data []byte) string {
 	h := sha256.New()
 	h.Write([]byte(source))
 	h.Write([]byte{0})
-	h.Write(data)
+	if len(findings) == 0 {
+		// Nothing was parsed (prose, or a shape with no findings): the bytes
+		// are all the identity there is.
+		h.Write(data)
+	} else {
+		for _, f := range findings {
+			// Deliberately excludes Line, Index, Severity and Verdict —
+			// everything that can differ between two runs reporting the same
+			// unchanged problem.
+			for _, part := range []string{f.File, f.Title, f.Body, f.Evidence, f.CodeBefore, f.CodeAfter} {
+				h.Write([]byte(part))
+				h.Write([]byte{0})
+			}
+			h.Write([]byte{'\n'})
+		}
+	}
 	return fmt.Sprintf("rev-%x", h.Sum(nil)[:6])
+}
+
+// reReviewID is the exact shape artifactID mints. Grounding validates a
+// model-supplied review_id against it before joining it into a path.
+var reReviewID = regexp.MustCompile(`^rev-[0-9a-f]{12}$`)
+
+// ValidReviewID reports whether s is a well-formed artifact ID.
+//
+// This is a containment check, not a formatting nicety. A signal's review_id
+// arrives from the extraction subagent and names the file its snippet is
+// verified against; joined into a path unchecked, "../state" or
+// "../../../signals" points grounding at some other JSON file on disk, and
+// every fabricated quote in the batch verifies against it. The PR arm cannot
+// do this because a PR number is an int.
+func ValidReviewID(s string) bool {
+	return reReviewID.MatchString(s)
 }
 
 // Detect sniffs the shape of a captured review. It is deliberately
@@ -205,7 +279,11 @@ func Detect(data []byte) string {
 		if _, ok := t["runs"].([]interface{}); ok {
 			return FormatSARIF
 		}
-		if _, ok := t["findings"].([]interface{}); ok {
+		// "findings" is a popular container key (Snyk, Trivy, Security Hub all
+		// use it with their own vocabulary), so claim this shape only when an
+		// element actually looks like a ReportFindings entry. Guessing on the
+		// key alone parsed every foreign report into content-free findings.
+		if fs, ok := t["findings"].([]interface{}); ok && looksLikeFindings(fs) {
 			return FormatFindings
 		}
 		if results, ok := t["results"].([]interface{}); ok {
@@ -236,15 +314,35 @@ func Detect(data []byte) string {
 					return FormatESLint
 				}
 			}
-			_, hasFile := first["file"]
-			_, hasSummary := first["summary"]
-			_, hasFailure := first["failure_scenario"]
-			if hasFile && (hasSummary || hasFailure) {
+			if looksLikeFinding(first) {
 				return FormatFindings
 			}
 		}
 	}
 	return FormatMarkdown
+}
+
+// looksLikeFindings reports whether a decoded "findings" array carries the
+// ReportFindings vocabulary. An empty array is accepted — a clean review is a
+// legitimate capture, and there is nothing to misread.
+func looksLikeFindings(fs []interface{}) bool {
+	if len(fs) == 0 {
+		return true
+	}
+	first, ok := fs[0].(map[string]interface{})
+	return ok && looksLikeFinding(first)
+}
+
+// looksLikeFinding reports whether one decoded object carries at least one
+// field only a ReportFindings entry would have. "file" alone is not enough:
+// most report formats name a file.
+func looksLikeFinding(m map[string]interface{}) bool {
+	for _, key := range []string{"summary", "short_summary", "failure_scenario"} {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func parse(format string, data []byte) ([]Finding, error) {

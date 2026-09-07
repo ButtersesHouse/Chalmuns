@@ -224,11 +224,18 @@ func captureFromHook(args []string) {
 		return
 	}
 
-	// Prefer CLAUDE_PROJECT_DIR, as the guard does: a tool call made from a
-	// subdirectory must still find the project's designations.
+	// Resolve the project exactly as the guard does — CLAUDE_PROJECT_DIR, then
+	// the cwd the payload reports, then the process cwd. The payload step is
+	// not optional: a hook wired by hand, or run by anything that does not
+	// export CLAUDE_PROJECT_DIR, otherwise falls back to the tool call's own
+	// working directory, and a command run from a subdirectory then finds no
+	// state.json and captures nothing.
 	base := cliflags.Value(args, "--project-dir", "")
 	if base == "" {
 		base = os.Getenv("CLAUDE_PROJECT_DIR")
+	}
+	if base == "" {
+		base = review.PayloadCWD(payload)
 	}
 	if base == "" {
 		if cwd, err := os.Getwd(); err == nil {

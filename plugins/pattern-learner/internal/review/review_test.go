@@ -83,10 +83,15 @@ func TestCapture_findings(t *testing.T) {
 	if f.Title != "Wrap errors with %w" || f.Verdict != "CONFIRMED" {
 		t.Errorf("title/verdict wrong: %+v", f)
 	}
-	// summary and failure_scenario are both the reviewer's own words, and a
-	// rule may quote either, so both must survive into the body.
-	if !strings.Contains(f.Body, "wraps errors with %w") || !strings.Contains(f.Body, "errors.Is returns false") {
-		t.Errorf("body must carry summary and failure_scenario; got %q", f.Body)
+	// summary and failure_scenario are both the reviewer's own words and a
+	// rule may quote either, so both survive — in separate fields. Joining
+	// them would create a sentence spanning the seam that no one wrote, and
+	// grounding would accept a quote of it as verbatim.
+	if f.Body != "This codebase wraps errors with %w." {
+		t.Errorf("body should be the summary alone; got %q", f.Body)
+	}
+	if f.Evidence != "errors.Is returns false." {
+		t.Errorf("failure_scenario belongs in evidence; got %q", f.Evidence)
 	}
 }
 
@@ -113,9 +118,13 @@ func TestCapture_sarif(t *testing.T) {
 		t.Errorf("sarif finding wrong: %+v", f)
 	}
 	// The rule description is where the convention is actually stated; a
-	// result's terse message alone would rarely support a rule.
-	if !strings.Contains(f.Body, "Return errors as values") {
-		t.Errorf("rule description must be folded into the body; got %q", f.Body)
+	// result's terse message alone would rarely support a rule. It is carried
+	// in its own field for the same reason failure_scenario is.
+	if f.Body != "panic() used" {
+		t.Errorf("body should be the result message alone; got %q", f.Body)
+	}
+	if !strings.Contains(f.Evidence, "Return errors as values") {
+		t.Errorf("rule description belongs in evidence; got %q", f.Evidence)
 	}
 	if f.CodeBefore != "panic(err)" || f.CodeAfter != "return err" {
 		t.Errorf("snippet/fix wrong: before=%q after=%q", f.CodeBefore, f.CodeAfter)
@@ -366,5 +375,178 @@ func TestLean_textOnlyWhenUnstructured(t *testing.T) {
 	}
 	if lean[1].Text == "" {
 		t.Error("an unstructured review must send its text; there is nothing else to read")
+	}
+}
+
+// The single worst outcome this package can produce is recording the flagged
+// code as the example to imitate: the generated skill then instructs the agent
+// to write exactly what review rejected. Each case below did that.
+func TestCapture_markdownFenceLabellingIsNotInverted(t *testing.T) {
+	cases := []struct {
+		name, body, before, after string
+	}{
+		{
+			// A cue word anywhere in the paragraph used to outrank the label
+			// immediately above the fence, because after-cues were tested first.
+			name: "a stray cue in the prose does not outrank the label at the fence",
+			body: "## Wrap errors with %w\n\nAvoid returning bare errors; the fix is to wrap them.\n\n" +
+				"Before:\n\n```go\nreturn err\n```\n\nAfter:\n\n```go\nreturn fmt.Errorf(\"ctx: %w\", err)\n```\n",
+			before: "return err",
+			after:  `return fmt.Errorf("ctx: %w", err)`,
+		},
+		{
+			// "instead" belonged to the after-cues, so "Instead of:" — the most
+			// canonical before-label there is — read as an after-label.
+			name: "Instead of / Do this",
+			body: "## Use the shared logger\n\nInstead of:\n\n```go\nfmt.Println(msg)\n```\n\n" +
+				"Do this:\n\n```go\nlog.Info(msg)\n```\n",
+			before: "fmt.Println(msg)",
+			after:  "log.Info(msg)",
+		},
+		{
+			// Each sub-heading becomes its own finding, so a section's only
+			// label is its own title.
+			name:   "sub-headings label their own fences",
+			body:   "## Before\n\n```go\nreturn err\n```\n",
+			before: "return err",
+			after:  "",
+		},
+		{
+			name:   "Bad / Good",
+			body:   "## A rule\n\nBad:\n\n```go\nx()\n```\n\nGood:\n\n```go\ny()\n```\n",
+			before: "x()",
+			after:  "y()",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := capture(t, "code-review", FormatMarkdown, tc.body)
+			var before, after string
+			for _, f := range a.Findings {
+				if f.CodeBefore != "" {
+					before = f.CodeBefore
+				}
+				if f.CodeAfter != "" {
+					after = f.CodeAfter
+				}
+			}
+			if before != tc.before || after != tc.after {
+				t.Errorf("before=%q after=%q; want before=%q after=%q", before, after, tc.before, tc.after)
+			}
+		})
+	}
+}
+
+// An unclosed fence used to pair its own opener with the next fence's opener,
+// storing the reviewer's prose as code.
+func TestCapture_markdownUnclosedFenceStoresNoCode(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## A finding\n\nCurrently:\n\n```go\nfoo()\n\nPrefer:\n\n```go\nbar()\n```\n")
+	for _, f := range a.Findings {
+		if strings.Contains(f.CodeBefore, "Prefer:") || strings.Contains(f.CodeAfter, "Prefer:") {
+			t.Errorf("prose stored as code: before=%q after=%q", f.CodeBefore, f.CodeAfter)
+		}
+	}
+}
+
+// A non-ASCII byte in a path truncated the match, attributing the finding to a
+// file that does not exist.
+func TestCapture_markdownFileRefWithNonASCII(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## Ne paniquez pas — café/naïve.go:12\n\nUse errors, not panics.\n")
+	if got := a.Findings[0].File; got != "café/naïve.go" {
+		t.Errorf("file ref: want %q, got %q", "café/naïve.go", got)
+	}
+	if got := a.Findings[0].Line; got != 12 {
+		t.Errorf("line: want 12, got %d", got)
+	}
+}
+
+// Title is what the recurrence check recognises a repeated finding by, so
+// cutting it at a qualified identifier's dot loses that identity.
+func TestCapture_titleKeepsQualifiedIdentifiers(t *testing.T) {
+	cases := map[string]string{
+		`Don't call os.Exit in library code; return an error instead.`: "Don't call os.Exit in library code; return an error instead",
+		`Use v2.Client here, not the v1 shim.`:                         "Use v2.Client here, not the v1 shim",
+		`Prefer errors.Is over == for sentinel errors. It is safer.`:   "Prefer errors.Is over == for sentinel errors",
+	}
+	for summary, want := range cases {
+		a := capture(t, "code-review", FormatAuto,
+			`[{"file":"a.go","summary":`+jsonQuote(summary)+`}]`)
+		if got := a.Findings[0].Title; got != want {
+			t.Errorf("summary %q\n  got  %q\n  want %q", summary, got, want)
+		}
+	}
+}
+
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// A foreign report that merely uses a "findings" key must not parse to
+// content-free findings: capture would report success while the reviewer's
+// words reached nobody, because the lean view sends raw text only when there
+// are no findings at all.
+func TestCapture_foreignFindingsVocabularyFallsBackToProse(t *testing.T) {
+	body := `{"findings":[{"id":"SNYK-JS-1","title":"Avoid eval()","description":"eval is unsafe here",
+	  "location":{"path":"src/a.js","line":9}}]}`
+	a := capture(t, "scanner", FormatAuto, body)
+
+	if a.Format == FormatFindings {
+		t.Error("a foreign vocabulary must not be claimed as the ReportFindings shape")
+	}
+	lean := Lean([]Artifact{a})
+	if !strings.Contains(lean[0].Text, "eval is unsafe here") {
+		t.Errorf("the reviewer's words must still reach the extraction step; text=%q", lean[0].Text)
+	}
+}
+
+// Asking for a shape the data does not have is an error, not a silent
+// zero-finding capture.
+func TestCapture_explicitFormatWithNoContentErrors(t *testing.T) {
+	body := `{"findings":[{"id":"X","description":"d"}]}`
+	if _, err := Capture(Input{Data: []byte(body), Source: "x", Format: FormatFindings, Now: fixed}); err == nil {
+		t.Fatal("an explicit format whose data carries no text should error")
+	}
+}
+
+// The confidence model counts artifacts as independent reviews, so re-running
+// a tool over a finding nobody has fixed must not manufacture corroboration.
+func TestCapture_reRunOverAnUnfixedFindingIsTheSameReview(t *testing.T) {
+	first := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/repo/a.js","messages":[{"ruleId":"no-console","severity":2,"message":"Use the shared logger.","line":3}]}]`)
+	// Same unfixed finding after an unrelated edit shifted its line.
+	shifted := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/repo/a.js","messages":[{"ruleId":"no-console","severity":2,"message":"Use the shared logger.","line":4}]}]`)
+	if first.ReviewID != shifted.ReviewID {
+		t.Errorf("a line shift must not make a new review: %q vs %q", first.ReviewID, shifted.ReviewID)
+	}
+
+	// A genuinely different finding is still a different review.
+	other := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/repo/a.js","messages":[{"ruleId":"no-var","severity":2,"message":"Use let or const.","line":3}]}]`)
+	if other.ReviewID == first.ReviewID {
+		t.Error("a different finding must be a different review")
+	}
+}
+
+// The watermark is compared as a time, so sub-second stamps and the
+// second-resolution stamps older builds wrote both order correctly.
+func TestSelect_subSecondWatermark(t *testing.T) {
+	all := []Artifact{
+		{ReviewID: "rev-a", CapturedAt: "2026-01-01T10:00:05Z"},
+		{ReviewID: "rev-b", CapturedAt: "2026-01-01T10:00:05.4Z"},
+		{ReviewID: "rev-c", CapturedAt: "2026-01-01T10:00:05.9Z"},
+	}
+	sortArtifacts(all)
+	if all[0].ReviewID != "rev-a" || all[2].ReviewID != "rev-c" {
+		t.Fatalf("sub-second stamps sort after the whole second: %+v", all)
+	}
+	// A watermark written by an older build still selects the newer captures
+	// from the same second, which a string compare would have skipped.
+	got := Select(all, nil, "2026-01-01T10:00:05Z")
+	if len(got) != 2 {
+		t.Errorf("want the two sub-second captures, got %+v", got)
 	}
 }

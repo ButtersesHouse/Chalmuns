@@ -42,16 +42,12 @@ func parseFindings(data []byte) ([]Finding, error) {
 
 	out := make([]Finding, 0, len(list))
 	for _, f := range list {
-		// summary is the claim; failure_scenario is the evidence for it. Both
-		// are the reviewer's own words, and a rule may legitimately quote
-		// either, so both go in the body a signal can be grounded against.
-		body := strings.TrimSpace(f.Summary)
-		if fs := strings.TrimSpace(f.FailureScenario); fs != "" {
-			if body != "" {
-				body += "\n\n"
-			}
-			body += fs
-		}
+		// summary is the claim, failure_scenario the evidence for it, and a
+		// rule may quote either — so both are kept, in *separate* fields.
+		// Concatenating them into one body welded the end of one field to the
+		// start of the other, and grounding checks containment: a quote
+		// spanning that join passed verification as the reviewer's verbatim
+		// words when the reviewer never wrote that sentence.
 		title := strings.TrimSpace(f.ShortSummary)
 		if title == "" {
 			title = firstSentence(f.Summary)
@@ -62,12 +58,27 @@ func parseFindings(data []byte) ([]Finding, error) {
 			Category:  strings.TrimSpace(f.Category),
 			Severity:  strings.TrimSpace(f.Severity),
 			Title:     title,
-			Body:      body,
+			Body:      strings.TrimSpace(f.Summary),
+			Evidence:  strings.TrimSpace(f.FailureScenario),
 			CodeAfter: strings.TrimSpace(f.Suggestion),
 			Verdict:   strings.TrimSpace(f.Verdict),
 		})
 	}
 	return out, nil
+}
+
+// hasContent reports whether a parsed finding carries any of the reviewer's
+// words. A list of findings with none means the input used a `findings` key
+// with a different vocabulary (Snyk, Trivy, a bespoke report) and was only
+// guessed to be this format — see Capture, which falls back rather than
+// recording a review whose text never reaches the extraction step.
+func hasContent(fs []Finding) bool {
+	for _, f := range fs {
+		if f.Title != "" || f.Body != "" || f.Evidence != "" {
+			return true
+		}
+	}
+	return len(fs) == 0
 }
 
 // --- SARIF 2.1.0 ---
@@ -137,17 +148,18 @@ func parseSARIF(data []byte) ([]Finding, error) {
 		}
 		for _, res := range run.Results {
 			body := strings.TrimSpace(res.Message.Text)
-			if d := desc[res.RuleID]; d != "" && d != body {
-				if body != "" {
-					body += "\n\n"
-				}
-				body += d
-			}
 			f := Finding{
 				Title:    strings.TrimSpace(res.RuleID),
 				Severity: strings.TrimSpace(res.Level),
 				Body:     body,
 				Verdict:  strings.TrimSpace(res.Level),
+			}
+			// The rule's own description is where the convention is stated,
+			// and a rule may quote it — but it is separate prose from the
+			// result message, so it is kept in its own field. Joining them
+			// would let a snippet span the seam and still ground.
+			if d := desc[res.RuleID]; d != "" && d != body {
+				f.Evidence = d
 			}
 			if len(res.Locations) > 0 {
 				phys := res.Locations[0].PhysicalLocation
@@ -257,16 +269,72 @@ var (
 	// write-ups nest inconsistently.
 	reMDHeading = regexp.MustCompile(`(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$`)
 	// A file reference: "internal/api/handler.go:42" or ":L42". The path must
-	// carry an extension so ordinary prose containing a colon is not read as
-	// a location.
-	reMDFileRef = regexp.MustCompile(`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+):L?(\d+)`)
-	reMDFence   = regexp.MustCompile("(?s)```[^\n]*\n(.*?)```")
+	// carry an extension so ordinary prose containing a colon is not read as a
+	// location. The character class excludes only separators and punctuation
+	// that cannot appear in a path — an ASCII-only class silently truncated
+	// any path containing a non-ASCII byte ("café/naïve.go:12" matched as
+	// "ve.go"), attributing the finding to a file that does not exist.
+	reMDFileRef = regexp.MustCompile(`([^\s:;,()\[\]{}'"<>|*?]+\.[A-Za-z0-9]+):L?(\d+)`)
 	// Words that label the fence that follows them. Kept narrow on purpose:
 	// guessing wrong swaps a rule's do and don't examples, which teaches the
-	// opposite of the convention.
-	reBeforeCue = regexp.MustCompile(`(?i)\b(before|current|currently|don't|do not|avoid|instead of|problem|found|flagged)\b`)
-	reAfterCue  = regexp.MustCompile(`(?i)\b(after|instead|prefer|should be|suggested|suggestion|fix|fixed|do this|correct)\b`)
+	// exact opposite of the convention. "instead" is deliberately absent from
+	// both lists: "instead of X" labels the code to avoid and "use X instead"
+	// labels the code to write, so the word alone decides nothing.
+	reBeforeCue = regexp.MustCompile(`(?i)\b(before|current|currently|don'?t|do not|avoid|instead of|problem|issue|flagged|bad|wrong|anti-?pattern)\b`)
+	reAfterCue  = regexp.MustCompile(`(?i)\b(after|prefer|preferred|should be|suggested|suggestion|fix|fixed|do this|correct|better|good|use this)\b`)
 )
+
+// fenceBlock is one closed fenced code block and where it sits in the section.
+type fenceBlock struct {
+	start int // byte offset of the opening fence line
+	end   int // byte offset just past the closing fence line
+	code  string
+}
+
+// fenceBlocks finds the closed code fences in s, scanning line by line rather
+// than by regex because fences are stateful. A pattern pairing "```…" with the
+// next "```" cannot tell an opener from a closer, so a review with an unclosed
+// fence had that opener paired with the *next block's* opener and stored the
+// reviewer's prose in between as code. Here an opener runs until a line that
+// is nothing but backticks, and a fence left unclosed at the end of the
+// section is dropped: its extent is unknown, and guessing it is how prose ends
+// up recorded as an example.
+func fenceBlocks(s string) []fenceBlock {
+	var out []fenceBlock
+	var open, nested bool
+	var block fenceBlock
+	var buf strings.Builder
+	offset := 0
+	for _, line := range strings.SplitAfter(s, "\n") {
+		bare := strings.TrimLeft(strings.TrimRight(line, "\r\n"), " \t")
+		isFence := strings.HasPrefix(bare, "```")
+		switch {
+		case !open && isFence:
+			open, nested = true, false
+			block = fenceBlock{start: offset}
+			buf.Reset()
+		case open && isFence && strings.Trim(bare, "`") == "":
+			block.end = offset + len(line)
+			block.code = buf.String()
+			// A block that swallowed another opening fence means the writer
+			// forgot a closing one: by the letter of the syntax everything up
+			// to the next bare ``` is code, but in a review it is the
+			// reviewer's prose plus the next example. Dropping the block loses
+			// an example; keeping it files prose as the code to imitate.
+			if !nested {
+				out = append(out, block)
+			}
+			open = false
+		case open:
+			if isFence {
+				nested = true
+			}
+			buf.WriteString(line)
+		}
+		offset += len(line)
+	}
+	return out
+}
 
 // parseMarkdown splits a prose review into one finding per heading. A document
 // with no headings yields no findings: the review is still captured whole in
@@ -307,7 +375,10 @@ func parseMarkdown(text string) []Finding {
 				f.Line = n
 			}
 		}
-		f.CodeBefore, f.CodeAfter = labelledFences(section)
+		// The heading labels the section's first fence: a review written as
+		// "### Before" / fence / "### After" / fence splits into one finding
+		// per heading, and each one's only label is its own title.
+		f.CodeBefore, f.CodeAfter = labelledFences(title + "\n" + section)
 		out = append(out, f)
 	}
 	return out
@@ -317,22 +388,66 @@ func parseMarkdown(text string) []Finding {
 // the text right above a fence says which it is. An unlabelled fence is left
 // out rather than assigned by position: a review that shows only the offending
 // code would otherwise have it recorded as the example to imitate.
+//
+// The label is the cue *nearest* the fence, not the first cue found anywhere
+// above it. Testing one list before the other made any stray cue word in the
+// paragraph outrank the label immediately above the code — "…the fix is to
+// wrap them.\n\nBefore:\n```go" put the flagged code under "do", which teaches
+// the reverse of what the reviewer wrote.
 func labelledFences(section string) (before, after string) {
-	for _, loc := range reMDFence.FindAllStringSubmatchIndex(section, -1) {
-		code := strings.TrimRight(section[loc[2]:loc[3]], "\n")
-		lead := section[:loc[0]]
-		// Only the run of text since the previous fence labels this one.
-		if cut := strings.LastIndex(lead, "```"); cut >= 0 {
-			lead = lead[cut+3:]
-		}
-		switch {
-		case reAfterCue.MatchString(lead) && after == "":
-			after = code
-		case reBeforeCue.MatchString(lead) && before == "":
-			before = code
+	prevEnd := 0
+	for _, block := range fenceBlocks(section) {
+		code := strings.TrimRight(block.code, "\n")
+		// Only the run of text since the previous fence closed can label this
+		// one; anything earlier belongs to the previous example.
+		lead := section[prevEnd:block.start]
+		prevEnd = block.end
+		switch nearestCue(lead) {
+		case cueAfter:
+			if after == "" {
+				after = code
+			}
+		case cueBefore:
+			if before == "" {
+				before = code
+			}
 		}
 	}
 	return before, after
+}
+
+type cue int
+
+const (
+	cueNone cue = iota
+	cueBefore
+	cueAfter
+)
+
+// nearestCue reports which kind of label sits closest to the end of lead —
+// i.e. closest to the fence it introduces. An equal position (no match of
+// either kind) leaves the fence unlabelled, which drops it rather than
+// guessing.
+func nearestCue(lead string) cue {
+	b := lastMatch(reBeforeCue, lead)
+	a := lastMatch(reAfterCue, lead)
+	switch {
+	case a > b:
+		return cueAfter
+	case b > a:
+		return cueBefore
+	default:
+		return cueNone
+	}
+}
+
+// lastMatch returns the start offset of re's last match in s, or -1.
+func lastMatch(re *regexp.Regexp, s string) int {
+	locs := re.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return -1
+	}
+	return locs[len(locs)-1][0]
 }
 
 // --- shared helpers ---
@@ -347,11 +462,21 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // firstSentence is the fallback title for a finding whose tool gave none.
+// A period only ends a sentence when whitespace follows it: cutting at any
+// period turned "Don't call os.Exit in library code" into "Don't call os",
+// and Title is what the recurrence check recognises a repeated finding by.
 func firstSentence(s string) string {
 	s = strings.TrimSpace(s)
-	if i := strings.IndexAny(s, ".\n"); i > 0 {
+	if i := strings.Index(s, "\n"); i > 0 {
 		s = s[:i]
 	}
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '.' && (s[i+1] == ' ' || s[i+1] == '\t') {
+			s = s[:i]
+			break
+		}
+	}
+	s = strings.TrimSuffix(s, ".")
 	const maxTitle = 80
 	if len([]rune(s)) > maxTitle {
 		s = string([]rune(s)[:maxTitle])
