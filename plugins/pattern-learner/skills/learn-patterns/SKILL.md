@@ -542,7 +542,10 @@ top-level instruction file is hand-maintained and lives in the user's git
 history. Publishing there is a separate, explicitly-requested step (Step 12.6).
 
 Use `--skills-dir` to target a non-default skills directory; when omitted,
-`--output-dir` provides the base (`<dir>/.claude/skills`).
+`--output-dir` provides the base (`<dir>/.claude/skills`). A relative `--skills-dir`
+is resolved against `--output-dir`, and `--output-dir` itself defaults to the root of
+the repository the state file lives in — never the shell's current directory — so the
+invocation below behaves the same from any directory.
 
 **Typical invocation:**
 ```

@@ -65,6 +65,11 @@ type PromoteOptions struct {
 	// it, a missing file is skipped rather than created, so `promote` can
 	// never introduce a repo-root file the user did not ask for.
 	Create bool
+	// RelativeLinks makes the block link the skill files relative to the
+	// target's directory even when SkillsDir is absolute. The CLI sets it
+	// when the skills directory lies inside the repository, where an
+	// absolute path would only hold on one machine.
+	RelativeLinks bool
 }
 
 // Promote writes the managed block into path. It never modifies content
@@ -77,7 +82,7 @@ func Promote(s state.State, path string, opts PromoteOptions) (PromoteResult, er
 		skillsDir = filepath.Join(filepath.Dir(path), ".claude", "skills")
 	}
 
-	block := renderPromotedBlock(s, path, skillsDir)
+	block := renderPromotedBlock(s, path, skillsDir, opts.RelativeLinks)
 	if block == "" {
 		res.Outcome, res.Reason = PromoteSkipped, "no approved rules to promote"
 		return res, nil
@@ -156,7 +161,7 @@ func spliceBlock(doc, block string) (string, PromoteOutcome, error) {
 //
 // The index is the point of this block for Claude Code (which auto-loads
 // .claude/skills itself) and the whole point for agents that do not.
-func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
+func renderPromotedBlock(s state.State, targetPath, skillsDir string, relativeLinks bool) string {
 	universal := approvedRules(s, UniversalLocation)
 	omitted := 0
 	if len(universal) > maxCLAUDERules {
@@ -167,13 +172,13 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 	// Paths in the block are written relative to the target file's directory
 	// where possible, so the file reads the same from any checkout location.
 	// Links are relative to the target file's directory whenever that is
-	// meaningful: a skills directory given relatively (the CLI's
-	// ".claude/skills") is linked relatively even when the target sits
-	// below the repo root and the link must climb out ("../.claude/..."),
-	// and so is the default skills directory under the target's own tree.
-	// An absolute skills directory elsewhere is a fixed location the user
-	// chose, and a relative path to it would only hold from one checkout,
-	// so it is linked as given.
+	// meaningful: a skills directory given relatively (or flagged as
+	// inside the repository by relativeLinks) is linked relatively even
+	// when the target sits below the repo root and the link must climb
+	// out ("../.claude/..."), and so is the default skills directory under
+	// the target's own tree. An absolute skills directory elsewhere is a
+	// fixed location the user chose, and a relative path to it would only
+	// hold from one checkout, so it is linked as given.
 	relRef := func(parts ...string) string {
 		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
 		// Compare absolute forms so a relative skills dir and an absolute
@@ -187,7 +192,7 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 		if err != nil {
 			return ref
 		}
-		if !filepath.IsAbs(ref) || !IsOutsideRel(rel) {
+		if relativeLinks || !filepath.IsAbs(ref) || !IsOutsideRel(rel) {
 			return rel
 		}
 		return ref

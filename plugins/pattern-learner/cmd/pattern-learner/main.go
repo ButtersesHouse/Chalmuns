@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -152,7 +153,7 @@ func runWriteOutputs(args []string) error {
 	}
 	opts := output.Options{
 		RAGHints:  ragHints,
-		SkillsDir: flagValue(args, "--skills-dir", ""),
+		SkillsDir: resolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir),
 		Owner:     owner,
 		RepoRoot:  root,
 	}
@@ -174,6 +175,20 @@ func runWriteOutputs(args []string) error {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	return err
+}
+
+// resolveSkillsDir applies the --skills-dir default and resolves a relative
+// value against the output directory rather than the process cwd, so the
+// skills, the example anchoring and the shared-directory judgement all
+// share one base wherever the command was run from.
+func resolveSkillsDir(flag, outputDir string) string {
+	if flag == "" {
+		return filepath.Join(outputDir, ".claude", "skills")
+	}
+	if filepath.IsAbs(flag) {
+		return flag
+	}
+	return filepath.Join(outputDir, flag)
 }
 
 // repoRoot finds the root of the repository a run writes for, which decides
@@ -263,10 +278,7 @@ func runPromote(args []string) error {
 		return err
 	}
 
-	skillsDir := flagValue(args, "--skills-dir", "")
-	if skillsDir == "" {
-		skillsDir = filepath.Join(outputDir, ".claude", "skills")
-	}
+	skillsDir := resolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir)
 
 	// Default to AGENTS.md (the cross-agent convention) when no target is
 	// named; agents other than Claude Code have no other entry point.
@@ -283,7 +295,13 @@ func runPromote(args []string) error {
 		targets = append(targets, filepath.Join(outputDir, "AGENTS.md"))
 	}
 
-	opts := output.PromoteOptions{SkillsDir: skillsDir, Create: hasFlag(args, "--create")}
+	opts := output.PromoteOptions{
+		SkillsDir: skillsDir,
+		Create:    hasFlag(args, "--create"),
+		// Inside the repository a link must hold on every checkout, so it
+		// is written relative to the target file.
+		RelativeLinks: output.IsInside(skillsDir, outputDir),
+	}
 	results := make([]output.PromoteResult, 0, len(targets))
 	for _, t := range targets {
 		res, err := output.Promote(s, t, opts)
@@ -489,18 +507,14 @@ func newGlobMatcher(root string, globs []string) *globMatcher {
 }
 
 // files returns the files under root matching glob. The walk happens on
-// the first call and covers every glob the matcher was built with; a glob
-// it was not built with costs a walk of its own.
+// the first call and covers every glob the matcher was built with.
 func (m *globMatcher) files(glob string) []string {
 	if !m.walked {
 		m.walkAll()
 	}
-	if files, ok := m.matches[glob]; ok {
-		return files
-	}
-	files := newGlobMatcher(m.root, []string{glob}).files(glob)
-	m.matches[glob] = files
-	return files
+	// Every caller registers all its globs up front; an unregistered one
+	// simply has no matches rather than costing a walk of its own.
+	return m.matches[glob]
 }
 
 // walkAll resolves every registered glob: plain globs through
@@ -544,8 +558,6 @@ func (m *globMatcher) walkAll() {
 	if len(walkPatterns) == 0 {
 		return
 	}
-	lastMatched := map[string]int{}
-	generation := 0
 	filepath.WalkDir(m.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -561,16 +573,11 @@ func (m *globMatcher) walkAll() {
 			return nil
 		}
 		segs := strings.Split(filepath.ToSlash(rel), "/")
-		// A glob with several "**" alternatives must list a file once;
-		// the generation counter dedups without allocating per file.
-		generation++
+		// A file matched by several alternatives of one glob is listed
+		// once by the deferred dedupMatches.
 		for _, wp := range walkPatterns {
-			if lastMatched[wp.glob] == generation {
-				continue
-			}
 			if matchSegments(wp.segs, segs) {
 				m.matches[wp.glob] = append(m.matches[wp.glob], p)
-				lastMatched[wp.glob] = generation
 			}
 		}
 		return nil
@@ -598,12 +605,14 @@ func (m *globMatcher) dedupMatches() {
 
 // escapeGlobMeta quotes the glob metacharacters in a literal path so it can
 // be joined with a pattern for filepath.Glob. Bracket classes work on every
-// platform, unlike a backslash escape.
+// platform, unlike a backslash escape; the backslash itself is an escape
+// character to filepath.Match everywhere but Windows, where it is the
+// separator and must pass through.
 func escapeGlobMeta(p string) string {
 	var b strings.Builder
 	for _, r := range p {
-		switch r {
-		case '*', '?', '[':
+		switch {
+		case r == '*' || r == '?' || r == '[' || (r == '\\' && runtime.GOOS != "windows"):
 			b.WriteRune('[')
 			b.WriteRune(r)
 			b.WriteRune(']')

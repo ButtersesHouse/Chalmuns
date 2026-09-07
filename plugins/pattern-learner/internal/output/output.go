@@ -103,6 +103,13 @@ func isSharedSkillsDir(skillsDir, outputDir string) bool {
 	return IsOutsideRel(rel)
 }
 
+// IsInside reports whether path lies within root (symlinks resolved), the
+// containment test the CLI uses to decide whether a skills directory is
+// the repository's own.
+func IsInside(path, root string) bool {
+	return !isSharedSkillsDir(path, root)
+}
+
 // IsOutsideRel reports whether a path returned by filepath.Rel points
 // outside the base it was computed from. It is the one implementation of
 // that test; a bare HasPrefix(rel, "..") would also match a sibling whose
@@ -373,6 +380,13 @@ func (p *plan) validateDisk() error {
 		case slotFile:
 			return fmt.Errorf("%s exists and is a file pattern-learner did not write; refusing to replace it — rename the domain or move the file, then rerun", skillDir)
 		case slotDir:
+			// A directory with none of the generated entries is what
+			// pruning leaves when a user kept files beside a skill that
+			// then lost all its rules; regeneration carries those files
+			// over, so it is free.
+			if !hasGeneratedEntries(skillDir) {
+				continue
+			}
 			existing = inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
 			if !existing.generated {
 				return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
@@ -633,7 +647,7 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			// else (a hand-written skill, another repository's) must not
 			// receive our files, so the copy is left and the user told.
 			liveInfo := inspectSkill(filepath.Join(live, "SKILL.md"), liveName)
-			ours := liveInfo.generated && (anyOwner || !liveInfo.stamped || liveInfo.stamp == owner)
+			ours := !hasGeneratedEntries(live) || (liveInfo.generated && (anyOwner || !liveInfo.stamped || liveInfo.stamp == owner))
 			if !ours {
 				if liveInfo.generated {
 					leftover(fmt.Sprintf("now belongs to repository %q", liveInfo.stamp))
@@ -642,8 +656,15 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 				}
 				continue
 			}
-			if err := carryOver(dir, live); err != nil {
+			kept, err := carryOver(dir, live)
+			if err != nil {
 				return warnings, err
+			}
+			if len(kept) > 0 {
+				// Same-named entries already in the live directory win;
+				// the older copies must not vanish unannounced.
+				leftover(fmt.Sprintf("already holds %s, so the older copies in the leftover were not moved", strings.Join(kept, ", ")))
+				continue
 			}
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -658,13 +679,25 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 // the user's and is carried over when the directory is regenerated.
 var generatedEntries = map[string]bool{"SKILL.md": true, "examples": true, "rules": true}
 
+// hasGeneratedEntries reports whether dir holds any entry the generator
+// writes (SKILL.md, examples/, rules/).
+func hasGeneratedEntries(dir string) bool {
+	for name := range generatedEntries {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // carryOver moves every entry of from that the generator does not write
 // into to, so files a user keeps beside a generated SKILL.md survive
-// regeneration. Entries to already has are left as they are.
-func carryOver(from, to string) error {
+// regeneration. An entry to already has is left as it is and reported in
+// kept, so the caller can tell the user before discarding from.
+func carryOver(from, to string) (kept []string, err error) {
 	entries, err := os.ReadDir(from)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	leftoverTmp := filepath.Base(tmpPath("SKILL.md"))
 	for _, e := range entries {
@@ -675,13 +708,14 @@ func carryOver(from, to string) error {
 		}
 		dst := filepath.Join(to, e.Name())
 		if _, err := os.Lstat(dst); err == nil {
+			kept = append(kept, e.Name())
 			continue
 		}
 		if err := os.Rename(filepath.Join(from, e.Name()), dst); err != nil {
-			return err
+			return kept, err
 		}
 	}
-	return nil
+	return kept, nil
 }
 
 // pruneStaleSkills removes generated skill directories under skillsDir whose
@@ -994,7 +1028,9 @@ func swapDir(staging, live, retired string) error {
 		return err
 	}
 	if hadLive {
-		if err := carryOver(retired, live); err != nil {
+		// A freshly rendered tree holds only generated entries, so nothing
+		// a user kept can collide and be left behind here.
+		if _, err := carryOver(retired, live); err != nil {
 			return err
 		}
 		return os.RemoveAll(retired)

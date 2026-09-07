@@ -331,8 +331,60 @@ func TestGlobMatcher(t *testing.T) {
 	if got := m.files("src/api/**/*.go"); len(got) != 1 || got[0] != filepath.Join(root, "src/api/h.go") {
 		t.Errorf("plain glob: got %v", got)
 	}
-	if got := m.files("docs/*.md"); len(got) != 1 {
-		t.Errorf("unregistered glob should still resolve: got %v", got)
+	if got := m.files("docs/*.md"); got != nil {
+		t.Errorf("an unregistered glob has no matches rather than a walk of its own: got %v", got)
+	}
+}
+
+// A relative --skills-dir resolves against the output directory, and the
+// default lives under it.
+func TestResolveSkillsDir(t *testing.T) {
+	if got := resolveSkillsDir("", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
+		t.Errorf("default: %q", got)
+	}
+	if got := resolveSkillsDir(".claude/skills", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
+		t.Errorf("relative: %q", got)
+	}
+	if got := resolveSkillsDir("/shared/skills", "/repo"); got != "/shared/skills" {
+		t.Errorf("absolute: %q", got)
+	}
+}
+
+// promote links relatively when the skills dir is inside the repository,
+// whatever form the path took, so the committed file holds on any checkout.
+func TestPromoteLinksRelativeInsideRepo(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	stateDir := filepath.Join(repo, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "Rule", Rule: "Do it.", Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "api", FileGlob: []string{"src/**/*.go"}},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "a", Snippet: "q", Strength: "explicit"}},
+	}}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(repo, "packages", "web", "CLAUDE.md")
+	if err := runPromote([]string{"--state", statePath, "--claude-md", target, "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "`" + filepath.Join("..", "..", ".claude", "skills", "api", "SKILL.md") + "`"
+	if !strings.Contains(string(content), want) {
+		t.Errorf("expected a relative link %s; got:\n%s", want, content)
+	}
+	if strings.Contains(string(content), repo) {
+		t.Error("the committed file must not carry a machine-specific absolute path")
 	}
 }
 

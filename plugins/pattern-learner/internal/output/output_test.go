@@ -2033,6 +2033,81 @@ func TestClassifySlot(t *testing.T) {
 	}
 }
 
+// A directory pruning left behind (only the user's files) is free for a
+// later regeneration, which carries those files over.
+func TestPrunedDirWithUserFilesIsRegenerable(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "v2", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("a pruned directory holding only user files must be regenerable: %v", err)
+	}
+	if got := readFile(t, filepath.Join(skillDir, "SKILL.md")); !strings.Contains(got, "v2") {
+		t.Error("skill should be regenerated")
+	}
+	if got := readFile(t, filepath.Join(skillDir, "notes.md")); got != "mine" {
+		t.Error("user file should be carried over")
+	}
+}
+
+// When a retired copy's user file collides with one already in the live
+// directory, the live one wins and the leftover is reported, not deleted.
+func TestCarryOverCollisionIsReported(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// The retired copy was restored (live was absent). Now simulate the
+	// interrupted-after-swap case: a live generated dir plus a retired copy
+	// whose notes.md collides with a newer live notes.md.
+	retired2 := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.MkdirAll(retired2, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired2, "notes.md"), []byte("older"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skills, "api", "notes.md"), []byte("newer"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	next := stateWith(approvedRule("Rule", "v2", "api", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "notes.md")); got != "newer" {
+		t.Error("the live copy must win")
+	}
+	if got := readFile(t, filepath.Join(retired2, "notes.md")); got != "older" {
+		t.Error("the older copy must be kept in the leftover")
+	}
+	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], "already holds notes.md") {
+		t.Errorf("expected a collision warning, got %v", w)
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)
