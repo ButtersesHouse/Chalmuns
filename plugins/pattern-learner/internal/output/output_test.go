@@ -1973,6 +1973,66 @@ func TestNormalizeOwnerKeyStripsGitSuffix(t *testing.T) {
 	}
 }
 
+// The swap never deletes a user's file or symlink that appeared at the
+// slot since validation; it refuses instead.
+func TestSwapRefusesForeignSlot(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0755); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(dir, "api")
+	if err := os.WriteFile(live, []byte("a note"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := swapDir(staging, live, filepath.Join(dir, "retired")); err == nil || !strings.Contains(err.Error(), "appeared since validation") {
+		t.Errorf("expected a refusal, got %v", err)
+	}
+	if got := readFile(t, live); got != "a note" {
+		t.Error("the user's file must be untouched")
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Error("staging is left for the caller to clear")
+	}
+}
+
+func TestClassifySlot(t *testing.T) {
+	dir := t.TempDir()
+	if got := classifySlot(filepath.Join(dir, "none")); got != slotAbsent {
+		t.Errorf("absent: %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifySlot(filepath.Join(dir, "file")); got != slotFile {
+		t.Errorf("file: %v", got)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "empty"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifySlot(filepath.Join(dir, "empty")); got != slotEmptyDir {
+		t.Errorf("empty: %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty", "x"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifySlot(filepath.Join(dir, "empty")); got != slotDir {
+		t.Errorf("dir: %v", got)
+	}
+	if err := os.Symlink(filepath.Join(dir, "empty"), filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if got := classifySlot(filepath.Join(dir, "link")); got != slotSymlinkDir {
+		t.Errorf("symlink dir: %v", got)
+	}
+	if err := os.Symlink(filepath.Join(dir, "gone"), filepath.Join(dir, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if got := classifySlot(filepath.Join(dir, "dangling")); got != slotDangling {
+		t.Errorf("dangling: %v", got)
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)

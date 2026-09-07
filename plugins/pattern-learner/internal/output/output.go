@@ -359,18 +359,24 @@ func (p *plan) validateDisk() error {
 		// conventions. A directory with no SKILL.md is foreign too, unless
 		// it is empty (nothing in it to lose).
 		skillDir := filepath.Join(skillsDir, domain)
-		// Regeneration replaces the directory wholesale, which would turn a
-		// symlinked domain into a real directory, strand the link target
-		// with a stale SKILL.md, and pull the user's files out of it. A
-		// link that still resolves is refused; a dangling one is cleared.
-		lst, lstErr := os.Lstat(skillDir)
-		_, statErr := os.Stat(skillDir)
-		if lstErr == nil && lst.Mode()&os.ModeSymlink != 0 && statErr == nil {
+		var existing skillInfo
+		switch classifySlot(skillDir) {
+		case slotAbsent, slotDangling, slotEmptyDir:
+			// Free (a dangling link is cleared by the swap).
+			continue
+		case slotSymlinkDir:
+			// Regeneration replaces the directory wholesale, which would
+			// turn a symlinked domain into a real directory, strand the
+			// link target with a stale SKILL.md, and pull the user's files
+			// out of it.
 			return fmt.Errorf("%s is a symlink; pattern-learner regenerates a domain directory by replacing it, which would break the link — replace it with a real directory, or point --skills-dir at the directory the link targets, then rerun", skillDir)
-		}
-		existing := inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
-		if statErr == nil && !existing.generated && !isEmptyDir(skillDir) {
-			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
+		case slotFile:
+			return fmt.Errorf("%s exists and is a file pattern-learner did not write; refusing to replace it — rename the domain or move the file, then rerun", skillDir)
+		case slotDir:
+			existing = inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
+			if !existing.generated {
+				return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
+			}
 		}
 		if shared {
 			// Any stamp that is not ours, including when this run has no
@@ -456,6 +462,40 @@ func parseOwnerLine(line string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(line, ownerStampPrefix), ownerStampSuffix), true
+}
+
+// slotKind is what occupies a domain's path in the skills directory. Every
+// place that has to decide what to do with that path (the overwrite guard,
+// interrupted-swap recovery, the swap itself) classifies it through
+// classifySlot, so their policies cannot drift apart.
+type slotKind int
+
+const (
+	slotAbsent     slotKind = iota // nothing there
+	slotDangling                   // a symlink to nothing
+	slotFile                       // a regular file (or other non-directory)
+	slotSymlinkDir                 // a symlink resolving to a directory
+	slotEmptyDir                   // a directory with nothing to lose
+	slotDir                        // a real directory with contents
+)
+
+func classifySlot(path string) slotKind {
+	lst, lstErr := os.Lstat(path)
+	if lstErr != nil {
+		return slotAbsent
+	}
+	fi, statErr := os.Stat(path)
+	switch {
+	case statErr != nil:
+		return slotDangling
+	case !fi.IsDir():
+		return slotFile
+	case lst.Mode()&os.ModeSymlink != 0:
+		return slotSymlinkDir
+	case isEmptyDir(path):
+		return slotEmptyDir
+	}
+	return slotDir
 }
 
 // isEmptyDir reports whether dir exists and holds nothing to lose: no
@@ -561,42 +601,28 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			leftover := func(why string) {
 				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, why))
 			}
-			// One look at the slot decides every case below.
-			lst, lstErr := os.Lstat(live)
-			fi, statErr := os.Stat(live)
-			switch {
-			case lstErr != nil || statErr != nil:
-				// Free, or only a dangling symlink (cleared, as swapDir
-				// would clear it): the retired copy goes back.
-				if lstErr == nil {
-					if err := os.RemoveAll(live); err != nil {
-						return warnings, err
-					}
-				}
-				if err := os.Rename(dir, live); err != nil {
-					return warnings, err
-				}
-				continue
-			case !fi.IsDir():
-				// A stray file is the user's and is left alone, like the
-				// overwrite guard leaves it.
-				leftover("is now a file that pattern-learner did not write")
-				continue
-			case lst.Mode()&os.ModeSymlink != 0:
-				// A resolving symlink is refused by validateDisk when the
-				// domain is live; folding our files through it first would
-				// move them into the link target before that refusal.
-				leftover("is now a symlink")
-				continue
-			case isEmptyDir(live):
-				// An empty directory (as validateDisk also allows) gives
-				// way to the retired copy wholesale.
+			switch classifySlot(live) {
+			case slotAbsent, slotDangling, slotEmptyDir:
+				// Free (a dangling link or an empty directory gives way,
+				// as the overwrite guard allows): the retired copy goes
+				// back wholesale.
 				if err := os.RemoveAll(live); err != nil {
 					return warnings, err
 				}
 				if err := os.Rename(dir, live); err != nil {
 					return warnings, err
 				}
+				continue
+			case slotFile:
+				// A stray file is the user's and is left alone, like the
+				// overwrite guard leaves it.
+				leftover("is now a file that pattern-learner did not write")
+				continue
+			case slotSymlinkDir:
+				// A resolving symlink is refused by validateDisk when the
+				// domain is live; folding our files through it first would
+				// move them into the link target before that refusal.
+				leftover("is now a symlink")
 				continue
 			}
 			// The live slot is taken. Our retired copy is folded into it
@@ -945,17 +971,21 @@ func renderSkillDir(dir, domain, desc string, globs []string, universal bool, ru
 // new one before the previous tree is removed.
 func swapDir(staging, live, retired string) error {
 	hadLive := false
-	if fi, err := os.Stat(live); err == nil && fi.IsDir() {
+	switch classifySlot(live) {
+	case slotDir, slotEmptyDir:
 		hadLive = true
 		if err := os.Rename(live, retired); err != nil {
 			return err
 		}
-	} else if _, err := os.Lstat(live); err == nil {
-		// A dangling symlink or a stray file at the live path: nothing to
-		// retire, but it must not block the rename.
+	case slotDangling:
+		// Nothing to retire, but the dead link must not block the rename.
 		if err := os.RemoveAll(live); err != nil {
 			return err
 		}
+	case slotFile, slotSymlinkDir:
+		// validateDisk refused these; one appearing since (the anchoring
+		// window) is the user's and is not deleted to make room.
+		return fmt.Errorf("%s appeared since validation and was not written by pattern-learner; rerun", live)
 	}
 	if err := os.Rename(staging, live); err != nil {
 		if hadLive {

@@ -252,7 +252,11 @@ func runPromote(args []string) error {
 	if statePath == "" {
 		return fmt.Errorf("--state required")
 	}
-	outputDir := flagValue(args, "--output-dir", ".")
+	// Same default as write-outputs: the repository the state lives in.
+	outputDir := flagValue(args, "--output-dir", "")
+	if outputDir == "" {
+		outputDir, _ = repoRoot(statePath, ".")
+	}
 
 	s, err := state.Read(statePath)
 	if err != nil {
@@ -520,18 +524,23 @@ func (m *globMatcher) walkAll() {
 			// anchoring is advisory and simply finds nothing for it.
 			continue
 		}
-		// Every alternative, "**" or not, is matched segment-wise during
-		// the one walk. Going through filepath.Glob for the plain ones
-		// would read glob metacharacters in the repository path itself
-		// ("proj[1]") as a pattern, and would list a file twice when a
-		// group has both a plain and a "**" alternative.
 		for _, g := range expanded {
 			// Globs are repository-relative; a leading "/" or "./" the
 			// model sometimes emits means the same thing.
 			cleaned := strings.TrimPrefix(path.Clean(filepath.ToSlash(g)), "/")
+			if !strings.Contains(cleaned, "**") {
+				// A plain glob is a few directory listings; only "**"
+				// needs the tree walk. The root is escaped so that glob
+				// metacharacters in the repository path ("proj[1]") are
+				// not read as a pattern.
+				found, _ := filepath.Glob(filepath.Join(escapeGlobMeta(m.root), filepath.FromSlash(cleaned)))
+				m.matches[glob] = append(m.matches[glob], found...)
+				continue
+			}
 			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(cleaned, "/")})
 		}
 	}
+	defer m.dedupMatches()
 	if len(walkPatterns) == 0 {
 		return
 	}
@@ -566,6 +575,43 @@ func (m *globMatcher) walkAll() {
 		}
 		return nil
 	})
+}
+
+// dedupMatches lists each file once per glob: a group with both a plain
+// and a "**" alternative can find the same file by both routes.
+func (m *globMatcher) dedupMatches() {
+	for glob, files := range m.matches {
+		if len(files) < 2 {
+			continue
+		}
+		seen := make(map[string]bool, len(files))
+		unique := files[:0]
+		for _, f := range files {
+			if !seen[f] {
+				seen[f] = true
+				unique = append(unique, f)
+			}
+		}
+		m.matches[glob] = unique
+	}
+}
+
+// escapeGlobMeta quotes the glob metacharacters in a literal path so it can
+// be joined with a pattern for filepath.Glob. Bracket classes work on every
+// platform, unlike a backslash escape.
+func escapeGlobMeta(p string) string {
+	var b strings.Builder
+	for _, r := range p {
+		switch r {
+		case '*', '?', '[':
+			b.WriteRune('[')
+			b.WriteRune(r)
+			b.WriteRune(']')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // matchSegments matches path segments against pattern segments where "**"

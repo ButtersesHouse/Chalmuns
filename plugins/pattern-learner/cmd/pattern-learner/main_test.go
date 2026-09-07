@@ -408,3 +408,38 @@ func TestGlobMatcherLeadingSlash(t *testing.T) {
 		}
 	}
 }
+
+// promote defaults its output directory to the state's repository, like
+// write-outputs, so the two agree on where AGENTS.md and the skills live.
+func TestPromoteDefaultsToStateRepo(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	stateDir := filepath.Join(repo, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	statePath := promoteState(t, stateDir)
+	if err := runPromote([]string{"--state", statePath, "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "AGENTS.md")); err != nil {
+		t.Errorf("AGENTS.md should be created at the state's repository root: %v", err)
+	}
+	if _, err := os.Stat("AGENTS.md"); err == nil {
+		t.Error("nothing should be written under the current directory")
+	}
+}
+
+func TestEscapeGlobMeta(t *testing.T) {
+	if got := escapeGlobMeta("/p[1]/a*b?c"); got != "/p[[]1]/a[*]b[?]c" {
+		t.Errorf("got %q", got)
+	}
+	root := filepath.Join(t.TempDir(), "p[1]")
+	writeTree(t, root, map[string]string{"a.go": "x\n"})
+	found, err := filepath.Glob(filepath.Join(escapeGlobMeta(root), "*.go"))
+	if err != nil || len(found) != 1 {
+		t.Errorf("escaped root should glob normally: %v, %v", found, err)
+	}
+}
