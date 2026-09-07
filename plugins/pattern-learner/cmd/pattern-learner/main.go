@@ -120,10 +120,10 @@ func runWriteOutputs(args []string) error {
 	// run from; an explicit --output-dir overrides it. The repository root
 	// is resolved once and reused for the shared-directory judgement.
 	outputDir := flagValue(args, "--output-dir", "")
-	root := repoRoot(statePath, ".")
+	root, inGit := repoRoot(statePath, ".")
 	if outputDir == "" {
 		outputDir = root
-	} else if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+	} else if !inGit {
 		// No git top level: the explicit output dir is the best root.
 		root = outputDir
 	}
@@ -182,15 +182,25 @@ func runWriteOutputs(args []string) error {
 // when the state is not under git, fall back to outputDir. Using the
 // current directory alone would misclassify a user-level skills directory
 // as repo-owned whenever the command is run from one of its ancestors.
-func repoRoot(statePath, outputDir string) string {
+func repoRoot(statePath, fallback string) (root string, ok bool) {
+	// Ask git from the state's logical location, not through whatever the
+	// path resolves to physically: a .claude/ that is a symlink into a
+	// dotfiles repository would otherwise name that repository. By
+	// convention the state lives at <repo>/.claude/pattern-learner/, so the
+	// directory above .claude/ is the place to ask from; any other layout
+	// asks from the state's own directory.
+	askFrom := filepath.Dir(statePath)
+	if filepath.Base(askFrom) == "pattern-learner" && filepath.Base(filepath.Dir(askFrom)) == ".claude" {
+		askFrom = filepath.Dir(filepath.Dir(askFrom))
+	}
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = filepath.Dir(statePath)
+	cmd.Dir = askFrom
 	if out, err := cmd.Output(); err == nil {
 		if top := strings.TrimSpace(string(out)); top != "" {
-			return top
+			return top, true
 		}
 	}
-	return outputDir
+	return fallback, false
 }
 
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
@@ -516,7 +526,10 @@ func (m *globMatcher) walkAll() {
 		// ("proj[1]") as a pattern, and would list a file twice when a
 		// group has both a plain and a "**" alternative.
 		for _, g := range expanded {
-			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(path.Clean(filepath.ToSlash(g)), "/")})
+			// Globs are repository-relative; a leading "/" or "./" the
+			// model sometimes emits means the same thing.
+			cleaned := strings.TrimPrefix(path.Clean(filepath.ToSlash(g)), "/")
+			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(cleaned, "/")})
 		}
 	}
 	if len(walkPatterns) == 0 {

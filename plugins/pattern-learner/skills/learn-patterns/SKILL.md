@@ -590,10 +590,12 @@ This writes:
     approved rules (renamed, merged, or all rejected), so an outdated skill cannot
     keep auto-loading. Only the generated entries (`SKILL.md`, `examples/`, `rules/`)
     are removed; any other file a user kept in that directory stays, and the
-    directory is removed only once it is empty. Inside the repo's own tree the stamp is ignored for this (a
-    fork or renamed repo still prunes skills stamped with its old identity); in a
-    skills directory **outside** the repo, only skills carrying this repo's stamp are
-    pruned. Skills the generator did not write (hand-written ones sharing the
+    directory is removed only once it is empty. Inside the repo's own tree, unstamped
+    generated skills and those stamped for this repo are pruned; one stamped for a
+    *different* repo (a leftover from before a fork or rename, or a skill the user
+    copied in from another repo on purpose) is left in place with a `warning:` line
+    naming it, since the two cases cannot be told apart. In a skills directory
+    **outside** the repo, only skills carrying this repo's stamp are pruned. Skills the generator did not write (hand-written ones sharing the
     directory) and skills another repo generated into a shared skills directory are
     never touched. A skill directory written by a very
     old build (no marker, none of the generator's fixed body sentences) carries no

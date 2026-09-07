@@ -217,7 +217,9 @@ func (pr *Prepared) Write() error {
 	// the overwrite guard: inside the repo's own tree every generated skill
 	// is ours whatever it is stamped with; in a shared directory only those
 	// stamped for this run are.
-	return pruneStaleSkills(p.skillsDir, p.byDomain, p.owner, !p.shared)
+	pruneWarnings, err := pruneStaleSkills(p.skillsDir, p.byDomain, p.owner, !p.shared)
+	pr.warnings = append(pr.warnings, pruneWarnings...)
+	return err
 }
 
 // Warnings reports conditions the run could not resolve on its own and the
@@ -361,13 +363,13 @@ func (p *plan) validateDisk() error {
 		// symlinked domain into a real directory, strand the link target
 		// with a stale SKILL.md, and pull the user's files out of it. A
 		// link that still resolves is refused; a dangling one is cleared.
-		if fi, err := os.Lstat(skillDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if _, err := os.Stat(skillDir); err == nil {
-				return fmt.Errorf("%s is a symlink; pattern-learner regenerates a domain directory by replacing it, which would break the link — replace it with a real directory, or point --skills-dir at the directory the link targets, then rerun", skillDir)
-			}
+		lst, lstErr := os.Lstat(skillDir)
+		_, statErr := os.Stat(skillDir)
+		if lstErr == nil && lst.Mode()&os.ModeSymlink != 0 && statErr == nil {
+			return fmt.Errorf("%s is a symlink; pattern-learner regenerates a domain directory by replacing it, which would break the link — replace it with a real directory, or point --skills-dir at the directory the link targets, then rerun", skillDir)
 		}
 		existing := inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
-		if _, err := os.Stat(skillDir); err == nil && !existing.generated && !isEmptyDir(skillDir) {
+		if statErr == nil && !existing.generated && !isEmptyDir(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 		}
 		if shared {
@@ -556,26 +558,45 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 		}
 		if liveName, ok := liveOfRetired(name); ok {
 			live := filepath.Join(skillsDir, liveName)
-			// The live slot is free when nothing is there or only a dangling
-			// symlink is (cleared, as swapDir would clear it). A stray file
-			// at the path is the user's and is left alone, like the
-			// overwrite guard leaves it.
-			if _, err := os.Lstat(live); err != nil {
+			leftover := func(why string) {
+				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, why))
+			}
+			// One look at the slot decides every case below.
+			lst, lstErr := os.Lstat(live)
+			fi, statErr := os.Stat(live)
+			switch {
+			case lstErr != nil || statErr != nil:
+				// Free, or only a dangling symlink (cleared, as swapDir
+				// would clear it): the retired copy goes back.
+				if lstErr == nil {
+					if err := os.RemoveAll(live); err != nil {
+						return warnings, err
+					}
+				}
 				if err := os.Rename(dir, live); err != nil {
 					return warnings, err
 				}
 				continue
-			}
-			if fi, err := os.Stat(live); err != nil {
+			case !fi.IsDir():
+				// A stray file is the user's and is left alone, like the
+				// overwrite guard leaves it.
+				leftover("is now a file that pattern-learner did not write")
+				continue
+			case lst.Mode()&os.ModeSymlink != 0:
+				// A resolving symlink is refused by validateDisk when the
+				// domain is live; folding our files through it first would
+				// move them into the link target before that refusal.
+				leftover("is now a symlink")
+				continue
+			case isEmptyDir(live):
+				// An empty directory (as validateDisk also allows) gives
+				// way to the retired copy wholesale.
 				if err := os.RemoveAll(live); err != nil {
 					return warnings, err
 				}
 				if err := os.Rename(dir, live); err != nil {
 					return warnings, err
 				}
-				continue
-			} else if !fi.IsDir() {
-				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s is now a file that pattern-learner did not write; move anything you want out of the leftover and delete it", dir, liveName, live))
 				continue
 			}
 			// The live slot is taken. Our retired copy is folded into it
@@ -585,32 +606,14 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			// directory one stamped for us or not stamped at all. Anything
 			// else (a hand-written skill, another repository's) must not
 			// receive our files, so the copy is left and the user told.
-			// A slot that is a resolving symlink is refused by validateDisk
-			// when the domain is live; folding our files through it first
-			// would move them into the link target before that refusal.
-			if lst, err := os.Lstat(live); err == nil && lst.Mode()&os.ModeSymlink != 0 {
-				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s is now a symlink; move anything you want out of the leftover and delete it", dir, liveName, live))
-				continue
-			}
-			// An empty directory at the slot (as validateDisk also allows)
-			// gives way to the retired copy wholesale.
-			if isEmptyDir(live) {
-				if err := os.RemoveAll(live); err != nil {
-					return warnings, err
-				}
-				if err := os.Rename(dir, live); err != nil {
-					return warnings, err
-				}
-				continue
-			}
 			liveInfo := inspectSkill(filepath.Join(live, "SKILL.md"), liveName)
 			ours := liveInfo.generated && (anyOwner || !liveInfo.stamped || liveInfo.stamp == owner)
 			if !ours {
-				holder := "was not written by pattern-learner"
 				if liveInfo.generated {
-					holder = fmt.Sprintf("now belongs to repository %q", liveInfo.stamp)
+					leftover(fmt.Sprintf("now belongs to repository %q", liveInfo.stamp))
+				} else {
+					leftover("was not written by pattern-learner")
 				}
-				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, holder))
 				continue
 			}
 			if err := carryOver(dir, live); err != nil {
@@ -664,11 +667,15 @@ func carryOver(from, to string) error {
 // skills and other repositories' generated skills sharing the root are
 // never removed.
 //
-// With anyOwner set (the repo's own tree) every generated skill is ours.
-// Otherwise (a shared directory) only a skill stamped for this owner is:
-// an unstamped one was written before stamping by some repository that
-// cannot be identified, and deleting another repository's conventions is
-// worse than leaving a stale skill for its owner to regenerate or remove.
+// With anyOwner set (the repo's own tree) every generated skill stamped for
+// this owner or not stamped at all is ours. One stamped for a different
+// repository is ambiguous even there: a fork or rename leaves stale skills
+// under the old identity, but a user may also have copied another
+// repository's generated skill in to reuse it. Deleting the latter is
+// worse than leaving the former, so such a skill is left in place and
+// reported (a live domain still regenerates and re-stamps it). In a shared
+// directory only a skill stamped for this owner is ours: an unstamped one
+// was written before stamping by some repository that cannot be identified.
 //
 // An entry is live when it exactly names a live domain. It is also treated
 // as live when it names one case-insensitively and the exact-cased directory
@@ -676,13 +683,13 @@ func carryOver(from, to string) error {
 // just written, showing under its older casing. When both casings exist as
 // separate entries (a case-sensitive filesystem after a re-cased domain),
 // the non-matching one is a stale skill and is pruned like any other.
-func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner string, anyOwner bool) error {
+func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner string, anyOwner bool) (warnings []string, err error) {
 	entries, err := os.ReadDir(skillsDir)
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	present := map[string]bool{}
 	for _, e := range entries {
@@ -725,17 +732,21 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		if !anyOwner && (!info.stamped || info.stamp != owner) {
 			continue
 		}
+		if anyOwner && info.stamped && info.stamp != owner {
+			warnings = append(warnings, fmt.Sprintf("%s is a generated skill stamped for repository %q with no approved rules in this state; it was left in place because it may have been copied in on purpose — delete it if it is a leftover from before this repository was forked or renamed", dir, info.stamp))
+			continue
+		}
 		if isLink {
 			if err := os.Remove(dir); err != nil {
-				return err
+				return warnings, err
 			}
 			continue
 		}
 		if err := removeGenerated(dir); err != nil {
-			return err
+			return warnings, err
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 // removeGenerated removes what the generator wrote in a stale skill
@@ -992,10 +1003,13 @@ func renderSkillHeader(domain, desc string, globs []string, universal bool, rule
 	}
 	b.WriteString("\n")
 	// "conventions" is already the noun, so don't render "Conventions Conventions".
-	if universal {
+	switch {
+	case universal:
 		b.WriteString("# Repo-Wide Conventions\n\n")
 		b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
-	} else {
+	case strings.EqualFold(headingTitle(domain), "Conventions"):
+		b.WriteString("# Conventions\n\n")
+	default:
 		b.WriteString(fmt.Sprintf("# %s Conventions\n\n", headingTitle(domain)))
 	}
 

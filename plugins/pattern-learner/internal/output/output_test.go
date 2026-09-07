@@ -919,10 +919,11 @@ func TestSharedDirLeavesUnstampedSkillsToTheirOwner(t *testing.T) {
 	}
 }
 
-// Inside the repo's own tree, ownership ignores the stamp for pruning as
-// well as for overwriting: after a fork or rename, a stale skill stamped
-// with the previous identity is still pruned.
-func TestForkPrunesStaleSkillWithOldStamp(t *testing.T) {
+// Inside the repo's own tree a stale skill stamped for a different
+// repository is ambiguous (a leftover from before a fork or rename, or a
+// skill copied in on purpose), so it is left in place and reported rather
+// than pruned; a live domain still regenerates it.
+func TestForeignStampedStaleSkillIsKeptAndReported(t *testing.T) {
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".claude", "skills")
 	a := stateWith(approvedRule("Rule", "do it", "components", "stated", 1))
@@ -932,11 +933,27 @@ func TestForkPrunesStaleSkillWithOldStamp(t *testing.T) {
 	}
 	fork := stateWith(approvedRule("Rule", "do it", "ui", "stated", 1))
 	fork.Repo = state.RepoInfo{Owner: "bob", Repo: "alpha"}
-	if err := Write(fork, dir, Options{}); err != nil {
+	prepared, err := Validate(&fork, dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
+		t.Error("a skill stamped for another repository must not be pruned silently")
+	}
+	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], `stamped for repository "acme/alpha"`) {
+		t.Errorf("expected a warning naming the foreign stamp, got %v", w)
+	}
+	// Unstamped and same-stamp stale skills are still pruned.
+	same := stateWith(approvedRule("Rule", "do it", "ui", "stated", 1))
+	same.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(same, dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(skills, "components")); !os.IsNotExist(err) {
-		t.Error("stale skill stamped with the old identity should be pruned inside the repo tree")
+		t.Error("a stale skill stamped for this repository should be pruned")
 	}
 }
 
@@ -1897,6 +1914,9 @@ func TestConventionsDomainWithoutUniversalRulesStaysGated(t *testing.T) {
 	}
 	if strings.Contains(content, "Repo-Wide Conventions") {
 		t.Error("scoped 'conventions' domain must not be presented as repo-wide")
+	}
+	if strings.Contains(content, "Conventions Conventions") || !strings.Contains(content, "# Conventions\n") {
+		t.Errorf("scoped 'conventions' domain should be headed '# Conventions'; got:\n%s", content)
 	}
 	// And its globs are validated like any other domain's.
 	bad := approvedRule("Legacy rule", "do it", UniversalSkillName, "stated", 1)

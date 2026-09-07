@@ -229,20 +229,45 @@ func TestRepoRoot(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	got := repoRoot(filepath.Join(stateDir, "state.json"), "/elsewhere")
+	got, ok := repoRoot(filepath.Join(stateDir, "state.json"), "/elsewhere")
 	want, _ := filepath.EvalSymlinks(repo)
-	if gotResolved, _ := filepath.EvalSymlinks(got); gotResolved != want {
-		t.Errorf("repoRoot = %q, want %q", got, want)
+	if gotResolved, _ := filepath.EvalSymlinks(got); !ok || gotResolved != want {
+		t.Errorf("repoRoot = %q, %v; want %q", got, ok, want)
 	}
-	// State outside any git repo: fall back to outputDir. The directory is
-	// its own repo-less location only if TMPDIR is not inside a checkout, so
-	// pin it with a nested git repo whose parent is the state dir.
-	if root := repoRoot(filepath.Join(t.TempDir(), "state.json"), "/fallback"); root != "/fallback" {
+	// State outside any git repo: fall back, and say so. A git repo with
+	// the state in a plain subdirectory keeps the fallback honest even
+	// when TMPDIR is inside a checkout.
+	if root, ok := repoRoot(filepath.Join(t.TempDir(), "state.json"), "/fallback"); ok {
 		// Inside a checkout this legitimately resolves to that checkout;
 		// only assert the fallback when git found nothing.
 		if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
 			t.Errorf("repoRoot fallback = %q, want /fallback", root)
 		}
+	} else if root != "/fallback" {
+		t.Errorf("repoRoot fallback = %q, want /fallback", root)
+	}
+
+	// A .claude/ that is a symlink into another repository must not make
+	// that repository the root: git is asked from the directory above
+	// .claude/, the project itself.
+	dotfiles := t.TempDir()
+	if out, err := exec.Command("git", "-C", dotfiles, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	if err := os.MkdirAll(filepath.Join(dotfiles, "claude", "pattern-learner"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	if out, err := exec.Command("git", "-C", project, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	if err := os.Symlink(filepath.Join(dotfiles, "claude"), filepath.Join(project, ".claude")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	got, ok = repoRoot(filepath.Join(project, ".claude", "pattern-learner", "state.json"), "/elsewhere")
+	wantProject, _ := filepath.EvalSymlinks(project)
+	if gotResolved, _ := filepath.EvalSymlinks(got); !ok || gotResolved != wantProject {
+		t.Errorf("repoRoot through a symlinked .claude = %q, %v; want the project %q", got, ok, wantProject)
 	}
 }
 
@@ -369,5 +394,17 @@ func TestResolveOwnerRejectsUnusableRemote(t *testing.T) {
 	}
 	if _, err := resolveOwner("", state.Empty(), repo); err == nil || !strings.Contains(err.Error(), "not a usable owner/repo") {
 		t.Errorf("expected an error for an unusable remote identity, got %v", err)
+	}
+}
+
+// A repo-relative glob written with a leading "/" or "./" matches the same
+// files as the plain form.
+func TestGlobMatcherLeadingSlash(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{"src/api/h.go": "a\n"})
+	for _, g := range []string{"/src/api/*.go", "./src/api/*.go", "/src/**/*.go"} {
+		if got := globFiles(root, g); len(got) != 1 {
+			t.Errorf("%s: got %v", g, got)
+		}
 	}
 }
