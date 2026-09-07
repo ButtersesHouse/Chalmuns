@@ -31,6 +31,10 @@ type ClassifyResult struct {
 //
 // Usage: classify --max-pr-seen <N> [--since-pr <N>]  (candidates JSON array on stdin)
 func RunClassify(args []string) error {
+	if err := checkFlags(args, []string{"--max-pr-seen", "--since-pr"}, nil); err != nil {
+		return err
+	}
+
 	maxPRStr := flagVal(args, "--max-pr-seen", "")
 	if maxPRStr == "" {
 		return fmt.Errorf("--max-pr-seen required")

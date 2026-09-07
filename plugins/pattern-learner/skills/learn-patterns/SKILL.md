@@ -1,7 +1,7 @@
 ---
 name: learn-patterns
-description: Extract coding conventions and developer preferences from this repo's PR review history and write approved rules into per-domain skill files under .claude/skills/ (never the repo's top-level CLAUDE.md — publishing there is a separate, opt-in promote step). Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions ("could we use X?"), skeptical critique ("interesting choice"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like "add a rule that…", "remember we always/never…", "make a convention that…", "save this as a rule", "let's standardize on…", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule.
-argumentHint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text]]"
+description: "Extract coding conventions and developer preferences from this repo's PR review history and write approved rules into per-domain skill files under .claude/skills/ (never the repo's top-level CLAUDE.md — publishing there is a separate, opt-in promote step). Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions (\"could we use X?\"), skeptical critique (\"interesting choice\"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like \"add a rule that…\", \"remember we always/never…\", \"make a convention that…\", \"save this as a rule\", \"let's standardize on…\", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule."
+argument-hint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text]]"
 ---
 
 # learn-patterns
@@ -72,20 +72,31 @@ If `--add` is set, jump to the **Add Mode** section after Step 4.
 **Binary build**: check whether `.claude/pattern-learner/bin/pattern-learner` exists in the current working directory (the target repo root).
 
 If it does not exist:
-1. Find the plugin root by running:
+1. Find the plugin root — the directory holding this plugin's `go.mod` and
+   `plugin.json`. Claude Code exports it directly, so prefer that:
    ```
-   find ~/.claude -name "go.mod" -path "*/Chalmuns/go.mod" 2>/dev/null | head -1 | xargs dirname
+   ROOT="$CLAUDE_PLUGIN_ROOT"
    ```
-   If nothing found, try: `find . -name "go.mod" -path "*/Chalmuns/go.mod" 2>/dev/null | head -1 | xargs dirname`
+   If `$CLAUDE_PLUGIN_ROOT` is empty (the skill was invoked outside a plugin
+   install, or by an agent that does not set it), search for it. Match on the
+   **plugin** directory, not the repository name — the module lives at
+   `plugins/pattern-learner/go.mod`, so a pattern anchored on the repo name
+   matches nothing:
+   ```
+   ROOT=$(find ~/.claude . -name go.mod -path "*/pattern-learner/go.mod" 2>/dev/null | head -1 | xargs -r dirname)
+   ```
+   If `ROOT` is still empty, **STOP** and report that the plugin source could
+   not be located; do not continue. (`xargs -r` is what keeps an empty result
+   from becoming a confusing `dirname: missing operand`.)
 
 2. Create the output directory:
    ```
    mkdir -p .claude/pattern-learner/bin
    ```
 
-3. Build the binary (CWD = plugin root found above):
+3. Build the binary (CWD = `$ROOT` from step 1):
    ```
-   go build -o <absolute_path_to_target_repo>/.claude/pattern-learner/bin/pattern-learner ./cmd/pattern-learner
+   cd "$ROOT" && go build -o <absolute_path_to_target_repo>/.claude/pattern-learner/bin/pattern-learner ./cmd/pattern-learner
    ```
 
 If the build fails, stop and report the error. Do not continue.

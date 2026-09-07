@@ -1,21 +1,19 @@
 package pipeline
 
-// flagVal extracts --flag value from args, returning def if not found.
+import "github.com/ButtersesHouse/Chalmuns/internal/cliflags"
+
+// The pipeline subcommands share the CLI's one flag parser. They used to
+// carry their own copy, which read only the "--flag value" form and
+// rejected nothing: `extract-lean --prs=1,2` silently became "no --prs"
+// and processed every PR in the cache.
 func flagVal(args []string, flag, def string) string {
-	for i, a := range args {
-		if a == flag && i+1 < len(args) {
-			return args[i+1]
-		}
-	}
-	return def
+	return cliflags.Value(args, flag, def)
 }
 
-// hasFlag reports whether a boolean flag appears in args.
 func hasFlag(args []string, flag string) bool {
-	for _, a := range args {
-		if a == flag {
-			return true
-		}
-	}
-	return false
+	return cliflags.Has(args, flag)
+}
+
+func checkFlags(args, valueFlags, boolFlags []string) error {
+	return cliflags.Check(args, valueFlags, boolFlags)
 }

@@ -41,6 +41,10 @@ type LeanPR struct {
 //
 // Usage: extract-lean --cache-dir <dir> [--prs 1,2,3]
 func RunExtractLean(args []string) error {
+	if err := checkFlags(args, []string{"--cache-dir", "--prs"}, nil); err != nil {
+		return err
+	}
+
 	cacheDir := flagVal(args, "--cache-dir", "")
 	if cacheDir == "" {
 		return fmt.Errorf("--cache-dir required")
