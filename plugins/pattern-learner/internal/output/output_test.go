@@ -3225,3 +3225,59 @@ func containsSubstring(haystack []string, want string) bool {
 	}
 	return false
 }
+
+// A rule mined from a watched code reviewer has no PR sources. It must name
+// the reviewers behind it rather than rendering an empty PR list, and it must
+// be exempt from the PR-watermark staleness warning — that warning measures
+// distance along a number line this rule was never on, so every review rule
+// would carry it from the first run.
+func TestWriteCodeReviewRuleSourceLabel(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_review", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "stated", Origin: "code-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{Reviewer: "code-review", ReviewID: "rev-abc123", Snippet: "this codebase wraps errors with %w", Strength: "explicit"},
+			{Reviewer: "semgrep", ReviewID: "rev-def456", Snippet: "wrap with %w", Strength: "implicit"},
+			{Reviewer: "code-review", ReviewID: "rev-999999", Snippet: "wrap with %w again", Strength: "implicit"},
+		},
+		LastSeenPR: 0,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 5000 // far past the staleness threshold
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	// Distinct reviewers, listed once each, so two tools agreeing is visible.
+	if !strings.Contains(content, "_Source: code review (code-review, semgrep)_") {
+		t.Errorf("want the reviewers named in the source label; got:\n%s", content)
+	}
+	if strings.Contains(content, "PRs #0") {
+		t.Error("a review rule must not render a bogus PR list")
+	}
+	if strings.Contains(content, "verify this convention is still current") {
+		t.Error("the PR-watermark staleness warning must not apply to a rule with no PR")
+	}
+}
+
+// With no reviewer names to list, the label still says where the rule came from.
+func TestWriteCodeReviewRuleSourceLabelWithoutReviewers(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_review2", Title: "Use the shared logger", Rule: "Use the shared logger",
+		Status: "approved", Confidence: "stated", Origin: "code-review",
+		Target:  state.Target{Location: "api"},
+		Sources: []state.Signal{{ReviewID: "rev-abc123", Snippet: "use the shared logger"}},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: code review_") {
+		t.Errorf("want a bare 'code review' label; got:\n%s", content)
+	}
+}

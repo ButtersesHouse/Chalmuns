@@ -74,11 +74,20 @@ func RunClassify(args []string) error {
 //   - Implicit (all sources implicit or empty):
 //     5+ signals → "established"; 1–4 → "emerging"
 //
-// Recency downgrade (implicit-only):
+// Recency downgrade (implicit-only, and only for candidates with at least one
+// PR source):
 //
 //	cutoff = maxPRSeen − (maxPRSeen − sincePR) × 0.5
 //	If max(source.pr_number) < cutoff: established → emerging; emerging → dropped.
 //	Explicit signals are exempt — a stated preference does not expire.
+//
+// A candidate with no PR source at all — every signal mined from a watched
+// code reviewer, and every rule from --add or --discover — is exempt too, and
+// this is not a detail. Recency is a judgement on the PR number line, and such
+// a candidate has no point on that line: its sources all report pr_number 0,
+// which is below every cutoff. Scoring them anyway silently dropped exactly
+// the implicit ones, so a convention a reviewing tool flagged four separate
+// times disappeared without ever reaching the approval prompt.
 func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (ClassifyResult, error) {
 	var result ClassifyResult
 
@@ -101,9 +110,13 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 
 		isExplicit := false
 		maxSourcePR := 0
+		hasPRSource := false
 		for _, src := range c.Sources {
 			if src.Strength == "explicit" {
 				isExplicit = true
+			}
+			if src.PRNumber > 0 {
+				hasPRSource = true
 			}
 			if src.PRNumber > maxSourcePR {
 				maxSourcePR = src.PRNumber
@@ -128,8 +141,10 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 		}
 
 		// Recency downgrade: implicit-only candidates whose most-recent source
-		// is older than the midpoint of the scanned range are suspect.
-		if !isExplicit && recencyCutoff > 0 && float64(maxSourcePR) < recencyCutoff {
+		// is older than the midpoint of the scanned range are suspect. A
+		// candidate with no PR source is not old, it is elsewhere — see the
+		// function doc.
+		if !isExplicit && hasPRSource && recencyCutoff > 0 && float64(maxSourcePR) < recencyCutoff {
 			switch confidence {
 			case "established":
 				confidence = "emerging"

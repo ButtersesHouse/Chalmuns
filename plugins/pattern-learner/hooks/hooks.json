@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Skill|SlashCommand|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" ]; then \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" capture-review --hook; fi"
+          }
+        ]
+      }
     ]
   }
 }

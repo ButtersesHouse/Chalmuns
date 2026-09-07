@@ -111,7 +111,7 @@ var (
 	reScriptFile = regexp.MustCompile(`(?i)\.(py|sh|rb|pl|bash|zsh|js|mjs|cjs|ts)$`)
 )
 
-const sanctioned = "Use the pattern-learner subcommands (extract-lean, verify-grounding, classify, triage, state-read/write, write-outputs, audit-format, promote) instead. If a needed capability is missing or a subcommand is broken, STOP and report it — do not write a workaround script."
+const sanctioned = "Use the pattern-learner subcommands (extract-lean, verify-grounding, classify, triage, state-read/write, write-outputs, watch, capture-review, extract-review, audit-format, promote) instead. If a needed capability is missing or a subcommand is broken, STOP and report it — do not write a workaround script."
 
 // forbiddenCommand returns a non-empty reason if the Bash command would
 // reimplement pipeline logic via an interpreter or ad-hoc script.

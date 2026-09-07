@@ -358,3 +358,64 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("output is not valid JSON: %v", err)
 	}
 }
+
+// Designations and the review watermark must survive a state round-trip:
+// state-write rewrites the whole file, and a dropped watcher would silently
+// stop every future capture from that reviewer.
+func TestWatchersAndReviewWatermarkRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	s := Empty()
+	s.Watchers = []Watcher{
+		{ID: "code-review", Name: "code-review", Kind: "skill", Format: "auto", AddedAt: "2026-01-15T10:04:00Z"},
+		{ID: "semgrep", Name: "semgrep", Kind: "tool", Format: "semgrep", AddedAt: "2026-01-15T10:05:00Z"},
+	}
+	s.LastIngestedReviewAt = "2026-01-15T10:06:00Z"
+	s.Rules = []Rule{{
+		Title: "Wrap errors with %w", Status: "approved", Confidence: "stated", Origin: "code-review",
+		Sources: []Signal{{Reviewer: "code-review", ReviewID: "rev-abc123", Snippet: "wrap with %w", Strength: "explicit"}},
+	}}
+
+	if err := Write(path, s); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.Watchers) != 2 || got.Watchers[0].ID != "code-review" || got.Watchers[1].Format != "semgrep" {
+		t.Errorf("watchers did not round-trip: %+v", got.Watchers)
+	}
+	if got.LastIngestedReviewAt != "2026-01-15T10:06:00Z" {
+		t.Errorf("review watermark did not round-trip: %q", got.LastIngestedReviewAt)
+	}
+	if got.Rules[0].Origin != "code-review" || got.Rules[0].Sources[0].ReviewID != "rev-abc123" {
+		t.Errorf("review provenance did not round-trip: %+v", got.Rules[0])
+	}
+}
+
+// A state written before this feature existed must still load, with the new
+// fields simply absent.
+func TestPreWatcherStateStillLoads(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := `{"schema_version":"1","repo":{"owner":"o","repo":"r"},"last_extracted_pr_number":42,
+	  "rules":[{"id":"rule_1","title":"t","rule":"r","status":"approved","confidence":"stated",
+	  "sources":[{"pr_number":42,"reviewer":"bob","snippet":"s","strength":"explicit"}]}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Watchers) != 0 || got.LastIngestedReviewAt != "" {
+		t.Errorf("absent fields should stay zero: %+v", got.Watchers)
+	}
+	if got.LastExtractedPRNumber != 42 || len(got.Rules) != 1 {
+		t.Errorf("existing state did not load: %+v", got)
+	}
+}

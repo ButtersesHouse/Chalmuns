@@ -29,13 +29,14 @@ import (
 // set is unchanged). Bump it whenever generated output or a subcommand's
 // behaviour changes, and update the expected value in SKILL.md and the
 // plugin manifest to match.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
 		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
+		fmt.Fprintln(os.Stderr, "             watch, capture-review, extract-review,")
 		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard, version")
 		os.Exit(1)
 	}
@@ -60,6 +61,12 @@ func main() {
 		err = pipeline.RunClassify(os.Args[2:])
 	case "triage":
 		err = pipeline.RunTriage(os.Args[2:])
+	case "watch":
+		err = runWatch(os.Args[2:])
+	case "capture-review":
+		err = runCaptureReview(os.Args[2:])
+	case "extract-review":
+		err = runExtractReview(os.Args[2:])
 	case "audit-format":
 		err = format.RunAuditFormat(os.Args[2:])
 	case "promote":

@@ -246,3 +246,59 @@ func TestClassify_refreshMode_noCutoff(t *testing.T) {
 		t.Fatal("should be kept when no range to compute cutoff")
 	}
 }
+
+// A candidate whose sources carry no PR number has no point on the PR number
+// line, so the recency downgrade must not touch it. It used to: pr_number 0
+// is below every cutoff, so an implicit candidate mined from a watched code
+// reviewer — or added by --add or --discover — was dropped before it ever
+// reached the approval prompt.
+func TestClassify_noPRSourceIsExemptFromRecency(t *testing.T) {
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {0, "implicit"}})
+
+	got := classifyOne(t, raw, 100, 0)
+	if got == nil {
+		t.Fatal("a candidate with no PR source must not be dropped by the recency downgrade")
+	}
+	if got["confidence"] != "emerging" {
+		t.Errorf("confidence: want emerging, got %v", got["confidence"])
+	}
+	if got["signal_count"] != float64(2) {
+		t.Errorf("signal_count: want 2, got %v", got["signal_count"])
+	}
+}
+
+// The exemption is for candidates with no PR at all; a genuinely stale
+// PR-derived candidate must still be dropped.
+func TestClassify_stalePRCandidateStillDropped(t *testing.T) {
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{5, "implicit"}})
+
+	if got := classifyOne(t, raw, 100, 0); got != nil {
+		t.Errorf("an old implicit PR candidate should still be dropped; got %v", got)
+	}
+}
+
+// A candidate mixing review and PR sources is judged on the PR sources it has:
+// the review source contributes no recency information either way.
+func TestClassify_mixedSourcesJudgedOnPRSources(t *testing.T) {
+	stale := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {5, "implicit"}})
+	if got := classifyOne(t, stale, 100, 0); got != nil {
+		t.Errorf("a candidate whose only PR source is stale should be dropped; got %v", got)
+	}
+
+	fresh := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {90, "implicit"}})
+	if got := classifyOne(t, fresh, 100, 0); got == nil {
+		t.Error("a candidate with a recent PR source should be kept")
+	}
+}

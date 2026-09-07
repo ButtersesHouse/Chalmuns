@@ -1,20 +1,31 @@
 ---
 name: learn-patterns
-description: "Extract coding conventions and developer preferences from this repo's PR review history and write approved rules into per-domain skill files under .claude/skills/ (never the repo's top-level CLAUDE.md — publishing there is a separate, opt-in promote step). Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions (\"could we use X?\"), skeptical critique (\"interesting choice\"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like \"add a rule that…\", \"remember we always/never…\", \"make a convention that…\", \"save this as a rule\", \"let's standardize on…\", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule."
-argument-hint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text]]"
+description: "Extract coding conventions and developer preferences from this repo's PR review history and write approved rules into per-domain skill files under .claude/skills/ (never the repo's top-level CLAUDE.md — publishing there is a separate, opt-in promote step). Treats reviewer preferences as authoritative spoken-word rules — including indirect language like polite questions (\"could we use X?\"), skeptical critique (\"interesting choice\"), and hedged suggestions — and captures them regardless of occurrence count. ALSO USE THIS SKILL to record a coding rule a developer states while working — whenever the user says things like \"add a rule that…\", \"remember we always/never…\", \"make a convention that…\", \"save this as a rule\", \"let's standardize on…\", or otherwise wants to persist a coding standard: invoke with --add so the rule is written into the right skill file (portable across Claude Code instances) instead of being lost in local session memory. ALSO USE THIS SKILL when the user wants a code-review skill or tool watched for conventions — \"keep an eye on /code-review\", \"learn from what the reviewer flags\", \"watch semgrep/eslint and turn its findings into rules\", \"stop my agent making the mistake review keeps catching\": --watch designates a reviewer whose output is captured from then on, and --learn-reviews mines the captured reviews into rules so generated code stops repeating what review already rejected. Use --refresh for incremental since last run, --review to re-open approval without re-fetching (skips unchanged emerging rules already seen; add --all to force-show all), --auto to run without any interactive approval (defers supersessions, conflicts, and single-implicit singletons for human review; add --auto-threshold to also auto-approve singletons), --discover to find patterns directly from the codebase using cursor-agent, --add to manually record a single human-authored rule."
+argument-hint: "[--refresh | --review [--all] | --auto [--refresh] [--auto-threshold] | --discover [domain ...] | --add [rule text] | --watch [add|list|remove] [name] | --learn-reviews [--auto]]"
 ---
 
 # learn-patterns
 
 Extracts coding conventions and developer preferences from merged PR review comments and writes approved rules into domain-specific skill files under `.claude/skills/`. It never writes to the repo's top-level `CLAUDE.md`/`AGENTS.md`; publishing there is an explicit, opt-in `promote` step (Step 12.6). Treats reviewer preferences — including indirect, hedged, and skeptical language — as spoken-word rules captured at face value, regardless of occurrence count.
 
+Merged PRs are one source of review; they are not the only one. A **designated
+code reviewer** — Claude Code's own `/code-review` skill, a linter, an analyzer,
+a review bot — reviews code long before it reaches a PR, and what it flags is
+the fastest feedback there is on how an agent's generated code diverges from
+this codebase. `--watch` designates such a reviewer; from then on its output is
+captured, and `--learn-reviews` mines the captured reviews through the same
+pipeline into the same skills. That closes the loop: an agent generates, the
+reviewer flags, the rule lands in a skill, and the next generation does not
+repeat it.
+
 ## Tooling policy (read first)
 
 Every deterministic step in this pipeline is implemented as a subcommand of the
 `pattern-learner` binary (`$BIN`): `detect-repo`, `state-read`, `state-write`,
 `write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`,
-`audit-format`, `promote`, `version`. **These subcommands are the only sanctioned
-implementations of their logic.**
+`watch`, `capture-review`, `extract-review`, `audit-format`, `promote`,
+`version`. **These subcommands are the only sanctioned implementations of their
+logic.**
 
 - **Do NOT** write or run ad-hoc scripts (Python, Node, Ruby, Perl, shell scripts, etc.)
   to fetch, preprocess, ground-check, deduplicate by rule, score confidence, or triage.
@@ -31,6 +42,12 @@ implementations of their logic.**
   binary is zero-network) and **cursor-agent** (optional enhancement for `--discover`,
   `--rag`, and RAG hints; every cursor-agent feature degrades gracefully when absent).
   Everything else the pipeline runs is the Go binary.
+- **Parsing a watched reviewer's output is `capture-review`, never your own reading of
+  it.** The formats are plural (`findings`, `sarif`, `eslint`, `semgrep`, `markdown`)
+  and each has a parser; reconstructing one by hand is exactly the reimplementation
+  this policy exists to prevent. This skill also never *runs* the designated reviewer —
+  it reads what that reviewer already produced. If the user wants a review run, they
+  run it; the capture hook records the output either way.
 
 This policy is mechanically enforced: while a run is in progress (Step 2 creates a
 run-lock at `.claude/pattern-learner/.run-lock`), a PreToolUse hook blocks interpreter
@@ -53,12 +70,16 @@ Parse `$ARGUMENTS`:
 - `--all` → modifier for `--review` only: force-show all proposed emerging rules in the approval loop, including ones the user previously skipped that have not received new signals since. Has no effect without `--review`.
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
 - `--add [rule text]` → manual-add mode: record a single human-authored rule the developer wants to persist (no PR fetching, no cursor-agent). Any text after `--add` is the rule statement; if absent, infer the rule from the user's request in the conversation. `--add` is incompatible with every other mode flag — if combined, abort with: "Error: --add records one manual rule and cannot be combined with other modes."
+- `--watch [add|list|remove] [name]` → designation mode: manage which code-review skills or tools pattern-learner keeps eyes on. No fetching, no mining — this only records the designation. `--watch` is incompatible with every other mode flag; if combined, abort with: "Error: --watch manages designations and cannot be combined with other modes."
+- `--learn-reviews` → review-learning mode: mine the reviews already captured from designated reviewers. Skips PR fetching entirely. Combines with `--auto` (unattended approval, same predicate as elsewhere); combining it with `--refresh`, `--review`, `--discover`, or `--add` is invalid — abort with: "Error: --learn-reviews mines captured reviews and cannot be combined with <flag>."
 - (nothing) → full mode: fetch all merged PRs
 
 Store `IS_AUTO` = true when `--auto` is present. Store `IS_AUTO_THRESHOLD` = true when `--auto-threshold` is present (only meaningful with `IS_AUTO`). Store `IS_SHOW_ALL` = true when `--all` is present (only meaningful with `--review`).
 
 If `--discover` is set, jump to the **Discover Mode** section after Step 4.
 If `--add` is set, jump to the **Add Mode** section after Step 4.
+If `--watch` is set, jump to the **Watch Mode** section after Step 4.
+If `--learn-reviews` is set, jump to the **Review Mode** section after Step 4.
 
 ---
 
@@ -66,7 +87,7 @@ If `--add` is set, jump to the **Add Mode** section after Step 4.
 
 **Pre-flight checks** (run first, abort with a clear message on failure):
 - `go version` — Go **1.21+** must be installed to build the binary. Parse the `goX.Y` token from the output; if the command fails or the version is below 1.21, tell the user: "Go (1.21+) is required to build the pattern-learner binary. Install Go from https://go.dev/dl/ and retry." (An older Go may appear to build the binary today but fails confusingly on modern syntax — check the version, not just presence.)
-- Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review`, `--discover`, and `--add` modes since no PR fetching happens.)
+- Confirm GitHub MCP tools are available in the session by checking that `mcp__github__list_pull_requests` is present. If not, tell the user: "The GitHub MCP server is not configured in this session. Add the GitHub MCP server to your Claude Code config and retry." (Skip this check in `--review`, `--discover`, `--add`, `--watch`, and `--learn-reviews` modes since no PR fetching happens.)
 - `which cursor-agent` — check if cursor-agent is available. Store result as `HAS_CURSOR_AGENT` (true/false). In `--discover` mode, if cursor-agent is not found, abort: "cursor-agent is required for --discover mode. Install Cursor and ensure cursor-agent is on your PATH." In other modes, cursor-agent is optional — absence is not an error.
 
 **Binary build**: check whether `.claude/pattern-learner/bin/pattern-learner` exists in the current working directory (the target repo root).
@@ -103,7 +124,7 @@ If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
 
-**Binary self-check**: run `$BIN version` and confirm it prints exactly `0.3.0`. If the command errors (an older binary reports `unknown subcommand: version`) or prints any other value, the binary was built from older source and its output format differs from what these steps describe — delete it and rebuild from Step 2, then re-run the check. If it still does not print `0.3.0` after a clean rebuild, STOP and report it: the plugin source found in step 1 is not the version this skill file belongs to. Do not proceed with a mismatched binary.
+**Binary self-check**: run `$BIN version` and confirm it prints exactly `0.4.0`. If the command errors (an older binary reports `unknown subcommand: version`) or prints any other value, the binary was built from older source and its output format differs from what these steps describe — delete it and rebuild from Step 2, then re-run the check. If it still does not print `0.4.0` after a clean rebuild, STOP and report it: the plugin source found in step 1 is not the version this skill file belongs to. Do not proceed with a mismatched binary.
 
 **Create the run-lock** (enables the off-script guard for the duration of this run):
 ```
@@ -353,6 +374,16 @@ Output shape: `{"kept": [...signals...], "stats": {"too_short": N, "not_found": 
 
 Read `stats.too_short` and `stats.not_found` for the Step 13 summary. Use `kept` as the verified signals array for Step 8.
 
+**Which corpus a signal is grounded against is decided by the signal**, not by
+the flags: one carrying `raw_signal.pr_number` is checked against that PR's
+cache file, one carrying `raw_signal.review_id` against that captured review
+(Review Mode). Pass `--review-cache-dir .claude/pattern-learner/review-cache`
+whenever the batch contains review signals — both flags together when it
+contains both. A batch with review signals and no `--review-cache-dir` is
+refused with an error naming the flag rather than reporting every rule
+ungrounded, so if you see that error, add the flag and re-run; do not treat it
+as the signals having failed.
+
 ---
 
 ### Step 8: Deduplicate, normalize, and aggregate
@@ -506,7 +537,9 @@ Wait for confirmation before continuing to Step 11. If `n`, exit without modifyi
 Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
 - `reviewed_snapshot` and `conflicted` per rule: both fields are part of the `Rule` struct and round-trip through `state-write` automatically. `reviewed_snapshot` is set by the `s` action and cleared on approve/reject (not on edit). `conflicted` is set by Step 8A-cross and cleared when the user resolves the conflict during review.
-- Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
+- Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review` or `--learn-reviews`.
+- `last_ingested_review_at`: the review-cache watermark. Set it only in Review Mode (Step R5.4), to the `captured_at` of the newest review mined this run; leave it untouched in every other mode.
+- `watchers`: carry through unchanged. Designations are managed by `watch` (Watch Mode) and no other mode may add, drop, or reorder them — dropping one silently stops every future capture from that reviewer.
 - Updated `last_run` and `stats`
 - `repo`: **always** set to the Step 3 `detect-repo` output (`{owner, repo, stack}`),
   on every run and in every mode — never leave it empty or copy it from memory.
@@ -806,6 +839,9 @@ Files written (skills only — nothing at the repo root):
 Promoted to top level:      <"not requested" | "<path> — <created|updated|appended|unchanged|skipped>">
 Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">
+Watched reviewers:          <"none designated" |
+                             "<name>, <name> — <N> captured, <N> not yet mined
+                              (run /learn-patterns --learn-reviews)">
 RAG anchoring:              <"cursor-agent (semantic)" | "grep (fallback)" | "none">
 RAG hints in skill files:   <yes | no>
 Format check (audit-format):
@@ -1090,3 +1126,379 @@ File:        .claude/skills/<domain>/SKILL.md  <or "universal rule — stored in
 ```
 
 Then **release the run-lock** (`rm -f .claude/pattern-learner/.run-lock`) as in Step 13.
+
+---
+
+## Watch Mode
+
+Invoked when `--watch` is set. This records **which code-review skills and tools
+pattern-learner keeps eyes on**. It runs after Step 4 (state read) and replaces
+every later step: designating a reviewer writes no rules and generates no
+skills, so Steps 5–13 do not apply. Release the run-lock when done.
+
+A designation is what makes capture happen at all. The plugin ships a
+PostToolUse hook that runs `capture-review --hook` after every Bash, Skill,
+SlashCommand and Task call; with no watchers designated it reads the payload,
+matches nothing, and exits. Once a reviewer is designated, that reviewer's
+output is written into `.claude/pattern-learner/review-cache/` as it happens,
+and `--learn-reviews` mines it. Nothing is captured from a tool nobody asked
+for, and nothing is ever captured from a tool that is not designated.
+
+---
+
+### Watch Step W1: Determine the action
+
+Parse what follows `--watch`:
+
+- `add <name>` (or just a bare name) → designate a reviewer.
+- `list` (or nothing at all) → show the current designations.
+- `remove <id>` → undesignate.
+
+If the user's intent is a designation but no name is recoverable ("watch my
+code review tool"), ask which skill or tool they mean, offering `code-review`
+as the likely answer when the session has that skill.
+
+---
+
+### Watch Step W2: Run the subcommand
+
+```
+$BIN watch --state .claude/pattern-learner/state.json --list
+$BIN watch --state .claude/pattern-learner/state.json --add <name> [--kind skill|tool|any] [--format auto|findings|sarif|eslint|semgrep|markdown]
+$BIN watch --state .claude/pattern-learner/state.json --remove <id>
+```
+
+Every form prints the resulting designations as JSON, each with a live
+`captures` tally read from the review cache.
+
+Choosing the flags:
+
+- `--kind` — `skill` for a Claude Code skill (`/code-review`, `/security-review`),
+  `tool` for a command (`semgrep`, `eslint`, `golangci-lint`), `any` when the
+  user is not distinguishing. Default `any`. A `tool` watcher matches only
+  when the tool is the command actually being run: `semgrep --json .` matches,
+  `grep semgrep notes.txt` does not.
+- `--format` — leave at the default `auto` unless the user knows the tool emits
+  a shape they want forced. `auto` sniffs each artifact, so a tool that emits
+  JSON on one run and prose on the next is handled per capture.
+
+`--add` refuses a name already designated rather than replacing it, so changing
+a watcher's kind or format is `--remove` then `--add`. Removing a designation
+never deletes captured artifacts, and never touches rules already mined from
+them — their provenance stands.
+
+---
+
+### Watch Step W3: Report
+
+```
+── Watched Reviewers ────────────────────────────────
+<name>  (<kind>, format <format>)  — <N> captured, last <timestamp | "none yet">
+[...]
+─────────────────────────────────────────────────────
+Captured reviews are mined by: /learn-patterns --learn-reviews
+```
+
+When a designation was just added and nothing has been captured yet, say so
+plainly and tell the user what triggers the first capture: running the
+designated reviewer. If they have a review output on hand already — a saved
+report, a file of findings — mention they can feed it directly:
+
+```
+$BIN capture-review --cache-dir .claude/pattern-learner/review-cache \
+  --source <name> [--format F] [--label "what was reviewed"] --file <path>
+```
+
+Then release the run-lock and stop.
+
+---
+
+## Review Mode
+
+Invoked when `--learn-reviews` is set. Mines the reviews captured from
+designated reviewers into conventions. It runs after Step 4 (state read) and
+replaces **Steps 5–7** (fetch, PR signal extraction, grounding) with the four
+steps below. **Steps 8–13 run exactly as written** — the same semantic dedup,
+the same `classify`, the same approval, the same `state-write`, the same
+`write-outputs`, the same summary. A rule mined from a review is a rule like
+any other by the time it reaches Step 8; only its provenance differs.
+
+Why this is worth a mode of its own: a designated reviewer sees the code an
+agent just generated, long before that code reaches a PR. What it flags is the
+most direct evidence available of where generated code diverges from this
+codebase — and once that divergence is a rule in a domain skill, the next
+generation is loaded with it. That is the alignment loop this mode exists to
+close.
+
+---
+
+### Review Step R1: Select the reviews to mine
+
+Read the watermark `last_ingested_review_at` from the Step 4 state (absent on a
+first run). List what is available:
+
+```
+$BIN extract-review --cache-dir .claude/pattern-learner/review-cache [--since <last_ingested_review_at>]
+```
+
+Omit `--since` on a first run to mine everything captured so far; pass it
+otherwise so a re-run does not re-mine reviews already turned into rules. To
+mine specific reviews regardless of the watermark, pass
+`--reviews <id1,id2>`.
+
+If the output is an empty array, stop here and tell the user plainly which case
+it is:
+
+- **No watchers designated** (`$BIN watch --state … --list` prints `[]`) →
+  "Nothing is being watched yet. Designate a reviewer with
+  `/learn-patterns --watch add code-review`, then run the reviewer."
+- **Watchers designated but nothing captured** → "Watching `<names>`, but no
+  review output has been captured yet. Run the reviewer, or feed an existing
+  report with `capture-review --file`."
+- **Everything already mined** (watermark is current) → "All <N> captured
+  reviews have already been mined; nothing new since <timestamp>."
+
+Release the run-lock in every one of these cases before stopping.
+
+---
+
+### Review Step R2: Batch the lean views
+
+`extract-review` returns a JSON array of lean review views, ready to insert
+into the subagent prompt below. Each element:
+
+```json
+{
+  "review_id": "rev-70af1cd25b01",
+  "source": "code-review",
+  "format": "findings",
+  "captured_at": "2026-01-15T10:04:00Z",
+  "label": "hook capture: /code-review",
+  "files_touched": ["internal/api/handler.go"],
+  "findings": [
+    {
+      "index": 0,
+      "file": "internal/api/handler.go",
+      "line": 42,
+      "category": "correctness",
+      "severity": "",
+      "title": "Errors wrapped without %w",
+      "body": "This codebase wraps errors with %w so callers can errors.Is them.\n\nA caller doing errors.Is(err, ErrNotFound) gets false and falls into the generic 500 branch.",
+      "code_before": "return fmt.Errorf(\"lookup: %v\", err)",
+      "code_after": "return fmt.Errorf(\"lookup: %w\", err)",
+      "verdict": "CONFIRMED"
+    }
+  ]
+}
+```
+
+A review whose format carries no structure (a prose write-up with no headings)
+has no `findings` and carries the review verbatim in `text` instead; the
+subagent reads that directly.
+
+Batch up to **10 reviews** per subagent run — findings are denser than PR
+comments, so the batches are smaller than Step 6's twenty.
+
+---
+
+### Review Step R3: Extract signals via subagents
+
+For each batch, launch a subagent with this exact prompt (fill in the
+`extract-review` output at the end):
+
+---
+**SUBAGENT PROMPT:**
+
+You are reading the output of a code-review skill or tool that this team runs on
+their codebase. Your job is to find the **conventions** behind what it flagged,
+so an AI coding assistant stops generating code that gets flagged again.
+
+**The central distinction — read this twice.** A review finding is usually a
+report about *one piece of code*, not a statement of a rule. Your output becomes
+standing instructions applied to every future edit, so a one-off defect promoted
+to a convention is worse than a convention missed.
+
+- **A convention** generalizes: it would still be true about code that does not
+  exist yet. "Wrap errors with %w so callers can errors.Is them." "Use the shared
+  http client, never requests directly." "Table-driven tests go in the same file
+  as the code under test."
+- **A defect report** does not: it is about this code, here, now. "This returns
+  nil when the list is empty." "Off-by-one in the retry loop." "This test asserts
+  the wrong field."
+
+Extract the first. Discard the second, however severe — a critical bug is still
+not a convention, and this pipeline is not a bug tracker.
+
+**Recurrence is the strongest evidence you have.** The same finding raised in
+several reviews is a convention the team's reviewer enforces; a finding raised
+once may be a defect that happened to be phrased generally. When you see the
+same underlying rule in more than one review, emit it once with one entry in
+`sources` per review it appeared in.
+
+---
+
+**Strength**
+
+- `"strength": "explicit"` — the finding **states the rule itself**: it says what
+  this codebase does, names the convention, cites a configured lint rule, or
+  explains the general principle ("this codebase wraps errors with %w so callers
+  can errors.Is them"). A named rule id from a tool the team configured
+  (`no-console`, `py.no-requests`) is a stated convention: the team chose to
+  enforce it.
+- `"strength": "implicit"` — the finding shows the correction without stating a
+  rule, and you inferred the convention from it.
+
+Do not mark a finding explicit merely because the tool sounded confident. A
+tool's `verdict` or `severity` says how sure it is that this is a *problem*, not
+whether a *convention* was stated.
+
+---
+
+**DO NOT extract:**
+
+- **One-off defects**: nil dereferences, off-by-ones, wrong assertions, a bad
+  regex — the whole "defect report" category above.
+- **Product or feature correctness**: what the code should *do*, not how it
+  should be *written*.
+- **Generic language advice** the model already knows: "handle errors", "avoid
+  global state", "add tests". If the rule would be true in any repository in this
+  language, it teaches nothing about *this* codebase — drop it.
+- **Findings whose fix is already automated**: formatting a formatter applies,
+  a lint rule that autofixes on save.
+- **Anything you cannot quote.** See below.
+
+---
+
+**Output schema** — a JSON array, each element:
+
+```json
+{
+  "title": "Short rule title (5-8 words)",
+  "rule": "The convention as a clear imperative instruction",
+  "strength": "explicit",
+  "do_examples": [
+    {"code": "...", "language": "go", "context": "optional"}
+  ],
+  "dont_examples": [
+    {"code": "...", "language": "go", "context": "flagged at internal/api/handler.go:42"}
+  ],
+  "suggested_target": {
+    "location": "CLAUDE.md (the universal-rule sentinel) or domain-name (e.g. api, auth, models)",
+    "file_glob": ["internal/api/**/*.go"]
+  },
+  "raw_signal": {
+    "review_id": "rev-70af1cd25b01",
+    "reviewer": "code-review",
+    "date": "2026-01-15",
+    "snippet": "EXACT VERBATIM QUOTE FROM THE FINDING"
+  }
+}
+```
+
+`raw_signal.review_id` is the `review_id` of the review the finding came from,
+and `reviewer` is that review's `source`. Both are copied verbatim from the
+input — a signal whose `review_id` does not name a real captured review is
+dropped in Step R4.
+
+`snippet` — the reviewer's exact words, at least 20 characters, copied from the
+finding's `title`, `body`, or (for an unstructured review) its `text`. **Do not
+paraphrase, do not stitch words from different places, do not summarize.** Step
+R4 checks every snippet against the stored review and silently drops any that is
+not found. If you cannot quote the finding in support of the rule, the rule is
+yours rather than the reviewer's — omit it.
+
+A rule seen in several reviews gets one `raw_signal` per review; emit it as
+several array elements sharing a `title` and `rule`, and Step 8 will merge them.
+
+`do_examples` / `dont_examples`: use the finding's own code. `code_before` is
+the flagged code — that is the `dont_example`. `code_after` (the suggested fix)
+is the `do_example`. Where a finding gives only one side, supply the other only
+if the finding's text states it; otherwise omit it. Never invent code.
+
+**The finding's `file` and `line` say where the problem was found.** Put that in
+a `dont_example`'s `context`, never on a `do_example` — a file the reviewer
+flagged is the last file a reader should be pointed at to imitate.
+
+`suggested_target`: pick the most specific domain the finding's file paths
+suggest, by exactly the rules in Step 6 — never a coarse bucket like `backend`
+or `general`, and reserve the `"CLAUDE.md"` sentinel for rules that hold for
+every file in the repository regardless of language or layer. Derive
+`file_glob` from the finding's `file` (e.g. `internal/api/handler.go` →
+`internal/api/**/*.go`). A finding with no file path and no repo-wide claim is
+not targetable — omit it.
+
+Output only the JSON array, no other text.
+
+Captured reviews:
+[INSERT extract-review OUTPUT HERE]
+
+---
+
+Collect all signals returned by all subagent runs.
+
+---
+
+### Review Step R4: Grounding verification
+
+Same check, same subcommand, different corpus — a review signal is verified
+against the review it names:
+
+```
+cat signals.json | $BIN verify-grounding --review-cache-dir .claude/pattern-learner/review-cache
+```
+
+The rules are the ones Step 7 documents (≥20 runes, normalized substring match),
+applied against the captured artifact rather than a PR cache file. Read
+`stats.too_short` and `stats.not_found` for the summary, and use `kept` as the
+verified signals array.
+
+---
+
+### Review Step R5: Rejoin the main pipeline
+
+Continue at **Step 8** (dedup, normalize, aggregate) with the verified signals,
+and run Steps 8 through 13 as written, with these five differences:
+
+1. **Step 8A-cross contradiction detection** compares candidates by
+   `max_pr(X)`, which every review candidate reports as 0. Order them by their
+   reviews' `captured_at` instead — the newest capture is the current
+   convention. A review candidate contradicting a *PR* candidate is genuinely
+   ambiguous (two different clocks): set `conflicted: true` on both and let a
+   human decide.
+2. **Step 9 `classify`** is run with `--max-pr-seen <last_extracted_pr_number>
+   --since-pr <same value>` when the batch is review-only, so no PR range is
+   implied. Review candidates carry no PR number and are exempt from the
+   recency downgrade by construction — a convention has not gone stale merely
+   because it was never in a PR.
+3. **Every new rule gets `origin: "code-review"`** in Step 11. This drives its
+   provenance line in the generated skill (`_Source: code review (code-review)_`)
+   and keeps it out of the PR-watermark staleness check, which would otherwise
+   mark every review rule stale.
+4. **Step 11 also sets `last_ingested_review_at`** to the `captured_at` of the
+   newest review mined this run (the last element of the `extract-review`
+   output). Leave `last_extracted_pr_number` untouched — this mode does not
+   read PRs.
+5. **Step 13's summary** replaces the PR counters with the Review Mode block
+   below.
+
+Approval is unchanged and still required: `--learn-reviews` alone presents
+every candidate for decision, and `--learn-reviews --auto` applies the same
+`triage --mode auto` predicate as everywhere else. Note that a convention a
+reviewer raised exactly once, without stating it as a rule, is a single
+implicit signal and so is **deferred** rather than auto-approved — which is the
+behaviour you want, because that is precisely the shape a one-off defect takes
+if one slips through R3.
+
+In the Step 13 summary, replace the PR-related counters with:
+
+```
+Reviews mined this run:     <N>  (sources: <name>, <name>)
+  findings read:            <N>
+Signals extracted:          <N>
+  explicit (stated rule):   <N>
+  implicit (inferred):      <N>
+Signals dropped (grounding):<N>
+  too short (<20 chars):    <N>
+  not found in review:      <N>
+Review watermark:           <last_ingested_review_at>
+```

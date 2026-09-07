@@ -1577,20 +1577,51 @@ func confidenceRank(c string) int {
 }
 
 // sourceLabel returns the provenance text for a rule's "_Source: …_" line.
-// Manual and discover-origin rules have no PR numbers, so they get a descriptive
-// label instead of an empty PR list.
+// Manual, discover and code-review origin rules have no PR numbers, so they
+// get a descriptive label instead of an empty PR list.
 func sourceLabel(r state.Rule) string {
 	switch r.Origin {
 	case "manual":
 		return "manually added"
 	case "discover":
 		return "discovered from codebase"
+	case "code-review":
+		// Name the reviewers: which tool flagged a convention is what tells a
+		// reader whether to trust it, and two different tools agreeing is a
+		// stronger claim than one repeating itself.
+		if tools := reviewerNames(r.Sources); tools != "" {
+			return "code review (" + tools + ")"
+		}
+		return "code review"
 	default:
 		if prs := prList(r.Sources); prs != "" {
 			return "PRs " + prs
 		}
 		return "—"
 	}
+}
+
+// reviewerNames lists the distinct reviewers behind a rule, for the source
+// line of a rule mined from watched code-review output, where the reviewer is
+// the tool's name. Capped so a convention flagged by many tools does not push
+// a source line past a readable length.
+func reviewerNames(sources []state.Signal) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, s := range sources {
+		name := strings.TrimSpace(s.Reviewer)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	const maxNames = 3
+	if len(names) > maxNames {
+		return strings.Join(names[:maxNames], ", ") + ", …"
+	}
+	return strings.Join(names, ", ")
 }
 
 func prList(sources []state.Signal) string {
