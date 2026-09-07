@@ -4,10 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/ButtersesHouse/Chalmuns/internal/cliflags"
+	"github.com/ButtersesHouse/Chalmuns/internal/format"
 	"github.com/ButtersesHouse/Chalmuns/internal/output"
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
@@ -637,17 +640,17 @@ func mustEval(t *testing.T, p string) string {
 // misspelled flag must be an error rather than a silent write to the
 // default location.
 func TestFlagParsingIsStrict(t *testing.T) {
-	if got := flagValue([]string{"--skills-dir=custom"}, "--skills-dir", "def"); got != "custom" {
+	if got := cliflags.Value([]string{"--skills-dir=custom"}, "--skills-dir", "def"); got != "custom" {
 		t.Errorf("equals form: got %q", got)
 	}
-	if got := flagValue([]string{"--skills-dir", "custom"}, "--skills-dir", "def"); got != "custom" {
+	if got := cliflags.Value([]string{"--skills-dir", "custom"}, "--skills-dir", "def"); got != "custom" {
 		t.Errorf("space form: got %q", got)
 	}
-	if got := flagValue([]string{"--other", "x"}, "--skills-dir", "def"); got != "def" {
+	if got := cliflags.Value([]string{"--other", "x"}, "--skills-dir", "def"); got != "def" {
 		t.Errorf("absent: got %q", got)
 	}
 	// A value that itself looks like a flag is not mistaken for one.
-	if err := checkFlags([]string{"--state", "--weird-name"}, []string{"--state"}, nil); err != nil {
+	if err := cliflags.Check([]string{"--state", "--weird-name"}, []string{"--state"}, nil); err != nil {
 		t.Errorf("a flag-shaped value should be consumed, got %v", err)
 	}
 	for _, args := range [][]string{
@@ -655,7 +658,7 @@ func TestFlagParsingIsStrict(t *testing.T) {
 		{"--skills-dirr=foo"},           // typo, equals form
 		{"--state", "s.json", "--nope"}, // unknown bool
 	} {
-		if err := checkFlags(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err == nil {
+		if err := cliflags.Check(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err == nil {
 			t.Errorf("%v: expected an unknown-flag error", args)
 		}
 	}
@@ -664,11 +667,11 @@ func TestFlagParsingIsStrict(t *testing.T) {
 		{"--state=s.json", "--skills-dir=d", "--create"},
 		{},
 	} {
-		if err := checkFlags(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err != nil {
+		if err := cliflags.Check(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err != nil {
 			t.Errorf("%v: expected acceptance, got %v", args, err)
 		}
 	}
-	if err := checkFlags([]string{"--state"}, []string{"--state"}, nil); err == nil {
+	if err := cliflags.Check([]string{"--state"}, []string{"--state"}, nil); err == nil {
 		t.Error("a value flag with no value should error")
 	}
 }
@@ -748,5 +751,73 @@ func TestAnchoringSkipsGeneratedOutputAndVendoredCode(t *testing.T) {
 	m := newGlobMatcher(root, []string{"**/*.md"}, skills)
 	if got := m.files("**/*.md"); len(got) != 1 || !strings.HasSuffix(got[0], filepath.Join("docs", "real.md")) {
 		t.Errorf("the repository's own file must still be found, got %v", got)
+	}
+}
+
+// The skill document bootstraps the whole pipeline by locating this
+// module's directory, and nothing tested that it still resolves. It had
+// been dead since the repository was restructured into a marketplace: the
+// documented pattern required go.mod's parent directory to be named
+// "Chalmuns", and the module moved to plugins/pattern-learner/go.mod, so
+// every run failed at Step 2 with "dirname: missing operand".
+func TestSkillBootstrapLocatesTheModule(t *testing.T) {
+	skill, err := os.ReadFile(filepath.Join("..", "..", "skills", "learn-patterns", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`-path "([^"]*go\.mod)"`)
+	found := re.FindAllStringSubmatch(string(skill), -1)
+	if len(found) == 0 {
+		t.Fatal("Step 2 no longer documents a -path pattern for locating go.mod")
+	}
+	// The module directory, reached from this test's package directory.
+	moduleDir, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range found {
+		pattern := m[1]
+		// find(1)'s -path globs are matched against the whole path and its
+		// "*" crosses "/" — unlike filepath.Match, whose "*" stops at a
+		// separator. Translate to a regexp so this asserts what find does.
+		var b strings.Builder
+		b.WriteString(`\A`)
+		for i, part := range strings.Split(pattern, "*") {
+			if i > 0 {
+				b.WriteString(".*")
+			}
+			b.WriteString(regexp.QuoteMeta(part))
+		}
+		b.WriteString(`\z`)
+		re, err := regexp.Compile(b.String())
+		if err != nil {
+			t.Errorf("documented pattern %q is not a valid glob: %v", pattern, err)
+			continue
+		}
+		if !re.MatchString(filepath.Join(moduleDir, "go.mod")) {
+			t.Errorf("documented pattern %q does not match this module's go.mod at %s;\n"+
+				"Step 2 would find nothing and the pipeline could not build its binary",
+				pattern, filepath.Join(moduleDir, "go.mod"))
+		}
+	}
+}
+
+// The skill's frontmatter keys have to be the ones Claude Code reads.
+func TestSkillFrontmatterUsesDocumentedKeys(t *testing.T) {
+	skill, err := os.ReadFile(filepath.Join("..", "..", "skills", "learn-patterns", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields, _, issues := format.ParseFrontmatter(string(skill))
+	if len(issues) != 0 {
+		t.Errorf("the plugin's own skill frontmatter has issues: %v", issues)
+	}
+	if _, bad := fields["argumentHint"]; bad {
+		t.Error("the documented key is argument-hint; argumentHint is not read")
+	}
+	for _, k := range []string{"name", "description", "argument-hint"} {
+		if fields[k] == "" {
+			t.Errorf("frontmatter is missing %q", k)
+		}
 	}
 }

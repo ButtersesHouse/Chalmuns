@@ -41,6 +41,10 @@ type TriageFilterResult struct {
 //	review-filter  [--all]             — suppress unchanged emerging rules; output
 //	                                     {show, suppressed, suppressed_ids}
 func RunTriage(args []string) error {
+	if err := checkFlags(args, []string{"--mode"}, []string{"--auto-threshold", "--all"}); err != nil {
+		return err
+	}
+
 	mode := flagVal(args, "--mode", "")
 	if mode == "" {
 		return fmt.Errorf("--mode required (auto or review-filter)")

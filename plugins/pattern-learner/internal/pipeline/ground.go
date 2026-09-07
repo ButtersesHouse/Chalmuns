@@ -35,6 +35,10 @@ type GroundingStats struct {
 //
 // Usage: verify-grounding --cache-dir <dir>  (signals JSON array on stdin)
 func RunVerifyGrounding(args []string) error {
+	if err := checkFlags(args, []string{"--cache-dir"}, nil); err != nil {
+		return err
+	}
+
 	cacheDir := flagVal(args, "--cache-dir", "")
 	if cacheDir == "" {
 		return fmt.Errorf("--cache-dir required")
