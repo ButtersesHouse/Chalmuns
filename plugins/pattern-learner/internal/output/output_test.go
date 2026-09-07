@@ -999,6 +999,30 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 			t.Errorf("%s: expected an empty-segment refusal, got %v", g, err)
 		}
 	}
+	// A brace-free glob that ends in a slash is the author's choice, not an
+	// empty alternative, and is accepted as before.
+	plain := approvedRule("R", "do it", "api", "stated", 1)
+	plain.Target.FileGlob = []string{"docs/"}
+	if err := Write(stateWith(plain), t.TempDir(), Options{}); err != nil {
+		t.Errorf("trailing-slash glob should be accepted: %v", err)
+	}
+	// An unbalanced brace is named as such.
+	unbalanced := approvedRule("R", "do it", "api", "stated", 1)
+	unbalanced.Target.FileGlob = []string{"src/{a,b/**/*.go"}
+	if err := Write(stateWith(unbalanced), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "unbalanced brace") {
+		t.Errorf("expected an unbalanced-brace refusal, got %v", err)
+	}
+}
+
+func TestIsOutsideRel(t *testing.T) {
+	sep := string(filepath.Separator)
+	for rel, want := range map[string]bool{
+		"..": true, ".." + sep + "x": true, "x": false, ".": false, "..skills": false, "x" + sep + "..": false,
+	} {
+		if got := IsOutsideRel(rel); got != want {
+			t.Errorf("IsOutsideRel(%q) = %v, want %v", rel, got, want)
+		}
+	}
 }
 
 // RepoRoot, not outputDir, decides whether the skills directory is shared.
@@ -1253,23 +1277,69 @@ func TestIsSharedSkillsDir(t *testing.T) {
 	}
 }
 
-// An interrupted first write leaves an empty directory (or only the tmp
-// file of the SKILL.md write); the next run must treat that as ours.
-func TestEmptyShellDirectoryIsRegenerated(t *testing.T) {
-	for _, leftover := range []string{"", "SKILL.md.tmp"} {
-		dir := t.TempDir()
-		skillDir := filepath.Join(dir, ".claude", "skills", "api")
-		if err := os.MkdirAll(skillDir, 0755); err != nil {
+// An empty directory at a domain's path holds nothing to lose and is used.
+func TestEmptyDirectoryIsRegenerated(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Errorf("expected regeneration into an empty directory, got %v", err)
+	}
+}
+
+// Leftovers of an interrupted swap (the staging and retired siblings) are
+// cleared by the next run, and a live directory is only ever complete.
+func TestTransientDirsAreCleared(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	for _, leftover := range []string{"api" + stagingSuffix, "old" + retiredSuffix, "gone" + stagingSuffix} {
+		if err := os.MkdirAll(filepath.Join(skills, leftover), 0755); err != nil {
 			t.Fatal(err)
 		}
-		if leftover != "" {
-			if err := os.WriteFile(filepath.Join(skillDir, leftover), []byte("partial"), 0644); err != nil {
-				t.Fatal(err)
-			}
+		if err := os.WriteFile(filepath.Join(skills, leftover, "SKILL.md"), []byte("partial"), 0644); err != nil {
+			t.Fatal(err)
 		}
-		if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
-			t.Errorf("leftover %q: expected regeneration, got %v", leftover, err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(skills)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "api" {
+			t.Errorf("unexpected entry left behind: %s", e.Name())
 		}
+	}
+	if !inspectSkill(filepath.Join(skills, "api", "SKILL.md"), "api").generated {
+		t.Error("live skill should be the complete generated one")
+	}
+}
+
+// A symlinked skill directory is judged by what it points at, for pruning
+// as well as for overwriting.
+func TestSymlinkedStaleSkillIsPruned(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// Move the generated directory aside and link it back under its name.
+	moved := filepath.Join(t.TempDir(), "api-real")
+	if err := os.Rename(filepath.Join(skills, "api"), moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, filepath.Join(skills, "api")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("stale symlinked generated skill should have been pruned")
 	}
 }
 

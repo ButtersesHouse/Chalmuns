@@ -168,7 +168,7 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 	// where possible, so the file reads the same from any checkout location.
 	relRef := func(parts ...string) string {
 		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
-		if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !IsOutsideRel(rel) {
 			return rel
 		}
 		return ref

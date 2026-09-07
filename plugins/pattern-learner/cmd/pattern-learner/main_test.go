@@ -264,3 +264,16 @@ func TestGlobFiles_singleAlternativeBrace(t *testing.T) {
 		t.Errorf("single-alternative brace group should expand like the paths gate does; got %v", got)
 	}
 }
+
+// A missing --state must be an error, not an empty state: write-outputs
+// prunes every generated skill absent from state.
+func TestWriteOutputsRefusesMissingState(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".claude", "skills"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	err := runWriteOutputs([]string{"--state", filepath.Join(dir, "missing.json"), "--output-dir", dir})
+	if err == nil {
+		t.Fatal("expected an error for a missing state file")
+	}
+}

@@ -119,6 +119,13 @@ func runWriteOutputs(args []string) error {
 	ragHints := hasFlag(args, "--rag-hints")
 	ragAnchor := hasFlag(args, "--rag")
 
+	// state.Read treats a missing file as an empty state, which is right for
+	// a first run of the pipeline but not here: write-outputs prunes every
+	// generated skill absent from state, so a mistyped --state would delete
+	// them all. Require the file to exist.
+	if _, err := os.Stat(statePath); err != nil {
+		return fmt.Errorf("--state %s: %w (write-outputs needs an existing state file; a missing one would prune every generated skill)", statePath, err)
+	}
 	s, err := state.Read(statePath)
 	if err != nil {
 		return err
@@ -313,7 +320,7 @@ func refExists(ref, root string) bool {
 		return false
 	}
 	rel := filepath.Clean(ref[:idx])
-	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if filepath.IsAbs(rel) || output.IsOutsideRel(rel) {
 		return false
 	}
 	f, err := os.Open(filepath.Join(root, rel))

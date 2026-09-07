@@ -101,6 +101,14 @@ func isSharedSkillsDir(skillsDir, outputDir string) bool {
 	if err != nil {
 		return true
 	}
+	return IsOutsideRel(rel)
+}
+
+// IsOutsideRel reports whether a path returned by filepath.Rel points
+// outside the base it was computed from. It is the one implementation of
+// that test; a bare HasPrefix(rel, "..") would also match a sibling whose
+// name merely starts with two dots.
+func IsOutsideRel(rel string) bool {
 	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
@@ -218,10 +226,10 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 		// shared skills directory a different stamp is a different
 		// repository's skill, and clobbering it would hand that repo our
 		// conventions. A directory with no SKILL.md is foreign too, unless
-		// it is the empty shell an interrupted first write leaves behind.
+		// it is empty (nothing in it to lose).
 		skillDir := filepath.Join(skillsDir, domain)
 		existing := inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
-		if _, err := os.Stat(skillDir); err == nil && !existing.generated && !isEmptyShell(skillDir) {
+		if _, err := os.Stat(skillDir); err == nil && !existing.generated && !isEmptyDir(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 		}
 		if shared {
@@ -304,23 +312,23 @@ func parseOwnerLine(line string) (string, bool) {
 	return strings.TrimSuffix(strings.TrimPrefix(line, ownerStampPrefix), ownerStampSuffix), true
 }
 
-// isEmptyShell reports whether dir holds nothing but what an interrupted
-// first write of ours could leave: no entries, or only the temp file of a
-// SKILL.md atomicWrite that never reached its rename. (SKILL.md is written
-// before the companion files, so a run that got any further left the
-// marker.)
-func isEmptyShell(dir string) bool {
+// isEmptyDir reports whether dir exists and holds no entries.
+func isEmptyDir(dir string) bool {
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	leftover := filepath.Base(tmpPath(filepath.Join(dir, "SKILL.md")))
-	for _, e := range entries {
-		if e.Name() != leftover {
-			return false
-		}
-	}
-	return true
+	return err == nil && len(entries) == 0
+}
+
+// Each domain is written into a staging sibling and swapped into place, so
+// a domain directory is only ever seen complete or absent. These suffixes
+// name the two transient siblings; anything carrying one is ours by
+// construction and is cleared away by the next run.
+const (
+	stagingSuffix = ".pattern-learner-staging"
+	retiredSuffix = ".pattern-learner-old"
+)
+
+func isTransientDir(name string) bool {
+	return strings.HasSuffix(name, stagingSuffix) || strings.HasSuffix(name, retiredSuffix)
 }
 
 // pruneStaleSkills removes generated skill directories under skillsDir whose
@@ -357,7 +365,17 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		present[e.Name()] = true
 	}
 	for _, e := range entries {
-		if !e.IsDir() {
+		dir := filepath.Join(skillsDir, e.Name())
+		// Leftovers of an interrupted swap are ours whatever they hold.
+		if isTransientDir(e.Name()) {
+			if err := os.RemoveAll(dir); err != nil {
+				return err
+			}
+			continue
+		}
+		// Stat rather than the entry type so a symlinked skill directory
+		// is judged like the overwrite guard judges it (which follows links).
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 			continue
 		}
 		if _, ok := live[e.Name()]; ok {
@@ -373,7 +391,6 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		if aliasOfLive {
 			continue
 		}
-		dir := filepath.Join(skillsDir, e.Name())
 		info := inspectSkill(filepath.Join(dir, "SKILL.md"), e.Name())
 		if !info.generated {
 			continue
@@ -490,14 +507,29 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	desc := buildDescription(domain, globs, override)
 	skillDir := filepath.Join(skillsDir, domain)
 
-	// examples/ and rules/ are generator-owned: regenerate from scratch so
-	// renamed or removed rules leave no stale files behind.
-	for _, sub := range []string{"examples", "rules"} {
-		if err := os.RemoveAll(filepath.Join(skillDir, sub)); err != nil {
+	// The whole domain is rendered into a staging sibling and then swapped
+	// into place, so the live directory is only ever complete or absent: an
+	// interrupted run leaves the previous skill untouched (plus a transient
+	// sibling the next run clears), never a SKILL.md pointing at companion
+	// files that were wiped and not rewritten. Rendering from scratch also
+	// means renamed or removed rules leave no stale companion files behind.
+	staging := skillDir + stagingSuffix
+	retired := skillDir + retiredSuffix
+	for _, transient := range []string{staging, retired} {
+		if err := os.RemoveAll(transient); err != nil {
 			return err
 		}
 	}
+	if err := renderSkillDir(staging, domain, desc, globs, rules, watermark, owner, opts); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+	return swapDir(staging, skillDir, retired)
+}
 
+// renderSkillDir writes a domain's complete skill tree (SKILL.md plus
+// companion files) under dir.
+func renderSkillDir(dir, domain, desc string, globs []string, rules []state.Rule, watermark int, owner string, opts Options) error {
 	slugs := ruleSlugs(rules)
 	header := renderSkillHeader(domain, desc, globs, rules, owner)
 
@@ -505,17 +537,12 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// SKILL.md body is a recurring token cost once loaded, so it carries only
 	// the imperative rules plus pointers the consuming agent follows at its
 	// discretion when it wants the do/don't code.
-	//
-	// SKILL.md is written before its companion files so that a run
-	// interrupted part-way always leaves the generated marker behind; a
-	// directory of companions with no SKILL.md would otherwise look foreign
-	// to the next run's overwrite guard.
 	inline := header + renderInlineRules(rules, slugs, watermark, opts)
 	if lineCount(inline) <= maxSkillLines {
-		if err := atomicWrite(filepath.Join(skillDir, "SKILL.md"), inline); err != nil {
+		if err := atomicWrite(filepath.Join(dir, "SKILL.md"), inline); err != nil {
 			return err
 		}
-		return writeExampleFiles(skillDir, rules, slugs)
+		return writeExampleFiles(dir, rules, slugs)
 	}
 
 	// Very large skill: chunk per the Claude Code guidance ("Keep SKILL.md
@@ -523,10 +550,33 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// SKILL.md becomes a rule index; each rule lives in rules/<slug>.md with
 	// its examples inline (the chunk itself is loaded on demand), and the
 	// chunk corpus doubles as a grep target for full-text lookup.
-	if err := atomicWrite(filepath.Join(skillDir, "SKILL.md"), header+renderRuleIndex(rules, slugs)); err != nil {
+	if err := atomicWrite(filepath.Join(dir, "SKILL.md"), header+renderRuleIndex(rules, slugs)); err != nil {
 		return err
 	}
-	return writeRuleChunks(skillDir, rules, slugs, watermark, opts)
+	return writeRuleChunks(dir, rules, slugs, watermark, opts)
+}
+
+// swapDir moves the complete tree at staging to live, retiring whatever was
+// at live first. If the final rename fails the previous tree is put back,
+// so live is never left absent when it existed before.
+func swapDir(staging, live, retired string) error {
+	hadLive := false
+	if _, err := os.Lstat(live); err == nil {
+		hadLive = true
+		if err := os.Rename(live, retired); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(staging, live); err != nil {
+		if hadLive {
+			os.Rename(retired, live)
+		}
+		return err
+	}
+	if hadLive {
+		return os.RemoveAll(retired)
+	}
+	return nil
 }
 
 // maxSkillLines is the chunking threshold for a generated domain SKILL.md,
@@ -923,14 +973,20 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 			if g == "" {
 				continue
 			}
+			braced := strings.ContainsAny(g, "{}")
 			for _, expanded := range ExpandBraces(g) {
+				if strings.ContainsAny(expanded, "{}") {
+					return nil, fmt.Errorf("file glob %q has an unbalanced brace; close every {a,b} group (or remove the stray brace) and rerun", g)
+				}
 				if strings.Contains(expanded, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
 				}
 				// An empty brace alternative ("src/{a,}/**") yields a path
 				// with an empty segment that a matcher never satisfies; the
-				// shell idiom has no equivalent in a paths gate.
-				if expanded == "" || strings.HasPrefix(expanded, "/") || strings.HasSuffix(expanded, "/") || strings.Contains(expanded, "//") {
+				// shell idiom has no equivalent in a paths gate. Only a glob
+				// that had a group can produce this; a plain "docs/" is left
+				// as the author wrote it.
+				if braced && (expanded == "" || strings.HasPrefix(expanded, "/") || strings.HasSuffix(expanded, "/") || strings.Contains(expanded, "//")) {
 					return nil, fmt.Errorf("file glob %q expands to %q, which has an empty path segment (an empty brace alternative); list the alternatives explicitly and rerun", g, expanded)
 				}
 				all = append(all, expanded)
