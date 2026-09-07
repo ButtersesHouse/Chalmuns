@@ -2419,8 +2419,14 @@ func TestRefusesDirectoryWithoutSkillFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{})
-	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+	// It is refused, but not as someone else's skill: a generated rules/
+	// tree with no SKILL.md is most often this generator's own interrupted
+	// run, and the message says only what can be established.
+	if err == nil || !strings.Contains(err.Error(), "cannot be attributed") {
 		t.Fatalf("expected a refusal, got %v", err)
+	}
+	if strings.Contains(fmt.Sprint(err), "was not written by pattern-learner") {
+		t.Error("a directory of ours missing its SKILL.md must not be called foreign")
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Error("user content under the directory was removed")
@@ -2614,8 +2620,8 @@ func TestWriteSkillFileChunkedWhenLarge(t *testing.T) {
 
 	skillDir := filepath.Join(dir, ".claude", "skills", "api")
 	skill := readFile(t, filepath.Join(skillDir, "SKILL.md"))
-	if got := strings.Count(skill, "\n") + 1; got > maxSkillLines {
-		t.Errorf("chunked SKILL.md should stay within %d lines, got %d", maxSkillLines, got)
+	if got := bodyLines(skill); got >= maxSkillBodyLines {
+		t.Errorf("chunked SKILL.md should stay under %d body lines, got %d", maxSkillBodyLines, got)
 	}
 	if !strings.Contains(skill, "## Rule Index") {
 		t.Error("chunked SKILL.md should carry a rule index")
@@ -3012,4 +3018,210 @@ func TestFencedCodeSurvivesNestedFence(t *testing.T) {
 	if got := strings.Split(out, "\n")[0]; got != "```go" {
 		t.Errorf("language tag not sanitized: %q", got)
 	}
+}
+
+// --- regressions from the adversarial audit ---
+
+// Disambiguating a repeated slug with "-<n>" must not hand out a name some
+// other rule's title slugifies to on its own: the two rules then share one
+// companion file, so one rule's examples silently overwrite the other's and
+// in the chunked layout one approved rule is missing from the tree.
+func TestRuleSlugsAreUniqueAgainstSuffixedNames(t *testing.T) {
+	rules := []state.Rule{
+		approvedRule("Use Tabs", "a", "api", "stated", 1),
+		approvedRule("Use Tabs", "b", "api", "stated", 1),
+		approvedRule("Use Tabs 2", "c", "api", "stated", 1),
+	}
+	slugs := ruleSlugs(rules)
+	seen := map[string]bool{}
+	for i, s := range slugs {
+		if seen[s] {
+			t.Fatalf("slug %q handed out twice (rule %d of %v)", s, i, slugs)
+		}
+		seen[s] = true
+	}
+}
+
+// Every rule keeps its own file on disk even when three titles collide.
+func TestCollidingTitlesEachGetTheirOwnExampleFile(t *testing.T) {
+	dir := t.TempDir()
+	var rules []state.Rule
+	for i, title := range []string{"Use Tabs", "Use Tabs", "Use Tabs 2"} {
+		r := approvedRule(title, fmt.Sprintf("rule %d", i), "api", "stated", 1)
+		r.DoExamples = []state.Example{{Code: fmt.Sprintf("body%d()", i), Language: "go"}}
+		rules = append(rules, r)
+	}
+	if err := Write(stateWith(rules...), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, ".claude", "skills", "api", "examples"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("each of 3 rules needs its own examples file, got %d: %v", len(entries), names)
+	}
+}
+
+// The generator's chunking threshold and the audit's warn threshold must
+// agree, or a domain that lands between them is emitted inline and then
+// graded approaching_budget — which the learn-patterns skill tells the agent
+// is a generator bug to stop the run over.
+func TestGeneratedSkillNeverReportsApproachingBudget(t *testing.T) {
+	for _, n := range []int{20, 30, 34, 36, 40, 45, 50, 60, 90} {
+		dir := t.TempDir()
+		var rules []state.Rule
+		for i := 0; i < n; i++ {
+			r := approvedRule(fmt.Sprintf("Rule number %d", i),
+				strings.Repeat("prose that takes up a line of the body. ", 4),
+				"api", "established", 1)
+			r.Target.FileGlob = []string{"src/**/*.go"}
+			r.DoExamples = []state.Example{{Code: "ok()", Language: "go"}}
+			rules = append(rules, r)
+		}
+		if err := Write(stateWith(rules...), dir, Options{}); err != nil {
+			t.Fatalf("%d rules: %v", n, err)
+		}
+		res := format.AuditFile(filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+		if res.OverBudget || res.ApproachingBudget {
+			t.Errorf("%d rules: generated SKILL.md graded over=%v approaching=%v at %d body lines",
+				n, res.OverBudget, res.ApproachingBudget, res.BodyLines)
+		}
+	}
+}
+
+// The paths gate is the union of every rule's globs, so when the rules do
+// not share one scope each must state its own — otherwise a rule scoped to
+// one glob reads as governing whatever file pulled the skill in.
+func TestInlineRulesStateTheirOwnScopeWhenScopesDiffer(t *testing.T) {
+	dir := t.TempDir()
+	a := approvedRule("Handlers rule", "do a", "api", "stated", 1)
+	a.Target.FileGlob = []string{"src/handlers/**/*.go"}
+	b := approvedRule("Models rule", "do b", "api", "stated", 1)
+	b.Target.FileGlob = []string{"src/models/**/*.go"}
+	if err := Write(stateWith(a, b), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	got := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	for _, want := range []string{"**Applies to:** `src/handlers/**/*.go`", "**Applies to:** `src/models/**/*.go`"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("inline SKILL.md must carry %s\n%s", want, got)
+		}
+	}
+
+	// When every rule shares one scope the frontmatter already says it and
+	// per-rule lines would only cost body budget.
+	dir2 := t.TempDir()
+	c := approvedRule("Second handlers rule", "do c", "api", "stated", 1)
+	c.Target.FileGlob = []string{"src/handlers/**/*.go"}
+	if err := Write(stateWith(a, c), dir2, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dir2, ".claude", "skills", "api", "SKILL.md")); strings.Contains(got, "Applies to:") {
+		t.Errorf("a uniformly scoped domain needs no per-rule scope lines\n%s", got)
+	}
+}
+
+// A scoped domain that happens to be named "conventions" is merged into the
+// universal skill, which carries no paths gate. The file must not then claim
+// those scoped rules govern every file.
+func TestMergedUniversalDomainDoesNotOverstateScopedRules(t *testing.T) {
+	dir := t.TempDir()
+	u := approvedRule("Universal rule", "everywhere", UniversalLocation, "established", 1)
+	scoped := approvedRule("Scoped rule", "only here", UniversalSkillName, "established", 1)
+	scoped.Target.FileGlob = []string{"src/api/**/*.go"}
+	if err := Write(stateWith(u, scoped), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	got := readFile(t, filepath.Join(dir, ".claude", "skills", UniversalSkillName, "SKILL.md"))
+	if strings.Contains(got, "regardless of what you are editing.\n") {
+		t.Error("the blanket sentence must not stand when a merged rule is scoped")
+	}
+	if !strings.Contains(got, "**Applies to:** `src/api/**/*.go`") {
+		t.Errorf("the merged scoped rule must state its own glob\n%s", got)
+	}
+	if !strings.Contains(got, "**Applies to:** every file in this repository.") {
+		t.Errorf("the genuinely repo-wide rule must say so beside it\n%s", got)
+	}
+}
+
+// A shared skills directory a run cannot stamp is written anyway (one repo
+// using a directory of its own is the ordinary case) but the run must say
+// what it can no longer do for itself.
+func TestUnstampableSharedDirIsReported(t *testing.T) {
+	repo := t.TempDir()
+	shared := filepath.Join(t.TempDir(), "shared")
+	pr, err := Validate(ptr(stateWith(approvedRule("R", "do it", "api", "stated", 1))), repo, Options{SkillsDir: shared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pr.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(pr.Warnings(), "no repository identity") {
+		t.Errorf("an unstampable shared dir must be reported, got %v", pr.Warnings())
+	}
+}
+
+// Claiming another repository's unstamped skill in a shared directory is the
+// documented migration path, but it is a takeover and must not be silent.
+func TestUnstampedSharedSkillTakeoverIsReported(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	skill := filepath.Join(shared, "api")
+	if err := os.MkdirAll(skill, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A generated skill from a build that predates stamping: the marker and
+	// the body fingerprint, but no owner line.
+	body := "---\nname: \"api\"\ndescription: \"d\"\n---\n\n" + GeneratedMarker + "\n\n# Api Conventions\n\n## Rules\n\n" + inlineRulesIntro + "\n"
+	if err := os.WriteFile(filepath.Join(skill, "SKILL.md"), []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s := stateWith(approvedRule("R", "do it", "api", "stated", 1))
+	s.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
+	pr, err := Validate(&s, t.TempDir(), Options{SkillsDir: shared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pr.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(pr.Warnings(), "unstamped generated skill") {
+		t.Errorf("an unstamped-skill takeover must be reported, got %v", pr.Warnings())
+	}
+}
+
+// A rename, fork, or transfer changes the stamp without changing who wrote
+// the skill, and the two standing remedies do not apply to it.
+func TestSharedStampMismatchNamesTheRenameRemedy(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	old := stateWith(approvedRule("R", "do it", "api", "stated", 1))
+	old.Repo = state.RepoInfo{Owner: "acme", Repo: "oldname"}
+	if err := Write(old, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	renamed := stateWith(approvedRule("R", "do it", "api", "stated", 1))
+	renamed.Repo = state.RepoInfo{Owner: "acme", Repo: "newname"}
+	err := Write(renamed, t.TempDir(), Options{SkillsDir: shared})
+	if err == nil {
+		t.Fatal("a foreign stamp in a shared directory must still be refused")
+	}
+	if !strings.Contains(err.Error(), "rename, fork, or transfer") {
+		t.Errorf("the refusal must name the remedy that fits a renamed repo, got %v", err)
+	}
+}
+
+func ptr(s state.State) *state.State { return &s }
+
+func containsSubstring(haystack []string, want string) bool {
+	for _, h := range haystack {
+		if strings.Contains(h, want) {
+			return true
+		}
+	}
+	return false
 }

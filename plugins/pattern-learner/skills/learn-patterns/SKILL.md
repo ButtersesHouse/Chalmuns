@@ -572,9 +572,16 @@ This writes:
     examples gets `<domain>/examples/<slug>.md` (all do/don't pairs, real-instance
     refs, context) and the SKILL.md rule entry links it — the consuming agent reads
     it at its discretion when it wants the code.
-  - **Very large skills are chunked** (when the rendered SKILL.md would exceed the
-    ~450-line threshold, honoring the documented "keep SKILL.md under 500 lines"
-    limit): SKILL.md becomes a **rule index** (title + globs, grouped by confidence,
+  - **Each rule states its own scope when the domain's rules differ.** The
+    `paths:` gate is the union of every rule's `file_glob`, so a skill loaded
+    for one file can carry rules scoped to others. When the domain's rules do
+    not all share one scope, each rule entry carries an `**Applies to:**` line
+    naming its own globs (a repo-wide rule says so in words). When they do all
+    share one scope the frontmatter already states it and no per-rule lines are
+    emitted.
+  - **Very large skills are chunked** (when the rendered body would reach the
+    400-line warn threshold `audit-format` applies, honoring the documented
+    "keep SKILL.md under 500 lines" limit): SKILL.md becomes a **rule index** (title + globs, grouped by confidence,
     each entry linking `<domain>/rules/<slug>.md`), and each rule file carries the
     full rule with its examples inline. The index also tells the agent it can
     `grep -ril "<keyword>" rules/` for full-text lookup.
@@ -648,8 +655,8 @@ This writes:
 ### Step 12.5: Format check
 
 `write-outputs` already keeps generated skills inside the documented body-line
-budget itself (inline rules while the render fits under ~450 lines, otherwise
-the chunked `rules/` index described in Step 12). So this step is **not** a
+budget itself (inline rules while the body fits under the 400-line warn
+threshold, otherwise the chunked `rules/` index described in Step 12). So this step is **not** a
 size-management step — it verifies the one thing the generator does not check:
 that the **frontmatter it emitted is valid**. The domain name is written to
 `name:` verbatim and the description comes from your `domain_descriptions`
@@ -673,23 +680,24 @@ rubric (`references/rubric.md` there carries the citations).
 
 For each result:
 
-- **`frontmatter_issues` non-empty — act on this.** The domain name or its
-  generated description violates a documented frontmatter rule (e.g. Step
-  8B/A3 canonicalized a domain to `Legacy_API`, which breaks the
-  lowercase/digits/hyphens charset rule, or `domain_descriptions[domain]`
-  grew past 1024 chars). A skill whose `name` breaks the charset rule may
-  fail to register, so this is worth fixing. A `not valid YAML` finding on a
-  file `write-outputs` just wrote is a generator bug (it quotes every value
-  it emits) — STOP and report it, as with `over_budget` below.
+- **`frontmatter_issues` non-empty — act on this.** The domain name violates
+  a documented frontmatter rule (e.g. Step 8B/A3 canonicalized a domain to
+  `Legacy_API`, which breaks the lowercase/digits/hyphens charset rule). A
+  skill whose `name` breaks the charset rule may fail to register, so this
+  is worth fixing. A `not valid YAML` finding, or any finding about the
+  *description*, on a file `write-outputs` just wrote is a generator bug (it
+  quotes every value it emits, and it truncates every description — your
+  `domain_descriptions` override included — well under the length limit, so
+  a length finding cannot come from state) — STOP and report it, as with
+  `over_budget` below.
 
   Fix it at the **state** level, never by hand-editing the generated file —
   `write-outputs` rewrites that file wholesale from state on every run, so a
   hand-edit is silently discarded next run. Propose to the user a corrected
-  domain name (valid charset) or a shortened `domain_descriptions[domain]`
-  entry. On approval, re-target the affected rules' `target.location` and/or
-  update the description, then re-run **Step 11** (state-write) and **Step
-  12** (write-outputs), and re-run this check to confirm it comes back
-  clean. On decline, note it in the Step 13 summary and continue.
+  domain name (valid charset). On approval, re-target the affected rules'
+  `target.location`, then re-run **Step 11** (state-write) and **Step 12**
+  (write-outputs), and re-run this check to confirm it comes back clean. On
+  decline, note it in the Step 13 summary and continue.
 
 - **`over_budget` / `approaching_budget` — this is a generator bug, not
   something to fix by hand.** Step 12's chunking is supposed to make this
@@ -699,6 +707,13 @@ For each result:
   Per the Tooling policy, **STOP and report it** — do not re-split the
   domain by hand and do not edit the emitted file. Include the domain name
   and the reported `body_lines` so the generator can be fixed.
+
+- **A non-zero exit — a path was not audited.** `audit-format` fails when it
+  cannot read one of the paths you gave it, and names them. That is a
+  mistake in the path list, not a finding about the skill: the file was
+  never opened, so its empty `frontmatter_issues` means nothing. Re-check
+  the paths against what Step 12 reported it wrote and run it again. Do not
+  report the run's skills as format-clean until every path audited.
 
 This step never edits a file or state on its own.
 

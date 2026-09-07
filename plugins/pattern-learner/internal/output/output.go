@@ -233,6 +233,7 @@ func (pr *Prepared) Write() error {
 	if err := p.validateDisk(); err != nil {
 		return err
 	}
+	pr.warnings = append(pr.warnings, p.warnings...)
 	for domain, rules := range p.byDomain {
 		if err := writeSkillFile(domain, rules, p.globs[domain], p.isUniversal(domain), p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
 			return err
@@ -302,6 +303,9 @@ type plan struct {
 	// hasUniversal records whether repo-wide rules were merged under
 	// UniversalSkillName; only then is that domain rendered ungated.
 	hasUniversal bool
+	// warnings are conditions validateDisk resolved in the run's favour but
+	// the user should hear about; Write hands them to Prepared.
+	warnings []string
 }
 
 func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan {
@@ -392,6 +396,19 @@ func (p *plan) validateRules() error {
 // anchoring step can sit between the two.
 func (p *plan) validateDisk() error {
 	skillsDir, shared, owner := p.skillsDir, p.shared, p.owner
+	// A shared skills directory is kept safe entirely by the owner stamp:
+	// it is what stops one repository's run from overwriting another's
+	// skill, and what lets a run recognise its own stale skills to prune. A
+	// run with no identity has neither, and both consequences used to be
+	// silent — it wrote unstamped skills that the next repository with the
+	// same domain name could claim, and pruning's unattributable case has
+	// no diagnostic of its own, so its stale skills accumulated forever.
+	// Writing is still allowed (one repository pointing --skills-dir at a
+	// directory of its own is the ordinary case, and nothing is at risk
+	// there), but the user is told what the run cannot do for itself.
+	if shared && owner == "" && len(p.byDomain) > 0 {
+		p.warnings = append(p.warnings, fmt.Sprintf("%s is outside this repository and this run has no repository identity, so its skills are written unstamped: they cannot be told apart from another repository's, which means this run will never prune its own stale skills there and another repository writing the same domain name would take them over. Pass --repo owner/name, set repo in the state file, or add a git remote to have them stamped", skillsDir))
+	}
 	for domain := range p.byDomain {
 		// A directory already at this path that this generator did not
 		// write is someone's hand-authored skill (or hand-kept material);
@@ -426,27 +443,50 @@ func (p *plan) validateDisk() error {
 			if !hasGeneratedEntries(skillDir) {
 				continue
 			}
+			// Provenance is read off SKILL.md, so a directory that has the
+			// generated companion trees but no SKILL.md cannot be judged
+			// either way. It is refused like a foreign one — its examples/
+			// and rules/ are entries regeneration replaces, so they are not
+			// carried over and would be lost — but it is not *called*
+			// foreign: the usual cause is this generator's own run dying
+			// between writing the companions and writing SKILL.md, and
+			// telling the user we did not write it is simply false.
+			if classifySlot(filepath.Join(skillDir, "SKILL.md")) == slotAbsent {
+				return fmt.Errorf("%s holds the examples/ and rules/ of a generated skill but no SKILL.md, so it cannot be attributed; if it is the leftover of an interrupted pattern-learner run, delete it and rerun — if the files are yours, move them out of that directory first", skillDir)
+			}
 			existing = inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
 			if !existing.generated {
 				return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 			}
 		}
 		if shared {
-			// Any stamp that is not ours, including when this run has no
-			// identity of its own, marks another repository's skill. An
-			// unstamped generated skill (written before stamping) cannot be
-			// attributed; regenerating it is the only way to migrate it, and
-			// its content is reproducible from whichever state wrote it.
+			// A stamp that is not ours marks another repository's skill.
 			if existing.stamped && existing.stamp != owner {
-				runFor := owner
-				if runFor == "" {
-					runFor = "an unidentified repository (no --repo, state.repo, or git remote)"
-				}
 				remedy := "rename the domain in one of them or use separate skills directories"
 				if p.isUniversal(domain) {
 					remedy = "the universal '" + UniversalSkillName + "' skill has a fixed name, so give each repository its own skills directory"
 				}
-				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s", skillDir, existing.stamp, runFor, remedy)
+				// A rename, fork, or org transfer changes the stamp without
+				// changing who wrote the skill, and neither remedy above
+				// applies to it: the two "repositories" are the same one.
+				// Repo-local runs are let through for exactly this reason
+				// (see the comment above); a shared directory cannot tell
+				// the cases apart, so it names the third way out instead of
+				// refusing with advice that does not fit.
+				runFor := fmt.Sprintf("%q", owner)
+				if owner == "" {
+					runFor = "an unidentified repository (no --repo, state.repo, or git remote)"
+				}
+				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s, or, if this is that same repository after a rename, fork, or transfer, delete %s (it is regenerated from state) and rerun", skillDir, existing.stamp, runFor, remedy, skillDir)
+			}
+			// An unstamped generated skill was written by some repository
+			// before stamping and cannot be attributed. Regenerating it is
+			// the only migration path, and its content is reproducible from
+			// whichever state wrote it — but the run doing the regenerating
+			// is not necessarily the one that wrote it, so this is a
+			// takeover and is reported rather than done silently.
+			if existing.generated && !existing.stamped {
+				p.warnings = append(p.warnings, fmt.Sprintf("%s is an unstamped generated skill in a shared skills directory, so it cannot be attributed; this run claimed it for %q and stamped it. If another repository wrote it, re-run that repository's write-outputs to get its version back, and give the two repositories separate skills directories", skillDir, owner))
 			}
 		}
 	}
@@ -1051,7 +1091,7 @@ func renderSkillDir(dir, domain, desc string, globs []string, universal bool, ru
 	// the imperative rules plus pointers the consuming agent follows at its
 	// discretion when it wants the do/don't code.
 	inline := header + renderInlineRules(rules, slugs, watermark, opts)
-	if lineCount(inline) <= maxSkillLines {
+	if bodyLines(inline) < maxSkillBodyLines {
 		if err := atomicWrite(filepath.Join(dir, "SKILL.md"), inline); err != nil {
 			return err
 		}
@@ -1109,9 +1149,41 @@ func swapDir(staging, live, retired string) error {
 	return nil
 }
 
-// maxSkillLines is the chunking threshold for a generated domain SKILL.md,
-// with headroom under the documented limit ("Keep SKILL.md under 500 lines").
-const maxSkillLines = 450
+// maxSkillBodyLines is the chunking threshold for a generated domain
+// SKILL.md, with headroom under the documented limit ("Keep SKILL.md under
+// 500 lines").
+//
+// It is the audit's *warn* threshold, and it is counted the way the audit
+// counts — body lines only, frontmatter excluded — because the two have to
+// agree. They did not: chunking triggered above 450 lines of whole file
+// while audit-format warns at 400 lines of body, so a domain landing in the
+// band between rendered inline and then came back `approaching_budget`,
+// which Step 12.5 of the learn-patterns skill tells the agent is a
+// generator bug to stop the run and report. Chunking at the same number the
+// audit warns at closes the band: a skill this generator emits can never
+// report approaching_budget or over_budget.
+const maxSkillBodyLines = format.BodyLineWarn
+
+// bodyLines counts a rendered SKILL.md the way audit-format will: the
+// frontmatter block is parsed off and only what follows is counted.
+func bodyLines(skill string) int {
+	_, body, _ := format.ParseFrontmatter(skill)
+	return countBodyLines(body)
+}
+
+// countBodyLines mirrors format.countLines (a trailing newline does not add
+// an empty final line), so the generator's own budget check and the audit
+// that later grades its output never disagree by one.
+func countBodyLines(body string) int {
+	if body == "" {
+		return 0
+	}
+	n := strings.Count(body, "\n")
+	if strings.HasSuffix(body, "\n") {
+		return n
+	}
+	return n + 1
+}
 
 // maxExamplePairs caps rendered do/don't pairs; state caps the arrays at 4.
 const maxExamplePairs = 4
@@ -1143,7 +1215,18 @@ func renderSkillHeader(domain, desc string, globs []string, universal bool, rule
 	switch {
 	case universal:
 		b.WriteString("# Repo-Wide Conventions\n\n")
-		b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
+		// The blanket sentence is only true when every rule here is
+		// repo-wide. It is not when a scoped domain happened to be named
+		// UniversalSkillName and got merged in by buildPlan: those rules keep
+		// their own file_glob, which this file carries no paths gate for.
+		// Claiming they govern every file would contradict the state they
+		// came from, so say what is actually true and point at the per-rule
+		// scope lines renderInlineRules emits for exactly this case.
+		if uniformScope(rules) {
+			b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
+		} else {
+			b.WriteString("These rules apply to every file in this repository, regardless of what you are editing — except where a rule names an **Applies to:** scope of its own, which narrows it to the files that scope matches.\n\n")
+		}
 	case strings.EqualFold(headingTitle(domain), "Conventions"):
 		b.WriteString("# Conventions\n\n")
 	default:
@@ -1165,8 +1248,19 @@ func renderInlineRules(rules []state.Rule, slugs []string, watermark int, opts O
 	var b strings.Builder
 	b.WriteString("## Rules\n\n")
 	b.WriteString(inlineRulesIntro + "\n\n")
+	// The paths gate is the union of every rule's globs, so a skill loaded
+	// for one file carries rules scoped to others. When the rules do not all
+	// share one scope, each states its own — the chunked layout has always
+	// done this ("Applies to:" in writeRuleChunks) and the inline layout
+	// dropped it, so the same rule read narrowly in one layout read
+	// repo-wide in the other. When every rule shares one scope the frontmatter
+	// already says it and per-rule lines would only cost body budget.
+	perRuleScope := !uniformScope(rules)
 	for i, r := range rules {
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
+		if perRuleScope {
+			b.WriteString(scopeLine(r) + "\n\n")
+		}
 		b.WriteString(r.Rule + "\n\n")
 		if hasExamples(r) {
 			b.WriteString(fmt.Sprintf("_Examples: `examples/%s.md`_\n\n", slugs[i]))
@@ -1175,6 +1269,37 @@ func renderInlineRules(rules []state.Rule, slugs []string, watermark int, opts O
 		writeRAGHint(&b, r, opts)
 	}
 	return b.String()
+}
+
+// uniformScope reports whether every rule in a domain is scoped to the same
+// set of globs, which is when the frontmatter `paths` gate describes each
+// rule as accurately as a per-rule line would.
+func uniformScope(rules []state.Rule) bool {
+	if len(rules) < 2 {
+		return true
+	}
+	first := scopeKey(rules[0])
+	for _, r := range rules[1:] {
+		if scopeKey(r) != first {
+			return false
+		}
+	}
+	return true
+}
+
+func scopeKey(r state.Rule) string {
+	return strings.Join(DedupeStrings(r.Target.FileGlob), "\x00")
+}
+
+// scopeLine states one rule's own scope in the body. A rule with no globs
+// is a repo-wide rule; saying so matters most in the merged domain, where
+// it sits beside scoped ones under a heading that speaks for the whole file.
+func scopeLine(r state.Rule) string {
+	globs := DedupeStrings(r.Target.FileGlob)
+	if len(globs) == 0 {
+		return "**Applies to:** every file in this repository."
+	}
+	return "**Applies to:** `" + strings.Join(globs, "`, `") + "`"
 }
 
 // writeExampleFiles writes one examples/<slug>.md per rule that has examples,
@@ -1305,21 +1430,27 @@ func slugify(title string) string {
 
 // ruleSlugs returns one unique slug per rule (suffixing -2, -3, … on collision).
 func ruleSlugs(rules []state.Rule) []string {
-	seen := map[string]int{}
+	// Every name handed out is recorded, the suffixed ones included, and a
+	// candidate is retried until it is free. Counting only the bare slugs
+	// is not enough: two rules titled "Use Tabs" produce "use-tabs" and
+	// "use-tabs-2", and a third titled "Use Tabs 2" slugifies to
+	// "use-tabs-2" on its own — a name the counter has never seen. The two
+	// then share a companion file, so in the inline layout one rule's
+	// examples/<slug>.md silently overwrites the other's, and in the
+	// chunked layout one approved rule is missing from the tree entirely
+	// while the index still links to its slug.
+	seen := map[string]bool{}
 	out := make([]string, len(rules))
 	for i, r := range rules {
-		s := slugify(r.Title)
-		seen[s]++
-		if n := seen[s]; n > 1 {
-			s = fmt.Sprintf("%s-%d", s, n)
+		base := slugify(r.Title)
+		s := base
+		for n := 2; seen[s]; n++ {
+			s = fmt.Sprintf("%s-%d", base, n)
 		}
+		seen[s] = true
 		out[i] = s
 	}
 	return out
-}
-
-func lineCount(s string) int {
-	return strings.Count(s, "\n") + 1
 }
 
 // renderExamples writes do/don't example pairs (up to maxPairs) before rule prose.

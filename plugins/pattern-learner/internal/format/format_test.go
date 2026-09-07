@@ -223,3 +223,110 @@ func TestAuditFile_duplicateKey(t *testing.T) {
 // The integration tests against the generator live in
 // format_integration_test.go (an external test package) because the
 // generator imports this package.
+
+// --- regressions from the adversarial audit ---
+
+// A file that could not be read was not audited. The documented decision
+// procedure reads only frontmatter_issues and the budget flags, all empty
+// here, so exiting 0 made a missing path indistinguishable from a clean
+// skill and the caller reported "frontmatter valid for all N domain skills"
+// about a file nothing had looked at.
+func TestRunAuditFormatFailsOnUnreadablePath(t *testing.T) {
+	dir := t.TempDir()
+	good := writeSkill(t, dir, "SKILL.md", "name: api\ndescription: d", "body\n")
+	err := RunAuditFormat([]string{good, filepath.Join(dir, "typo", "SKILL.md")})
+	if err == nil {
+		t.Fatal("an unreadable path must not audit as clean")
+	}
+	if !strings.Contains(err.Error(), "not audited") {
+		t.Errorf("the error must say the file was not audited, got %v", err)
+	}
+}
+
+// An unread file's issue list must still encode as [], never null.
+func TestUnreadableResultHasEmptyIssueList(t *testing.T) {
+	if res := AuditFile("/nonexistent/SKILL.md"); res.FrontmatterIssues == nil {
+		t.Error("FrontmatterIssues must be non-nil so it encodes as [] rather than null")
+	}
+}
+
+// Only paths is documented as taking a list. Flattening every key's list
+// turned name and description written as one-item lists into plain strings
+// that then passed every check.
+func TestListValuedNameAndDescriptionAreReported(t *testing.T) {
+	dir := t.TempDir()
+	res := AuditFile(writeSkill(t, dir, "SKILL.md", "name:\n  - api\ndescription:\n  - d", "body\n"))
+	for _, key := range []string{"name", "description"} {
+		want := "frontmatter field '" + key + "' is a list"
+		found := false
+		for _, iss := range res.FrontmatterIssues {
+			if strings.Contains(iss, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("a list-valued %s must be reported, got %v", key, res.FrontmatterIssues)
+		}
+	}
+	// ...and not reported a second time as missing, which sends the agent
+	// after a different remedy for the same defect.
+	for _, iss := range res.FrontmatterIssues {
+		if strings.Contains(iss, "missing required") {
+			t.Errorf("a malformed key must not also be reported absent: %v", res.FrontmatterIssues)
+		}
+	}
+	// paths keeps the list form: .claude/rules files write globs that way.
+	res = AuditFile(writeSkill(t, dir, "P.md", "name: api\ndescription: d\npaths:\n  - \"src/**/*.go\"\n  - \"lib/**/*.go\"", "body\n"))
+	if len(res.FrontmatterIssues) != 0 {
+		t.Errorf("a list-valued paths is the documented form: %v", res.FrontmatterIssues)
+	}
+}
+
+// A nested mapping value is one defect and must produce one finding.
+func TestNestedMappingIsNotAlsoReportedMissing(t *testing.T) {
+	dir := t.TempDir()
+	res := AuditFile(writeSkill(t, dir, "SKILL.md", "name: api\ndescription:\n  a: b", "body\n"))
+	nested, missing := 0, 0
+	for _, iss := range res.FrontmatterIssues {
+		if strings.Contains(iss, "nested value") {
+			nested++
+		}
+		if strings.Contains(iss, "missing required 'description'") {
+			missing++
+		}
+	}
+	if nested != 1 || missing != 0 {
+		t.Errorf("want one nested-value finding and no missing-key finding, got %v", res.FrontmatterIssues)
+	}
+}
+
+// The fences are whole lines. A line merely starting with "---" used to end
+// the block, so the audit graded a shorter frontmatter than the loader reads.
+func TestClosingFenceMustBeExact(t *testing.T) {
+	text := "---\nname: api\n---- not a fence\ndescription: d\n---\nbody\n"
+	fields, body, issues := ParseFrontmatter(text)
+	if fields["description"] != "d" {
+		t.Errorf("the block runs to the real fence; got fields %v, issues %v", fields, issues)
+	}
+	if strings.Contains(body, "description") {
+		t.Errorf("the frontmatter must not leak into the body: %q", body)
+	}
+}
+
+// A BOM sits before the opening fence, and the pattern is anchored at byte 0:
+// leaving it in place hid the frontmatter completely, so a file that plainly
+// has name and description was reported as missing both.
+func TestBOMDoesNotHideFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte("\ufeff---\nname: api\ndescription: d\n---\nbody\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res := AuditFile(path)
+	if res.Name != "api" {
+		t.Errorf("a BOM must not hide the frontmatter, got name %q", res.Name)
+	}
+	if len(res.FrontmatterIssues) != 0 {
+		t.Errorf("no issues expected, got %v", res.FrontmatterIssues)
+	}
+}

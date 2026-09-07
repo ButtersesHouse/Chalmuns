@@ -181,9 +181,9 @@ func runWriteOutputs(args []string) error {
 	// Anchoring enriches s in place; Write reads it through the pointer
 	// Validate holds.
 	if ragAnchor {
-		anchorExamplesRAG(&s, outputDir)
+		anchorExamplesRAG(&s, outputDir, opts.SkillsDir)
 	} else {
-		anchorExamples(&s, outputDir)
+		anchorExamples(&s, outputDir, opts.SkillsDir)
 	}
 
 	err = prepared.Write()
@@ -297,6 +297,10 @@ func runPromote(args []string) error {
 	}
 
 	skillsDir := output.ResolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir)
+	promoteRoot, inGit := repoRoot(statePath)
+	if !inGit {
+		promoteRoot = outputDir
+	}
 
 	// Default to AGENTS.md (the cross-agent convention) when no target is
 	// named; agents other than Claude Code have no other entry point.
@@ -323,8 +327,15 @@ func runPromote(args []string) error {
 		SkillsDir: skillsDir,
 		Create:    hasFlag(args, "--create"),
 		// Inside the repository a link must hold on every checkout, so it
-		// is written relative to the target file.
-		RelativeLinks: output.IsInside(skillsDir, outputDir),
+		// is written relative to the target file. The judgement is made
+		// against the git top level, exactly as write-outputs makes it
+		// (repoRoot, and Options.RepoRoot's doc on why outputDir alone is
+		// not safe): outputDir is the project the state belongs to, which
+		// in a monorepo service — or under any --output-dir below the root
+		// — is not the root, so a skills directory write-outputs correctly
+		// calls the repository's own was called shared here and promoted
+		// with absolute, machine-local links.
+		RelativeLinks: output.IsInside(skillsDir, promoteRoot),
 	}
 	results := make([]output.PromoteResult, 0, len(targets))
 	for _, t := range targets {
@@ -343,13 +354,13 @@ func runPromote(args []string) error {
 // anchorExamplesRAG uses cursor-agent to semantically find real codebase instances
 // of each approved rule's pattern and sets FileRef when found. Falls back to
 // grep-based anchorExamples if cursor-agent is unavailable or returns no result.
-func anchorExamplesRAG(s *state.State, outputDir string) {
+func anchorExamplesRAG(s *state.State, outputDir, skillsDir string) {
 	if !isCursorAgentAvailable() {
-		anchorExamples(s, outputDir)
+		anchorExamples(s, outputDir, skillsDir)
 		return
 	}
 
-	matcher := newGlobMatcher(outputDir, approvedGlobs(s))
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s), skillsDir)
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 {
@@ -498,8 +509,8 @@ func anchorSingleRule(r *state.Rule, outputDir string, matcher *globMatcher) {
 // anchorExamples does a best-effort grep search for real codebase instances of
 // each approved rule's first do_example and sets FileRef when found. Errors are
 // silently ignored — this is advisory metadata only.
-func anchorExamples(s *state.State, outputDir string) {
-	matcher := newGlobMatcher(outputDir, approvedGlobs(s))
+func anchorExamples(s *state.State, outputDir, skillsDir string) {
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s), skillsDir)
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
@@ -524,10 +535,29 @@ type globMatcher struct {
 	globs   []string
 	matches map[string][]string
 	walked  bool
+	// skipDirs are absolute directories the walk does not descend into,
+	// beyond the fixed skipNames below.
+	skipDirs map[string]bool
 }
 
-func newGlobMatcher(root string, globs []string) *globMatcher {
-	return &globMatcher{root: root, globs: globs}
+// skipNames are directories whose contents are never a real instance of the
+// team's own convention: version-control metadata, and the two conventional
+// dependency trees. Anchoring a rule to third-party code would put someone
+// else's file under "Real instance" and in "Exemplary Files", which tells
+// the reader to imitate it.
+var skipNames = map[string]bool{".git": true, "node_modules": true, "vendor": true}
+
+func newGlobMatcher(root string, globs []string, skip ...string) *globMatcher {
+	skipped := map[string]bool{}
+	for _, dir := range skip {
+		if dir == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(dir); err == nil {
+			skipped[abs] = true
+		}
+	}
+	return &globMatcher{root: root, globs: globs, skipDirs: skipped}
 }
 
 // files returns the files under root matching glob. The walk happens on
@@ -593,7 +623,7 @@ func (m *globMatcher) walkAll() {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == "node_modules" {
+			if skipNames[d.Name()] || m.skipDirs[p] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -618,9 +648,48 @@ func (m *globMatcher) walkAll() {
 // and a "**" alternative can find the same file by both routes.
 func (m *globMatcher) dedupMatches() {
 	for glob, files := range m.matches {
-		if len(files) >= 2 {
-			m.matches[glob] = output.DedupeStrings(files)
+		kept := files[:0]
+		for _, f := range files {
+			if !m.skipped(f) {
+				kept = append(kept, f)
+			}
 		}
+		m.matches[glob] = output.DedupeStrings(kept)
+	}
+}
+
+// skipped reports whether a matched file lies under a directory anchoring
+// must not cite. The tree walk already prunes those, but the plain-glob
+// route goes through filepath.Glob, which does no walking and would still
+// return e.g. `.claude/skills/api/examples/x.md` for "**"-free patterns.
+func (m *globMatcher) skipped(file string) bool {
+	rel, err := filepath.Rel(m.root, file)
+	if err != nil {
+		return false
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if skipNames[seg] {
+			return true
+		}
+	}
+	if len(m.skipDirs) == 0 {
+		return false
+	}
+	// skipDirs holds absolute paths, so compare on absolute ones: root (and
+	// therefore every match built from it) may be relative.
+	abs, err := filepath.Abs(file)
+	if err != nil {
+		return false
+	}
+	for d := filepath.Dir(abs); ; {
+		if m.skipDirs[d] {
+			return true
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return false
+		}
+		d = parent
 	}
 }
 

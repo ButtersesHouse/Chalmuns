@@ -5,7 +5,7 @@
 //
 // Scope, and why it is narrow. output.Write already keeps generated skills
 // within the documented body-line budget itself: it renders rules inline
-// while the result fits under maxSkillLines (450) and otherwise chunks the
+// while the body fits under maxSkillBodyLines (BodyLineWarn) and chunks the
 // domain into rules/<slug>.md plus an index, and it emits examples/<slug>.md
 // companion files. Those companions are one link-hop from SKILL.md by
 // construction, so the reference-nesting and TOC checks in the sibling
@@ -55,7 +55,11 @@ const (
 var (
 	reservedWords = []string{"claude", "anthropic"}
 	reNameChars   = regexp.MustCompile(`^[a-z0-9-]+$`)
-	reFrontmatter = regexp.MustCompile(`(?s)^---\s*\n(.*?)\n---\s*\n?`)
+	// The fences are whole lines. `\s` would match a newline, so `\s*\n?`
+	// let the closing fence match at any line merely *starting* with "---"
+	// ("----", "--- x"), cutting the block short of where a real YAML
+	// loader ends it and grading the truncated remainder clean.
+	reFrontmatter = regexp.MustCompile(`(?s)\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\z)`)
 	reFMField     = regexp.MustCompile(`^([A-Za-z_-]+):\s*(.*)$`)
 )
 
@@ -73,7 +77,7 @@ type Result struct {
 // AuditFile reads path and checks it against the body-line budget and
 // frontmatter validity rules.
 func AuditFile(path string) Result {
-	res := Result{Path: path}
+	res := Result{Path: path, FrontmatterIssues: []string{}}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		res.Error = err.Error()
@@ -86,7 +90,7 @@ func AuditFile(path string) Result {
 	res.BodyLines = countLines(body)
 	res.OverBudget = res.BodyLines > BodyLineLimit
 	res.ApproachingBudget = !res.OverBudget && res.BodyLines >= BodyLineWarn
-	res.FrontmatterIssues = append(parseIssues, checkFrontmatter(fields)...)
+	res.FrontmatterIssues = append(parseIssues, checkFrontmatter(fields, reported(parseIssues))...)
 	return res
 }
 
@@ -110,6 +114,12 @@ func AuditFile(path string) Result {
 func ParseFrontmatter(text string) (fields map[string]string, body string, issues []string) {
 	fields = map[string]string{}
 	issues = []string{}
+	// A UTF-8 BOM sits before the opening fence, and the pattern is anchored
+	// at byte 0, so leaving it in place hides the frontmatter completely:
+	// the audit then reports name and description missing from a file that
+	// plainly has both, and the generator fails to recognise a skill it
+	// wrote itself and refuses the run over it.
+	text = strings.TrimPrefix(text, "\ufeff")
 	m := reFrontmatter.FindStringSubmatchIndex(text)
 	if m == nil {
 		return fields, text, issues
@@ -138,20 +148,30 @@ func ParseFrontmatter(text string) (fields map[string]string, body string, issue
 		return fields, body, issues
 	}
 	seen := map[string]bool{}
+	// Keys reported malformed here are deliberately left out of fields, so
+	// checkFrontmatter must not then also report them absent: one defect
+	// handed to the agent as two findings with different remedies sends it
+	// after the wrong one.
+	malformed := map[string]bool{}
 	for i := 0; i+1 < len(top.Content); i += 2 {
 		k, node := top.Content[i].Value, top.Content[i+1]
 		if seen[k] {
 			issues = append(issues, fmt.Sprintf("frontmatter key '%s' appears more than once; strict YAML loaders reject the file", k))
 		}
 		seen[k] = true
-		switch node.Kind {
-		case yaml.ScalarNode:
+		switch {
+		case node.Kind == yaml.ScalarNode:
 			if node.Tag == "!!null" {
 				fields[k] = ""
 			} else {
 				fields[k] = node.Value
 			}
-		case yaml.SequenceNode:
+		case node.Kind == yaml.SequenceNode && listValued[k]:
+			// Only paths is documented as a list (the .claude/rules form).
+			// Flattening every key's list turned `name:` and `description:`
+			// written as one-item lists into plain strings that then passed
+			// every check — a false clean on a file Claude Code would hand a
+			// list where it wants a string.
 			parts := make([]string, 0, len(node.Content))
 			nested := false
 			for _, item := range node.Content {
@@ -165,14 +185,44 @@ func ParseFrontmatter(text string) (fields map[string]string, body string, issue
 				// Report the nested item only; storing a partial join would
 				// trigger a second, spurious empty-glob finding.
 				issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+				malformed[k] = true
 				continue
 			}
 			fields[k] = strings.Join(parts, ",")
+		case node.Kind == yaml.SequenceNode:
+			issues = append(issues, fmt.Sprintf("frontmatter field '%s' is a list; expected a string", k))
+			malformed[k] = true
 		default:
 			issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+			malformed[k] = true
 		}
 	}
+	for k := range malformed {
+		delete(fields, k)
+	}
 	return fields, body, issues
+}
+
+// listValued names the frontmatter keys a YAML list is a legitimate form
+// for. paths is the only one: .claude/rules files write their globs as a
+// list, and the audit reads those too.
+var listValued = map[string]bool{"paths": true}
+
+// reported maps the keys ParseFrontmatter named in its own issues, so
+// checkFrontmatter can stay quiet about them. The issue text is the one
+// carrier between the two: the alternative is a third return value on an
+// exported function whose only caller in the module is AuditFile.
+func reported(issues []string) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range issues {
+		if i := strings.Index(s, "frontmatter field '"); i >= 0 {
+			rest := s[i+len("frontmatter field '"):]
+			if j := strings.Index(rest, "'"); j > 0 {
+				out[rest[:j]] = true
+			}
+		}
+	}
+	return out
 }
 
 // lenientFields is the pre-YAML line reader, kept only as the fallback for a
@@ -208,13 +258,16 @@ func countLines(body string) int {
 // right-format-skills rubric and are deliberately not re-flagged here —
 // pattern-learner's domain names are dictated by codebase structure
 // (api, auth, models, ...), not chosen for gerund style.
-func checkFrontmatter(fields map[string]string) []string {
+func checkFrontmatter(fields map[string]string, malformed map[string]bool) []string {
 	// Non-nil so the JSON output reads as an empty list, not null.
 	issues := []string{}
 	name := fields["name"]
 	desc := fields["description"]
 
-	if name == "" {
+	if name == "" && malformed["name"] {
+		// Already reported as malformed by ParseFrontmatter; "missing" would
+		// be a second, contradictory finding for the one defect.
+	} else if name == "" {
 		issues = append(issues, "frontmatter missing required 'name'")
 	} else {
 		if n := utf8.RuneCountInString(name); n > NameMaxChars {
@@ -231,7 +284,9 @@ func checkFrontmatter(fields map[string]string) []string {
 		}
 	}
 
-	if desc == "" {
+	if desc == "" && malformed["description"] {
+		// See the name branch above.
+	} else if desc == "" {
 		issues = append(issues, "frontmatter missing required 'description'")
 	} else if n := utf8.RuneCountInString(desc); n > DescMaxChars {
 		issues = append(issues, fmt.Sprintf("description exceeds %d chars (%d)", DescMaxChars, n))
@@ -261,10 +316,28 @@ func RunAuditFormat(args []string) error {
 		return fmt.Errorf("usage: audit-format <path> [<path> ...]")
 	}
 	results := make([]Result, 0, len(args))
+	var unread []string
 	for _, path := range args {
-		results = append(results, AuditFile(path))
+		res := AuditFile(path)
+		if res.Error != "" {
+			unread = append(unread, path)
+		}
+		results = append(results, res)
 	}
-	return encodeResults(os.Stdout, results)
+	if err := encodeResults(os.Stdout, results); err != nil {
+		return err
+	}
+	// A file that could not be read was not audited, and the documented
+	// decision procedure reads only frontmatter_issues and the budget flags
+	// — all of which are empty here. Exiting 0 made a missing or misspelled
+	// path indistinguishable from a clean skill, so the caller was told
+	// "frontmatter valid for all N domain skills" about files nothing looked
+	// at. Fail instead, naming them.
+	if len(unread) > 0 {
+		return fmt.Errorf("could not read %d of %d file(s), so they were not audited: %s",
+			len(unread), len(args), strings.Join(unread, ", "))
+	}
+	return nil
 }
 
 func encodeResults(w io.Writer, results []Result) error {

@@ -672,3 +672,81 @@ func TestFlagParsingIsStrict(t *testing.T) {
 		t.Error("a value flag with no value should error")
 	}
 }
+
+// --- regressions from the adversarial audit ---
+
+// promote judges in-repo-ness against the git top level, exactly as
+// write-outputs does. Judging against the project directory made a
+// monorepo service's own skills directory look shared, so the managed block
+// got absolute, machine-local links that break on every other checkout.
+func TestPromoteJudgesInRepoAgainstGitTopLevel(t *testing.T) {
+	mono := t.TempDir()
+	if out, err := exec.Command("git", "-C", mono, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	proj := filepath.Join(mono, "svc")
+	stateDir := filepath.Join(proj, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A skills directory inside the repository but above the project: not
+	// inside outputDir, so the old judgement called it shared.
+	skills := filepath.Join(mono, "shared-skills")
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "Rule", Rule: "Do it.", Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "api", FileGlob: []string{"src/**/*.go"}},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "a", Snippet: "q", Strength: "explicit"}},
+	}}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWriteOutputs([]string{"--state", statePath, "--skills-dir", skills}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPromote([]string{"--state", statePath, "--skills-dir", skills, "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(proj, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), mono) {
+		t.Errorf("a skills dir inside the repository must be linked relatively, got absolute paths:\n%s", got)
+	}
+}
+
+// Anchoring must not cite the generator's own output as a real instance of
+// the team's convention, nor third-party code in a vendor tree.
+func TestAnchoringSkipsGeneratedOutputAndVendoredCode(t *testing.T) {
+	root := t.TempDir()
+	skills := filepath.Join(root, ".claude", "skills")
+	for _, p := range []string{
+		filepath.Join(skills, "api", "examples", "rule.md"),
+		filepath.Join(root, "vendor", "third", "party.md"),
+		filepath.Join(root, "node_modules", "dep", "readme.md"),
+		filepath.Join(root, "docs", "real.md"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, glob := range []string{"**/*.md", "*/*/*.md", "**/examples/*.md"} {
+		m := newGlobMatcher(root, []string{glob}, skills)
+		for _, f := range m.files(glob) {
+			for _, bad := range []string{skills, filepath.Join(root, "vendor"), filepath.Join(root, "node_modules")} {
+				if strings.HasPrefix(f, bad) {
+					t.Errorf("glob %q anchored to %s, which must be skipped", glob, f)
+				}
+			}
+		}
+	}
+	m := newGlobMatcher(root, []string{"**/*.md"}, skills)
+	if got := m.files("**/*.md"); len(got) != 1 || !strings.HasSuffix(got[0], filepath.Join("docs", "real.md")) {
+		t.Errorf("the repository's own file must still be found, got %v", got)
+	}
+}
