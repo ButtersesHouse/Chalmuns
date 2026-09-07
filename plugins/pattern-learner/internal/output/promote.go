@@ -243,7 +243,7 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string, relativeLi
 		for _, name := range domains {
 			ref := relRef(name, "SKILL.md")
 			scope := name
-			if globs := dedupeStrings(byDomain[name]); len(globs) > 0 {
+			if globs := DedupeStrings(byDomain[name]); len(globs) > 0 {
 				scope = "`" + strings.Join(globs, "`, `") + "`"
 			}
 			b.WriteString(fmt.Sprintf("- %s → `%s`\n", scope, ref))

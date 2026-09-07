@@ -165,7 +165,9 @@ func renderUniversalRules(b *strings.Builder, rules []state.Rule, heading string
 	}
 }
 
-func dedupeStrings(in []string) []string {
+// DedupeStrings returns in without duplicates or empty strings, first
+// occurrence order kept.
+func DedupeStrings(in []string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, s := range in {
@@ -212,6 +214,22 @@ func (pr *Prepared) Write() error {
 	if err := p.validateRules(); err != nil {
 		return err
 	}
+
+	// Nothing to write and nothing to prune: leave the tree uncreated.
+	if len(p.byDomain) == 0 {
+		if _, err := os.Stat(p.skillsDir); err != nil {
+			return nil
+		}
+	}
+
+	// One run at a time per skills directory: a concurrent run would take
+	// this run's staging tree for an abandoned leftover, or swap a domain
+	// out from under it.
+	release, err := lockSkillsDir(p.skillsDir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	// Repair whatever an interrupted earlier run left (a domain mid-swap,
 	// a stale staging tree) before judging the tree, so the checks see
@@ -586,10 +604,43 @@ func isTransientDir(name string) bool {
 	return reTransient.MatchString(name)
 }
 
-// abandonedAfter is how long a transient tree with no SKILL.md may exist
-// before it is taken for the leftover of a dead run rather than another
-// run's render in progress. Rendering a domain takes well under this.
+// abandonedAfter is how long a staging tree with no SKILL.md, or the
+// skills-directory lock, may exist before it is taken for the leftover of a
+// dead run rather than a run in progress. A run takes well under this.
 var abandonedAfter = 10 * time.Minute
+
+// lockName is the exclusive lock file a run holds under the skills
+// directory for the duration of its writes.
+const lockName = ".pattern-learner.lock"
+
+// lockSkillsDir takes the skills directory's lock, creating the directory
+// if needed. A lock older than abandonedAfter belongs to a dead run and is
+// broken; a fresh one means another run is writing, which is an error the
+// user can act on (wait, or delete the lock if that run is known to be
+// dead).
+func lockSkillsDir(skillsDir string) (release func(), err error) {
+	if err := os.MkdirAll(skillsDir, 0755); err != nil {
+		return nil, err
+	}
+	lock := filepath.Join(skillsDir, lockName)
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(lock, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			fmt.Fprintf(f, "pid %d\n", os.Getpid())
+			f.Close()
+			return func() { os.Remove(lock) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if fi, statErr := os.Stat(lock); statErr == nil && time.Since(fi.ModTime()) > abandonedAfter {
+			os.Remove(lock) // a dead run's lock; retry once
+			continue
+		}
+		return nil, fmt.Errorf("another pattern-learner run is writing to %s (lock %s); wait for it to finish, or delete the lock if that run is known to be dead", skillsDir, lock)
+	}
+	return nil, fmt.Errorf("could not take the lock %s", lock)
+}
 
 // transientPath returns a fresh sibling name for base with the given marker.
 func transientPath(base, marker string) string {
@@ -649,15 +700,18 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 		if !anyOwner && info.stamped && info.stamp != owner {
 			continue
 		}
-		// A transient with no SKILL.md yet may be another run's render in
-		// progress (SKILL.md is the first file written, so the window is
+		liveName, retired := liveOfRetired(name)
+		// A staging tree with no SKILL.md yet may be another run's render
+		// in progress (SKILL.md is the first file written, so the window is
 		// brief); only one that has sat untouched for a while is abandoned.
-		if !info.generated && !info.stamped {
+		// A retired copy can never be a render in progress: it is judged
+		// on what it holds, whatever its age.
+		if !retired && !info.generated && !info.stamped {
 			if fi, err := os.Stat(dir); err == nil && time.Since(fi.ModTime()) < abandonedAfter {
 				continue
 			}
 		}
-		if liveName, ok := liveOfRetired(name); ok {
+		if retired {
 			live := filepath.Join(skillsDir, liveName)
 			leftover := func(why string) {
 				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, why))
@@ -1497,7 +1551,7 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 			}
 		}
 	}
-	return dedupeStrings(all), nil
+	return DedupeStrings(all), nil
 }
 
 // ExpandBraces expands every {a,b,...} group in glob, nested and successive

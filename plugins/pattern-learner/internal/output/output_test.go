@@ -2191,6 +2191,61 @@ func TestEscapesRoot(t *testing.T) {
 	}
 }
 
+// A fresh lock means another run is writing; a stale one is broken.
+func TestSkillsDirLock(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	release, err := lockSkillsDir(skills)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err == nil || !strings.Contains(err.Error(), "another pattern-learner run") {
+		t.Errorf("a held lock should refuse the run, got %v", err)
+	}
+	release()
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("released lock should allow the run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, lockName)); !os.IsNotExist(err) {
+		t.Error("the lock should be released after the run")
+	}
+	// A stale lock from a dead run is broken.
+	lock := filepath.Join(skills, lockName)
+	if err := os.WriteFile(lock, []byte("pid 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * abandonedAfter)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "again", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("a stale lock should be broken: %v", err)
+	}
+}
+
+// A freshly retired copy is judged on its contents, not its age: an
+// interrupted swap of a user-files-only directory is restored at once.
+func TestFreshRetiredUserFilesRestoredImmediately(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.MkdirAll(retired, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "notes.md")); got != "mine" {
+		t.Error("the retired user files should be restored and carried into the regenerated skill")
+	}
+	if left := transientEntries(t, skills); len(left) != 0 {
+		t.Errorf("no transient should remain, found %v", left)
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)

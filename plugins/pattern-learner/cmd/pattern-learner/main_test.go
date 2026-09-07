@@ -580,3 +580,55 @@ func TestGlobMatcherIgnoresGlobsOutsideRoot(t *testing.T) {
 		t.Errorf("an in-root glob still matches: %v", got)
 	}
 }
+
+// A project nested in a larger repository keeps its skills, anchoring root
+// and AGENTS.md in the project, while the git top level only decides the
+// shared-directory judgement.
+func TestNestedProjectStaysInProject(t *testing.T) {
+	mono := t.TempDir()
+	if out, err := exec.Command("git", "-C", mono, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	proj := filepath.Join(mono, "proj")
+	stateDir := filepath.Join(proj, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := filepath.EvalSymlinks(projectDir(filepath.Join(stateDir, "state.json"))); got != mustEval(t, proj) {
+		t.Errorf("projectDir = %q, want %q", got, proj)
+	}
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "Rule", Rule: "Do it.", Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "api", FileGlob: []string{"src/**/*.go"}},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "a", Snippet: "q", Strength: "explicit"}},
+	}}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWriteOutputs([]string{"--state", statePath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".claude", "skills", "api", "SKILL.md")); err != nil {
+		t.Errorf("skills should be written in the project: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mono, ".claude")); err == nil {
+		t.Error("nothing should be written at the monorepo root")
+	}
+	if err := runPromote([]string{"--state", statePath, "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(proj, "AGENTS.md")); err != nil {
+		t.Errorf("AGENTS.md should be created in the project: %v", err)
+	}
+}
+
+func mustEval(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}

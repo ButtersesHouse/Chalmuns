@@ -127,12 +127,17 @@ func runWriteOutputs(args []string) error {
 	// the repository the state belongs to, not wherever the command was
 	// run from; an explicit --output-dir overrides it. The repository root
 	// is resolved once and reused for the shared-directory judgement.
+	// The output directory is the project the state belongs to (the
+	// directory above its .claude/), which in a monorepo is not the git
+	// top level; the top level only decides whether a skills directory is
+	// the repository's own or shared.
 	outputDir := flagValue(args, "--output-dir", "")
-	root, inGit := repoRoot(statePath)
 	if outputDir == "" {
-		outputDir = root
-	} else if !inGit {
-		// No git top level: the explicit output dir is the best root.
+		outputDir = projectDir(statePath)
+	}
+	root, inGit := repoRoot(statePath)
+	if !inGit {
+		// No git top level: the output dir is the best root.
 		root = outputDir
 	}
 	ragHints := hasFlag(args, "--rag-hints")
@@ -186,28 +191,33 @@ func runWriteOutputs(args []string) error {
 func repoRoot(statePath string) (root string, inGit bool) {
 	// Ask git from the state's logical location, not through whatever the
 	// path resolves to physically: a .claude/ that is a symlink into a
-	// dotfiles repository would otherwise name that repository. By
-	// convention the state lives at <repo>/.claude/pattern-learner/, so the
-	// directory above .claude/ is the place to ask from; any other layout
-	// asks from the state's own directory.
-	askFrom := filepath.Dir(statePath)
-	if filepath.Base(askFrom) == "pattern-learner" && filepath.Base(filepath.Dir(askFrom)) == ".claude" {
-		askFrom = filepath.Dir(filepath.Dir(askFrom))
-	}
+	// dotfiles repository would otherwise name that repository.
+	project := projectDir(statePath)
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	cmd.Dir = askFrom
+	cmd.Dir = project
 	if out, err := cmd.Output(); err == nil {
 		if top := strings.TrimSpace(string(out)); top != "" {
 			return top, true
 		}
 	}
-	// Not under git: the state's own project directory is still the
-	// repository this run is for, never the process cwd.
-	abs, err := filepath.Abs(askFrom)
-	if err != nil {
-		return askFrom, false
+	// Not under git: the project directory is still the repository this
+	// run is for, never the process cwd.
+	return project, false
+}
+
+// projectDir is the directory a state file belongs to: by convention the
+// state lives at <project>/.claude/pattern-learner/state.json, so the
+// directory above .claude/; any other layout means the state's own
+// directory. It is absolute so later joins do not depend on the cwd.
+func projectDir(statePath string) string {
+	dir := filepath.Dir(statePath)
+	if filepath.Base(dir) == "pattern-learner" && filepath.Base(filepath.Dir(dir)) == ".claude" {
+		dir = filepath.Dir(filepath.Dir(dir))
 	}
-	return abs, false
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
@@ -262,7 +272,7 @@ func runPromote(args []string) error {
 	// Same default as write-outputs: the repository the state lives in.
 	outputDir := flagValue(args, "--output-dir", "")
 	if outputDir == "" {
-		outputDir, _ = repoRoot(statePath)
+		outputDir = projectDir(statePath)
 	}
 
 	s, err := state.Read(statePath)
@@ -592,18 +602,9 @@ func (m *globMatcher) walkAll() {
 // and a "**" alternative can find the same file by both routes.
 func (m *globMatcher) dedupMatches() {
 	for glob, files := range m.matches {
-		if len(files) < 2 {
-			continue
+		if len(files) >= 2 {
+			m.matches[glob] = output.DedupeStrings(files)
 		}
-		seen := make(map[string]bool, len(files))
-		unique := files[:0]
-		for _, f := range files {
-			if !seen[f] {
-				seen[f] = true
-				unique = append(unique, f)
-			}
-		}
-		m.matches[glob] = unique
 	}
 }
 
