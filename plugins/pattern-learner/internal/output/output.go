@@ -114,8 +114,11 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 		byDomain[UniversalSkillName] = append(universal, byDomain[UniversalSkillName]...)
 	}
 
-	// Validate every domain before touching the tree, so a bad name fails the
-	// run with nothing written rather than after a map-ordered subset.
+	owner := ownerKey(s)
+
+	// Validate every domain before touching the tree, so a bad name or a
+	// collision fails the run with nothing written rather than after a
+	// map-ordered subset.
 	byFold := map[string]string{}
 	for domain := range byDomain {
 		if !validDomain(domain) {
@@ -129,30 +132,55 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 			return fmt.Errorf("skill domains %q and %q differ only by case and would share one directory; merge them into a single domain and rerun", other, domain)
 		}
 		byFold[folded] = domain
+		// A skill already at this path that this generator did not write is
+		// someone's hand-authored skill; overwriting it (and wiping its
+		// examples/ and rules/) would destroy their work.
+		existing := filepath.Join(skillsDir, domain, "SKILL.md")
+		if _, err := os.Stat(existing); err == nil && !isGeneratedSkill(existing, domain, owner) {
+			return fmt.Errorf("%s exists and was not written by pattern-learner (for this repo); refusing to overwrite it — rename the domain, move that skill, or delete the directory if it is a leftover from an older pattern-learner build, then rerun", existing)
+		}
 	}
 
-	// Prune before writing. Pruning afterwards would, on a case-insensitive
-	// filesystem, see the directory just written under its old casing
-	// ("Api" for domain "api"), miss it in the live set, and delete it.
-	if err := pruneStaleSkills(skillsDir, byDomain); err != nil {
-		return err
-	}
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, opts); err != nil {
+		if err := writeSkillFile(domain, rules, skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, owner, opts); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Prune only once every write has succeeded, so a failed run leaves the
+	// previous skills in place rather than a tree with both the old ones
+	// removed and the new ones missing.
+	return pruneStaleSkills(skillsDir, byDomain, owner)
 }
+
+// ownerKey identifies the repository a state file belongs to, so generated
+// skills in a skills directory shared by several repositories (say a
+// user-level one) are pruned only by the run that owns them. Empty when the
+// state carries no repo information.
+func ownerKey(s state.State) string {
+	if s.Repo.Owner == "" || s.Repo.Repo == "" {
+		return ""
+	}
+	return strings.ToLower(s.Repo.Owner + "/" + s.Repo.Repo)
+}
+
+// ownerLine renders the owner stamp written under GeneratedMarker.
+func ownerLine(owner string) string {
+	return "<!-- pattern-learner:repo=" + owner + " -->"
+}
+
+var reOwnerLine = regexp.MustCompile(`(?m)^<!-- pattern-learner:repo=(.*?) -->$`)
 
 // pruneStaleSkills removes generated skill directories under skillsDir whose
 // domain no longer has approved rules. Without this, a renamed or merged
 // domain (or one whose rules were all rejected) leaves its old SKILL.md
 // behind, and the consuming agent keeps auto-loading conventions that state
-// no longer holds. Only directories whose SKILL.md this generator wrote
-// (see isGeneratedSkill) are candidates; hand-authored skills sharing the
-// root are never removed.
-func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
+// no longer holds. Only directories whose SKILL.md this generator wrote for
+// this repository (see isGeneratedSkill) are candidates; hand-authored
+// skills and other repositories' generated skills sharing the root are
+// never removed. The live check is case-insensitive because on a
+// case-insensitive filesystem the directory just written may still carry an
+// older casing of its name.
+func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner string) error {
 	entries, err := os.ReadDir(skillsDir)
 	if os.IsNotExist(err) {
 		return nil
@@ -164,11 +192,18 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 		if !e.IsDir() {
 			continue
 		}
-		if _, ok := live[e.Name()]; ok {
+		isLive := false
+		for domain := range live {
+			if strings.EqualFold(domain, e.Name()) {
+				isLive = true
+				break
+			}
+		}
+		if isLive {
 			continue
 		}
 		dir := filepath.Join(skillsDir, e.Name())
-		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name()) {
+		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -194,18 +229,23 @@ var generatedBodyLines = []string{
 var reFrontmatterName = regexp.MustCompile(`(?m)^name:\s*(.+?)\s*$`)
 
 // isGeneratedSkill reports whether the SKILL.md at path is one this package
-// wrote for the skill directory dirName. Two conditions must both hold:
+// wrote for the skill directory dirName on behalf of the repository owner.
+// All of the following must hold:
 //
 //   - the frontmatter name equals dirName, so a generated skill a user
 //     copied elsewhere and adopted ("api-style/" carrying name "api") is not
-//     mistaken for the generator's own output; and
+//     mistaken for the generator's own output;
+//   - if the file carries an owner stamp, it names this owner, so a skills
+//     directory shared by several repositories is only ever pruned by the
+//     repository that wrote each skill (a file without a stamp predates
+//     stamping and is treated as ours); and
 //   - the body carries GeneratedMarker or, for a file from a build that
 //     predates the marker, one of generatedBodyLines as a whole line.
 //
 // A generated skill kept under its original directory name and hand-edited
 // is still recognised: that directory is documented as generator-owned and
 // regenerated wholesale, so its edits were never safe.
-func isGeneratedSkill(path, dirName string) bool {
+func isGeneratedSkill(path, dirName, owner string) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
@@ -215,8 +255,20 @@ func isGeneratedSkill(path, dirName string) bool {
 	if m == nil {
 		return false
 	}
-	name := strings.Trim(m[1], `"'`)
+	name := m[1]
+	if strings.HasPrefix(name, `"`) {
+		// The generator writes the name via strconv.Quote; read it back the
+		// same way so an escaped name still compares equal.
+		if unq, err := strconv.Unquote(name); err == nil {
+			name = unq
+		}
+	} else {
+		name = strings.Trim(name, `'`)
+	}
 	if name != dirName {
+		return false
+	}
+	if om := reOwnerLine.FindStringSubmatch(content); om != nil && om[1] != owner {
 		return false
 	}
 	for _, line := range strings.Split(content, "\n") {
@@ -233,7 +285,7 @@ func isGeneratedSkill(path, dirName string) bool {
 	return false
 }
 
-func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, opts Options) error {
+func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, owner string, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -260,7 +312,7 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 	}
 
 	slugs := ruleSlugs(rules)
-	header := renderSkillHeader(domain, desc, globs, rules)
+	header := renderSkillHeader(domain, desc, globs, rules, owner)
 
 	// Examples always live in companion files (progressive disclosure): the
 	// SKILL.md body is a recurring token cost once loaded, so it carries only
@@ -292,7 +344,7 @@ const maxSkillLines = 450
 // maxExamplePairs caps rendered do/don't pairs; state caps the arrays at 4.
 const maxExamplePairs = 4
 
-func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule) string {
+func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule, owner string) string {
 	var b strings.Builder
 	// Every value is emitted as a double-quoted YAML scalar. Claude Code
 	// parses this block as real YAML, and unquoted values break in exactly
@@ -310,7 +362,11 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule) 
 		b.WriteString(fmt.Sprintf("paths: %s\n", yamlQuote(strings.Join(globs, ","))))
 	}
 	b.WriteString("---\n\n")
-	b.WriteString(GeneratedMarker + "\n\n")
+	b.WriteString(GeneratedMarker + "\n")
+	if owner != "" {
+		b.WriteString(ownerLine(owner) + "\n")
+	}
+	b.WriteString("\n")
 	// "conventions" is already the noun, so don't render "Conventions Conventions".
 	if domain == UniversalSkillName {
 		b.WriteString("# Repo-Wide Conventions\n\n")
@@ -661,18 +717,71 @@ func exemplaryFiles(rules []state.Rule) []string {
 	return out
 }
 
+// collectGlobs gathers the distinct, non-empty file globs across rules, with
+// brace groups expanded. The frontmatter `paths` field is one comma-separated
+// string, so a glob that itself contains a comma ("src/{a,b}/**/*.go") would
+// be split by the consumer into two broken globs; expanding the group into
+// plain globs keeps every comma out of the value. A glob that still carries a
+// comma after expansion cannot be represented and is dropped.
 func collectGlobs(rules []state.Rule) []string {
-	seen := map[string]bool{}
-	var out []string
+	var all []string
 	for _, r := range rules {
 		for _, g := range r.Target.FileGlob {
-			if !seen[g] {
-				seen[g] = true
-				out = append(out, g)
+			for _, expanded := range expandBraces(g) {
+				if !strings.Contains(expanded, ",") {
+					all = append(all, expanded)
+				}
 			}
 		}
 	}
-	return out
+	return dedupeStrings(all)
+}
+
+// expandBraces expands the first {a,b,...} group in glob, recursing so
+// nested and successive groups expand fully. A glob with no group, or with
+// an unbalanced brace, is returned unchanged.
+func expandBraces(glob string) []string {
+	open := strings.Index(glob, "{")
+	if open < 0 {
+		return []string{glob}
+	}
+	depth := 0
+	for i := open; i < len(glob); i++ {
+		switch glob[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				var out []string
+				for _, alt := range splitTopLevel(glob[open+1 : i]) {
+					out = append(out, expandBraces(glob[:open]+alt+glob[i+1:])...)
+				}
+				return out
+			}
+		}
+	}
+	return []string{glob}
+}
+
+// splitTopLevel splits s on commas that are not inside a nested brace group.
+func splitTopLevel(s string) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, s[start:])
 }
 
 // buildDescription returns the SKILL.md frontmatter description for a domain.
@@ -710,16 +819,31 @@ func truncate(s string, max int) string {
 }
 
 // validDomain reports whether a domain name can be used as a single skill
-// directory segment. Domain names are model-supplied; one containing a path
-// separator or "." / ".." would write outside <skillsDir>/<domain>. Charset
-// rules (lowercase, digits, hyphens) are the audit-format subcommand's job
+// directory segment on every platform. Domain names are model-supplied; one
+// containing a path separator or "." / ".." would write outside
+// <skillsDir>/<domain>, and one the operating system rejects (over-long,
+// control characters, the characters Windows forbids in file names) would
+// fail mid-run after other skills were written. Charset rules for skill
+// names (lowercase, digits, hyphens) are the audit-format subcommand's job
 // and are deliberately not enforced here.
 func validDomain(domain string) bool {
 	if domain == "" || domain == "." || domain == ".." {
 		return false
 	}
-	return !strings.ContainsAny(domain, `/\`)
+	if len(domain) > maxDomainBytes {
+		return false
+	}
+	for _, r := range domain {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return !strings.ContainsAny(domain, `/\<>:"|?*`)
 }
+
+// maxDomainBytes is the file-name length limit common to the major
+// filesystems (255 bytes), which a directory segment must respect.
+const maxDomainBytes = 255
 
 // yamlQuote renders s as a YAML double-quoted scalar. It is strconv.Quote:
 // every escape Go emits (\a \b \f \n \r \t \v \\ \" \xNN \uNNNN \UNNNNNNNN)

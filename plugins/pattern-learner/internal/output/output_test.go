@@ -794,6 +794,131 @@ func TestCaseCollidingDomainsRejected(t *testing.T) {
 	}
 }
 
+// A hand-written skill whose directory name collides with a model-chosen
+// domain must never be overwritten; the run is refused with nothing written.
+func TestRefusesToOverwriteHandWrittenSkill(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	mine := filepath.Join(skills, "api")
+	if err := os.MkdirAll(filepath.Join(mine, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	handWritten := "---\nname: api\ndescription: My own API skill.\n---\n\nMy steps.\n"
+	if err := os.WriteFile(filepath.Join(mine, "SKILL.md"), []byte(handWritten), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mine, "rules", "mine.md"), []byte("keep me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := Write(stateWith(
+		approvedRule("Auth rule", "do it", "auth", "stated", 1),
+		approvedRule("API rule", "do it", "api", "stated", 2),
+	), dir, Options{})
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("expected a refusal, got %v", err)
+	}
+	if got := readFile(t, filepath.Join(mine, "SKILL.md")); got != handWritten {
+		t.Error("hand-written SKILL.md was modified")
+	}
+	if _, err := os.Stat(filepath.Join(mine, "rules", "mine.md")); err != nil {
+		t.Error("hand-written companion file was removed")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "auth")); !os.IsNotExist(err) {
+		t.Error("nothing should be written when the run is refused")
+	}
+}
+
+// Two repositories sharing one skills directory must not prune each other's
+// generated skills; each run only owns the skills stamped with its repo.
+func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, "shared")
+	opts := Options{SkillsDir: skills}
+
+	a := stateWith(approvedRule("A rule", "do it", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(skills, "api", "SKILL.md"))
+	if !strings.Contains(content, "<!-- pattern-learner:repo=acme/alpha -->") {
+		t.Errorf("generated skill should carry the owner stamp; got:\n%s", content)
+	}
+
+	b := stateWith(approvedRule("B rule", "do it", "ui", "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
+	if err := Write(b, dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api", "SKILL.md")); err != nil {
+		t.Error("repo beta must not prune repo alpha's generated skill")
+	}
+
+	// Alpha drops its domain: its own skill goes, beta's stays.
+	a2 := state.Empty()
+	a2.Repo = a.Repo
+	if err := Write(a2, dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("alpha should prune its own stale skill")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "ui", "SKILL.md")); err != nil {
+		t.Error("alpha must not prune beta's skill")
+	}
+
+	// A run whose state carries no repo information does not own stamped
+	// skills either.
+	if err := Write(state.Empty(), dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "ui", "SKILL.md")); err != nil {
+		t.Error("an unowned run must not prune a stamped skill")
+	}
+}
+
+// Globs are joined with commas in `paths`, so a brace group is expanded and
+// empty entries are dropped before the join.
+func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
+	r := approvedRule("R", "do it", "api", "stated", 1)
+	r.Target.FileGlob = []string{"", "src/{a,b}/**/*.go", "lib/{x,{y,z}}/*.ts", "src/a/**/*.go"}
+	got := strings.Join(collectGlobs([]state.Rule{r}), "|")
+	want := "src/a/**/*.go|src/b/**/*.go|lib/x/*.ts|lib/y/*.ts|lib/z/*.ts"
+	if got != want {
+		t.Errorf("collectGlobs = %q, want %q", got, want)
+	}
+	if x := expandBraces("src/{a/**/*.go"); len(x) != 1 || x[0] != "src/{a/**/*.go" {
+		t.Errorf("unbalanced brace should be left alone, got %v", x)
+	}
+}
+
+func TestValidDomainRejectsOSInvalidNames(t *testing.T) {
+	for _, bad := range []string{strings.Repeat("a", 256), "api\x00", "api\tx", "a:b", "a?b", "a*b", "a<b", "a|b", `a"b`} {
+		if validDomain(bad) {
+			t.Errorf("validDomain(%q) should be false", bad)
+		}
+	}
+	for _, ok := range []string{"api", "rest-api", "état", strings.Repeat("a", 255)} {
+		if !validDomain(ok) {
+			t.Errorf("validDomain(%q) should be true", ok)
+		}
+	}
+}
+
+// The name line is read back with strconv.Unquote so an escaped name still
+// identifies its directory.
+func TestIsGeneratedSkillUnquotesName(t *testing.T) {
+	dir := t.TempDir()
+	content := "---\nname: \"caf\\u00e9\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n\nbody\n"
+	path := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !isGeneratedSkill(path, "café", "") {
+		t.Error("escaped name should match its directory after unquoting")
+	}
+}
+
 // A bad domain must fail the run before anything is written or pruned.
 func TestBadDomainWritesNothing(t *testing.T) {
 	dir := t.TempDir()
@@ -870,7 +995,7 @@ func TestWritePrunesStaleGeneratedSkills(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
 		t.Fatalf("first run should have written components: %v", err)
 	}
-	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components") {
+	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components", "") {
 		t.Fatal("generated SKILL.md should carry the generated marker")
 	}
 

@@ -35,7 +35,14 @@ func TestVersionLiteralsAgree(t *testing.T) {
 	if err := json.Unmarshal(manifest, &pm); err != nil {
 		t.Fatal(err)
 	}
+	// The marketplace manifest lives at the repository root, outside this Go
+	// module. An installed copy of the plugin has only the module, so its
+	// absence is not a failure.
 	market, err := os.ReadFile("../../../../.claude-plugin/marketplace.json")
+	if os.IsNotExist(err) {
+		t.Log("marketplace.json not found (plugin checked out on its own); skipping the description check")
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +68,11 @@ func TestVersionLiteralsAgree(t *testing.T) {
 		t.Error("marketplace.json has no pattern-learner entry")
 	}
 
+}
+
+// SKILL.md Step 2 tells the agent which version string to expect from the
+// binary; it must be the one the binary prints.
+func TestSkillExpectsThisVersion(t *testing.T) {
 	skill, err := os.ReadFile("../../skills/learn-patterns/SKILL.md")
 	if err != nil {
 		t.Fatal(err)
