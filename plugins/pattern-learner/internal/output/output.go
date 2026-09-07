@@ -571,6 +571,17 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			// directory one stamped for us or not stamped at all. Anything
 			// else (a hand-written skill, another repository's) must not
 			// receive our files, so the copy is left and the user told.
+			// An empty directory at the slot (as validateDisk also allows)
+			// gives way to the retired copy wholesale.
+			if isEmptyDir(live) {
+				if err := os.RemoveAll(live); err != nil {
+					return warnings, err
+				}
+				if err := os.Rename(dir, live); err != nil {
+					return warnings, err
+				}
+				continue
+			}
 			liveInfo := inspectSkill(filepath.Join(live, "SKILL.md"), liveName)
 			ours := liveInfo.generated && (anyOwner || !liveInfo.stamped || liveInfo.stamp == owner)
 			if !ours {

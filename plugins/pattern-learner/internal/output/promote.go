@@ -176,7 +176,14 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 	// so it is linked as given.
 	relRef := func(parts ...string) string {
 		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
-		rel, err := filepath.Rel(filepath.Dir(targetPath), ref)
+		// Compare absolute forms so a relative skills dir and an absolute
+		// target (or the reverse) still yield a correct relative link.
+		absRef, err1 := filepath.Abs(ref)
+		absTargetDir, err2 := filepath.Abs(filepath.Dir(targetPath))
+		if err1 != nil || err2 != nil {
+			return ref
+		}
+		rel, err := filepath.Rel(absTargetDir, absRef)
 		if err != nil {
 			return ref
 		}

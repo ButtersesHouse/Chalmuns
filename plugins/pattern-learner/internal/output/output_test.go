@@ -1411,6 +1411,64 @@ func TestRetiredCopyRestoredOverDanglingSymlink(t *testing.T) {
 	}
 }
 
+// An absolute target with the CLI's relative default skills dir still gets
+// a correct relative link.
+func TestPromoteLinksAbsoluteTargetWithRelativeSkillsDir(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	s := stateWith(approvedRule("API rule", "do it", "api", "stated", 1))
+	target := filepath.Join(dir, "docs", "CLAUDE.md")
+	if _, err := Promote(s, target, PromoteOptions{SkillsDir: filepath.Join(".claude", "skills"), Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, target)
+	want := "`" + filepath.Join("..", ".claude", "skills", "api", "SKILL.md") + "`"
+	if !strings.Contains(content, want) {
+		t.Errorf("expected link %s; got:\n%s", want, content)
+	}
+}
+
+// A retired copy whose live slot is an empty directory (regenerable, as
+// validateDisk treats it) is folded and cleared.
+func TestRetiredCopyFoldedIntoEmptyLiveDir(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(skills, "api"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	next := stateWith(approvedRule("Rule", "v2", "api", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "notes.md")); got != "mine" {
+		t.Error("user file should be folded into the regenerated skill")
+	}
+	if left := transientEntries(t, skills); len(left) != 0 || len(prepared.Warnings()) != 0 {
+		t.Errorf("no leftover or warning expected, got %v, %v", left, prepared.Warnings())
+	}
+}
+
 // A promote target below the repo root gets links relative to its own
 // directory, climbing out with "..", when the skills dir is given
 // relative to the repo root as the CLI does.

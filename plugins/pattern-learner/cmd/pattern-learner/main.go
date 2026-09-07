@@ -135,7 +135,8 @@ func runWriteOutputs(args []string) error {
 	// glob, or a skill directory the run would refuse to overwrite. The
 	// anchoring below walks the repository (or calls cursor-agent per
 	// rule) and should not run for a state the write would then reject.
-	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, outputDir)
+	root := repoRoot(statePath, outputDir)
+	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, root)
 	if err != nil {
 		return err
 	}
@@ -143,7 +144,7 @@ func runWriteOutputs(args []string) error {
 		RAGHints:  ragHints,
 		SkillsDir: flagValue(args, "--skills-dir", ""),
 		Owner:     owner,
-		RepoRoot:  repoRoot(statePath, outputDir),
+		RepoRoot:  root,
 	}
 	prepared, err := output.Validate(&s, outputDir, opts)
 	if err != nil {
@@ -184,11 +185,15 @@ func repoRoot(statePath, outputDir string) string {
 
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
 // in a fixed order so it cannot flip between runs: an explicit --repo flag,
-// then the state's repo field, then the git remote of the output directory
-// (the same detection detect-repo performs). Every branch produces the value
-// through output.OwnerKey so stamps compare equal across runs. Empty when
-// none is available.
-func resolveOwner(flag string, s state.State, outputDir string) (string, error) {
+// then the state's repo field, then the git remote of the repository root
+// (the same detection detect-repo performs, run where the state lives
+// rather than in the current directory, which may be an unrelated
+// ancestor repository). Every branch produces the value through
+// output.NormalizeOwnerKey so stamps compare equal across runs. Empty when
+// none is available; an unusable value in state or the flag is an error
+// rather than a silent unstamped run, since unstamped skills in a shared
+// directory are never pruned.
+func resolveOwner(flag string, s state.State, repoRoot string) (string, error) {
 	if flag != "" {
 		key := output.NormalizeOwnerKey(flag)
 		if key == "" {
@@ -196,10 +201,14 @@ func resolveOwner(flag string, s state.State, outputDir string) (string, error) 
 		}
 		return key, nil
 	}
-	if key := output.OwnerFromState(s); key != "" {
+	if s.Repo.Owner != "" || s.Repo.Repo != "" {
+		key := output.OwnerFromState(s)
+		if key == "" {
+			return "", fmt.Errorf("state.repo {owner: %q, repo: %q} is not a usable owner/repo identity (one segment each, no whitespace); set it from detect-repo's output (Step 11) or pass --repo", s.Repo.Owner, s.Repo.Repo)
+		}
 		return key, nil
 	}
-	if r, err := detect.Detect(outputDir); err == nil {
+	if r, err := detect.Detect(repoRoot); err == nil {
 		return output.OwnerKey(r.Owner, r.Repo), nil
 	}
 	return "", nil

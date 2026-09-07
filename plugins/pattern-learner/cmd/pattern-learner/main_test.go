@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
@@ -196,6 +197,12 @@ func TestResolveOwner(t *testing.T) {
 	s.Repo = state.RepoInfo{Owner: "Acme", Repo: "Beta"}
 	if got, err := resolveOwner("", s, t.TempDir()); err != nil || got != "acme/beta" {
 		t.Errorf("state: got %q, %v", got, err)
+	}
+	// A state repo that cannot become a key is an error, not a silent
+	// unstamped run.
+	s.Repo = state.RepoInfo{Owner: "group/sub", Repo: "svc"}
+	if _, err := resolveOwner("", s, t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a usable owner/repo") {
+		t.Errorf("unusable state.repo should be an error, got %v", err)
 	}
 	// No flag, no state repo, no git remote: unowned, not an error. The
 	// directory is its own git repository (with no origin) so the git
