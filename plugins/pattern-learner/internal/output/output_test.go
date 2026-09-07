@@ -1313,7 +1313,7 @@ func TestInterruptedSwapIsRecovered(t *testing.T) {
 	if err := Write(stateWith(approvedRule("Rule", "old text", "api", "stated", 1)), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(filepath.Join(skills, "api"), filepath.Join(skills, "api"+retiredSuffix)); err != nil {
+	if err := os.Rename(filepath.Join(skills, "api"), transientPath(filepath.Join(skills, "api"), retiredSuffix)); err != nil {
 		t.Fatal(err)
 	}
 	if err := Write(stateWith(approvedRule("Rule", "new text", "api", "stated", 1)), dir, Options{}); err != nil {
@@ -1326,22 +1326,117 @@ func TestInterruptedSwapIsRecovered(t *testing.T) {
 		t.Errorf("retired copy should be gone after a successful swap, found %v", left)
 	}
 	// A stale domain mid-swap is restored and then pruned like any other.
-	if err := os.Rename(filepath.Join(skills, "api"), filepath.Join(skills, "api"+retiredSuffix)); err != nil {
+	if err := os.Rename(filepath.Join(skills, "api"), transientPath(filepath.Join(skills, "api"), retiredSuffix)); err != nil {
 		t.Fatal(err)
 	}
 	if err := Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, gone := range []string{"api", "api" + retiredSuffix} {
-		if _, err := os.Lstat(filepath.Join(skills, gone)); !os.IsNotExist(err) {
-			t.Errorf("%s should not remain", gone)
-		}
+	if _, err := os.Lstat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("restored stale domain should have been pruned")
+	}
+	if left := transientEntries(t, skills); len(left) != 0 {
+		t.Errorf("no transient should remain, found %v", left)
+	}
+}
+
+// Validate reports what Write would refuse, without touching the tree, and
+// the Prepared it returns writes the run it validated.
+func TestValidateReportsWithoutWriting(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Validate(stateWith(
+		approvedRule("Good", "do it", "api", "stated", 1),
+		approvedRule("Bad", "do it", "api/v2", "stated", 2),
+	), dir, Options{})
+	if err == nil {
+		t.Fatal("expected a validation error")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude")); !os.IsNotExist(err) {
+		t.Error("Validate must not create anything")
+	}
+	good := stateWith(approvedRule("Good", "do it", "api", "stated", 1))
+	prepared, err := Validate(good, dir, Options{})
+	if err != nil {
+		t.Fatalf("valid state should pass: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude")); !os.IsNotExist(err) {
+		t.Error("Validate must not create anything")
+	}
+	// Enrichment after validation (what anchoring does) is fine ...
+	good.Rules[0].DoExamples = []state.Example{{Code: "x()", Language: "go", FileRef: "a.go:L1"}}
+	if err := prepared.Write(good); err != nil {
+		t.Fatalf("prepared write: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "api", "SKILL.md")); err != nil {
+		t.Error("prepared write should have written the skill")
+	}
+	// ... but a different domain set is refused.
+	changed := stateWith(approvedRule("Other", "do it", "ui", "stated", 1))
+	if err := prepared.Write(changed); err == nil || !strings.Contains(err.Error(), "changed since validation") {
+		t.Errorf("a changed domain set must be refused, got %v", err)
+	}
+}
+
+// A retired copy whose live slot holds only a dangling symlink is restored
+// (the link is cleared), not folded into the link.
+func TestRetiredCopyRestoredOverDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "gone"), filepath.Join(skills, "api")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "v2", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("run should recover and regenerate: %v", err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "SKILL.md")); !strings.Contains(got, "v2") {
+		t.Error("skill should be regenerated")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api", "notes.md")); err != nil {
+		t.Error("user file from the restored copy should be carried into the regenerated skill")
+	}
+	if left := transientEntries(t, skills); len(left) != 0 {
+		t.Errorf("no transient should remain, found %v", left)
+	}
+}
+
+// A promote target below the repo root gets links relative to its own
+// directory, climbing out with "..", when the skills dir is given
+// relative to the repo root as the CLI does.
+func TestPromoteLinksRelativeToTargetDirectory(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	s := stateWith(approvedRule("API rule", "do it", "api", "stated", 1))
+	target := filepath.Join("docs", "AGENTS.md")
+	if _, err := Promote(s, target, PromoteOptions{SkillsDir: filepath.Join(".claude", "skills"), Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, target)
+	want := "`" + filepath.Join("..", ".claude", "skills", "api", "SKILL.md") + "`"
+	if !strings.Contains(content, want) {
+		t.Errorf("expected link %s relative to docs/; got:\n%s", want, content)
 	}
 }
 
 // A domain name carrying a transient suffix would be cleared by prune.
 func TestTransientSuffixDomainRejected(t *testing.T) {
-	for _, bad := range []string{"api" + stagingSuffix, "api" + retiredSuffix} {
+	for _, bad := range []string{filepath.Base(transientPath("api", stagingSuffix)), filepath.Base(transientPath("api", retiredSuffix))} {
 		if validDomain(bad) {
 			t.Errorf("validDomain(%q) should be false", bad)
 		}
@@ -1480,7 +1575,7 @@ func TestForeignTransientDoesNotBlockSwap(t *testing.T) {
 // has since taken is left alone rather than folded into their skill.
 func TestSharedDirRetiredCopyNotFoldedIntoForeignSkill(t *testing.T) {
 	shared := filepath.Join(t.TempDir(), "shared")
-	retired := filepath.Join(shared, "api"+retiredSuffix)
+	retired := transientPath(filepath.Join(shared, "api"), retiredSuffix)
 	if err := os.MkdirAll(retired, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -1536,12 +1631,12 @@ func TestValidDomainLeavesRoomForSuffix(t *testing.T) {
 // without the random tail) are transients; a user's file or directory that
 // merely contains the marker is not.
 func TestIsTransientDirShape(t *testing.T) {
-	for _, yes := range []string{transientPath("api", stagingSuffix), transientPath("api", retiredSuffix), "api" + retiredSuffix, "api" + stagingSuffix} {
+	for _, yes := range []string{transientPath("api", stagingSuffix), transientPath("api", retiredSuffix)} {
 		if !isTransientDir(yes) {
 			t.Errorf("isTransientDir(%q) should be true", yes)
 		}
 	}
-	for _, no := range []string{"README.pattern-learner-old.md", "api.pattern-learner-old-backup", "api", ".pattern-learner-old", "api.pattern-learner-old-XYZ"} {
+	for _, no := range []string{"README.pattern-learner-old.md", "api.pattern-learner-old-backup", "api", ".pattern-learner-old", "api.pattern-learner-old-XYZ", "api" + retiredSuffix, "api" + stagingSuffix} {
 		if isTransientDir(no) {
 			t.Errorf("isTransientDir(%q) should be false", no)
 		}
@@ -1558,8 +1653,10 @@ func TestIsTransientDirShape(t *testing.T) {
 func TestUserFileWithMarkerLikeNameSurvives(t *testing.T) {
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".claude", "skills")
-	if err := os.MkdirAll(filepath.Join(skills, "api.pattern-learner-old-backup"), 0755); err != nil {
-		t.Fatal(err)
+	for _, keepDir := range []string{"api.pattern-learner-old-backup", "api" + retiredSuffix} {
+		if err := os.MkdirAll(filepath.Join(skills, keepDir), 0755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(skills, "README.pattern-learner-old.md"), []byte("keep"), 0644); err != nil {
 		t.Fatal(err)
@@ -1567,7 +1664,7 @@ func TestUserFileWithMarkerLikeNameSurvives(t *testing.T) {
 	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, keep := range []string{"api.pattern-learner-old-backup", "README.pattern-learner-old.md"} {
+	for _, keep := range []string{"api.pattern-learner-old-backup", "api" + retiredSuffix, "README.pattern-learner-old.md"} {
 		if _, err := os.Lstat(filepath.Join(skills, keep)); err != nil {
 			t.Errorf("%s should survive: %v", keep, err)
 		}
@@ -1626,10 +1723,10 @@ func TestTransientDirsAreCleared(t *testing.T) {
 	if err := Write(stateWith(approvedRule("Rule", "do it", "old", "stated", 1)), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(filepath.Join(skills, "old"), filepath.Join(skills, "old"+retiredSuffix)); err != nil {
+	if err := os.Rename(filepath.Join(skills, "old"), transientPath(filepath.Join(skills, "old"), retiredSuffix)); err != nil {
 		t.Fatal(err)
 	}
-	for _, leftover := range []string{"api" + stagingSuffix, "gone" + stagingSuffix} {
+	for _, leftover := range []string{filepath.Base(transientPath("api", stagingSuffix)), filepath.Base(transientPath("gone", stagingSuffix))} {
 		if err := os.MkdirAll(filepath.Join(skills, leftover), 0755); err != nil {
 			t.Fatal(err)
 		}

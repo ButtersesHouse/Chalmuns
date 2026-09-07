@@ -76,15 +76,11 @@ type Options struct {
 // history, so publishing to it is an explicit, user-initiated step — see
 // Promote.
 func Write(s state.State, outputDir string, opts Options) error {
-	skillsDir := opts.SkillsDir
-	if skillsDir == "" {
-		skillsDir = filepath.Join(outputDir, ".claude", "skills")
+	prepared, err := Validate(s, outputDir, opts)
+	if err != nil {
+		return err
 	}
-	repoRoot := opts.RepoRoot
-	if repoRoot == "" {
-		repoRoot = outputDir
-	}
-	return writeSkillFiles(s, skillsDir, isSharedSkillsDir(skillsDir, repoRoot), opts)
+	return prepared.Write(s)
 }
 
 // isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
@@ -166,7 +162,99 @@ func dedupeStrings(in []string) []string {
 // writeSkillFiles writes per-domain skill files under skillsDir.
 // skillsDir is the root under which per-domain subdirs are created (e.g.
 // ".claude/skills" → ".claude/skills/api/SKILL.md").
-func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options) error {
+// Prepared is a run that has passed every pre-write check. Validate
+// produces it and its Write method performs the run, so the checks run
+// once and the tree written is the one that passed.
+type Prepared struct {
+	skillsDir string
+	shared    bool
+	owner     string
+	globs     map[string][]string
+	domains   map[string]bool
+	opts      Options
+}
+
+// Validate runs every check a run performs before it touches the skills
+// tree (domain names, globs, collisions, and the ownership of whatever is
+// already on disk) and returns the first failure, writing nothing. The CLI
+// calls it before the expensive example-anchoring step so a run that
+// would be refused does not walk the repository first.
+func Validate(s state.State, outputDir string, opts Options) (*Prepared, error) {
+	skillsDir, shared := resolveDirs(outputDir, opts)
+	p := buildPlan(s, skillsDir, shared, opts)
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	domains := map[string]bool{}
+	for d := range p.byDomain {
+		domains[d] = true
+	}
+	return &Prepared{skillsDir: skillsDir, shared: shared, owner: p.owner, globs: p.globs, domains: domains, opts: opts}, nil
+}
+
+// Write performs the validated run. s is the state Validate saw, possibly
+// enriched since (example anchoring adds file references); its set of
+// approved domains must be unchanged, since those are what was checked.
+func (pr *Prepared) Write(s state.State) error {
+	p := buildPlan(s, pr.skillsDir, pr.shared, pr.opts)
+	if len(p.byDomain) != len(pr.domains) {
+		return fmt.Errorf("state changed since validation (domain set differs); rerun")
+	}
+	for domain, rules := range p.byDomain {
+		if !pr.domains[domain] {
+			return fmt.Errorf("state changed since validation: domain %q was not validated; rerun", domain)
+		}
+		sortRules(rules)
+	}
+
+	// Repair whatever an interrupted earlier run left (a domain mid-swap,
+	// a stale staging tree) before writing. Recovery only restores or
+	// clears this run's own generated trees, so it cannot turn the tree
+	// that passed validation into one that would have failed.
+	if err := recoverTransients(pr.skillsDir, pr.owner, !pr.shared); err != nil {
+		return err
+	}
+	for domain, rules := range p.byDomain {
+		if err := writeSkillFile(domain, rules, pr.globs[domain], pr.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, pr.owner, pr.opts); err != nil {
+			return err
+		}
+	}
+	// Prune only once every write has succeeded, so a failed run leaves the
+	// previous skills in place rather than a tree with both the old ones
+	// removed and the new ones missing. Ownership follows the same rule as
+	// the overwrite guard: inside the repo's own tree every generated skill
+	// is ours whatever it is stamped with; in a shared directory only those
+	// stamped for this run are.
+	return pruneStaleSkills(pr.skillsDir, p.byDomain, pr.owner, !pr.shared)
+}
+
+// resolveDirs applies the Options defaults for the skills directory and
+// decides whether it is shared.
+func resolveDirs(outputDir string, opts Options) (skillsDir string, shared bool) {
+	skillsDir = opts.SkillsDir
+	if skillsDir == "" {
+		skillsDir = filepath.Join(outputDir, ".claude", "skills")
+	}
+	repoRoot := opts.RepoRoot
+	if repoRoot == "" {
+		repoRoot = outputDir
+	}
+	return skillsDir, isSharedSkillsDir(skillsDir, repoRoot)
+}
+
+// plan is everything a run needs to know before it writes: the approved
+// rules grouped by skill domain (universal rules under UniversalSkillName),
+// each domain's expanded globs once validated, the owner stamp, and where
+// and in what kind of directory the skills go.
+type plan struct {
+	byDomain  map[string][]state.Rule
+	globs     map[string][]string
+	owner     string
+	skillsDir string
+	shared    bool
+}
+
+func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan {
 	byDomain := map[string][]state.Rule{}
 	var universal []state.Rule
 	for _, r := range s.Rules {
@@ -192,20 +280,17 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 	if owner == "" {
 		owner = OwnerFromState(s)
 	}
+	return &plan{byDomain: byDomain, globs: map[string][]string{}, owner: owner, skillsDir: skillsDir, shared: shared}
+}
 
-	// Repair whatever an interrupted earlier run left (a domain mid-swap,
-	// a stale staging tree) before anything is judged, so the ownership
-	// checks below see every domain in its settled place.
-	if err := recoverTransients(skillsDir, owner, !shared); err != nil {
-		return err
-	}
-
-	// Validate every domain before touching the tree, so a bad name or a
-	// collision fails the run with nothing written rather than after a
-	// map-ordered subset.
+// validate checks every domain before anything is written, so a bad name or
+// a collision fails the run with nothing written rather than after a
+// map-ordered subset. It also sorts each domain's rules into rendering
+// order and records the expanded globs.
+func (p *plan) validate() error {
+	skillsDir, shared, owner := p.skillsDir, p.shared, p.owner
 	byFold := map[string]string{}
-	globsByDomain := map[string][]string{}
-	for domain, rules := range byDomain {
+	for domain, rules := range p.byDomain {
 		if !validDomain(domain) {
 			return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
 		}
@@ -228,7 +313,7 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 			if err != nil {
 				return fmt.Errorf("skill domain %q: %w", domain, err)
 			}
-			globsByDomain[domain] = globs
+			p.globs[domain] = globs
 		}
 		// A directory already at this path that this generator did not
 		// write is someone's hand-authored skill (or hand-kept material);
@@ -274,19 +359,7 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 			}
 		}
 	}
-
-	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, globsByDomain[domain], skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, owner, opts); err != nil {
-			return err
-		}
-	}
-	// Prune only once every write has succeeded, so a failed run leaves the
-	// previous skills in place rather than a tree with both the old ones
-	// removed and the new ones missing. Ownership follows the same rule as
-	// the overwrite guard: inside the repo's own tree every generated skill
-	// is ours whatever it is stamped with; in a shared directory only those
-	// stamped for this run are.
-	return pruneStaleSkills(skillsDir, byDomain, owner, !shared)
+	return nil
 }
 
 // OwnerFromState identifies the repository a state file belongs to, so
@@ -366,12 +439,11 @@ const (
 	retiredSuffix = ".pattern-learner-old"
 )
 
-// reTransient matches exactly the names transientPath produces (and, for
-// leftovers of this branch's earlier builds, the same without the random
-// tail): the marker and tail must end the name, so a user's
-// "README.pattern-learner-old.md" or "api.pattern-learner-old-backup" is
-// never taken for one of ours.
-var reTransient = regexp.MustCompile(`^(.+)(` + regexp.QuoteMeta(stagingSuffix) + `|` + regexp.QuoteMeta(retiredSuffix) + `)(-[0-9a-f]{8})?$`)
+// reTransient matches exactly the names transientPath produces: the marker
+// and an 8-hex-digit tail must end the name, so a user's
+// "README.pattern-learner-old.md", "api.pattern-learner-old-backup", or a
+// hand-made "api.pattern-learner-old" copy is never taken for one of ours.
+var reTransient = regexp.MustCompile(`^(.+)(` + regexp.QuoteMeta(stagingSuffix) + `|` + regexp.QuoteMeta(retiredSuffix) + `)-[0-9a-f]{8}$`)
 
 func isTransientDir(name string) bool {
 	return reTransient.MatchString(name)
@@ -438,7 +510,15 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 		}
 		if liveName, ok := liveOfRetired(name); ok {
 			live := filepath.Join(skillsDir, liveName)
-			if _, err := os.Lstat(live); err != nil {
+			// The live slot counts as taken only by a real directory; a
+			// dangling symlink or stray file there is cleared so the
+			// retired copy can go back, as swapDir would clear it.
+			if fi, err := os.Stat(live); err != nil || !fi.IsDir() {
+				if _, err := os.Lstat(live); err == nil {
+					if err := os.RemoveAll(live); err != nil {
+						return err
+					}
+				}
 				if err := os.Rename(dir, live); err != nil {
 					return err
 				}

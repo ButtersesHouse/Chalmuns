@@ -166,9 +166,21 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 
 	// Paths in the block are written relative to the target file's directory
 	// where possible, so the file reads the same from any checkout location.
+	// Links are relative to the target file's directory whenever that is
+	// meaningful: a skills directory given relatively (the CLI's
+	// ".claude/skills") is linked relatively even when the target sits
+	// below the repo root and the link must climb out ("../.claude/..."),
+	// and so is the default skills directory under the target's own tree.
+	// An absolute skills directory elsewhere is a fixed location the user
+	// chose, and a relative path to it would only hold from one checkout,
+	// so it is linked as given.
 	relRef := func(parts ...string) string {
 		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
-		if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !IsOutsideRel(rel) {
+		rel, err := filepath.Rel(filepath.Dir(targetPath), ref)
+		if err != nil {
+			return ref
+		}
+		if !filepath.IsAbs(ref) || !IsOutsideRel(rel) {
 			return rel
 		}
 		return ref

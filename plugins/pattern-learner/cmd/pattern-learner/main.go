@@ -131,9 +131,21 @@ func runWriteOutputs(args []string) error {
 		return err
 	}
 
-	// Cheap flag validation first; anchoring below walks the repository
-	// (or calls cursor-agent per rule) and should not run for a bad flag.
+	// Every cheap, deterministic check first: a bad flag, domain name,
+	// glob, or a skill directory the run would refuse to overwrite. The
+	// anchoring below walks the repository (or calls cursor-agent per
+	// rule) and should not run for a state the write would then reject.
 	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, outputDir)
+	if err != nil {
+		return err
+	}
+	opts := output.Options{
+		RAGHints:  ragHints,
+		SkillsDir: flagValue(args, "--skills-dir", ""),
+		Owner:     owner,
+		RepoRoot:  repoRoot(statePath, outputDir),
+	}
+	prepared, err := output.Validate(s, outputDir, opts)
 	if err != nil {
 		return err
 	}
@@ -144,13 +156,7 @@ func runWriteOutputs(args []string) error {
 		anchorExamples(&s, outputDir)
 	}
 
-	opts := output.Options{
-		RAGHints:  ragHints,
-		SkillsDir: flagValue(args, "--skills-dir", ""),
-		Owner:     owner,
-		RepoRoot:  repoRoot(statePath, outputDir),
-	}
-	return output.Write(s, outputDir, opts)
+	return prepared.Write(s)
 }
 
 // repoRoot finds the root of the repository a run writes for, which decides
@@ -178,11 +184,11 @@ func repoRoot(statePath, outputDir string) string {
 // none is available.
 func resolveOwner(flag string, s state.State, outputDir string) (string, error) {
 	if flag != "" {
-		parts := strings.SplitN(strings.Trim(flag, "/"), "/", 2)
-		if len(parts) != 2 || !output.ValidOwnerKey(output.OwnerKey(parts[0], parts[1])) {
+		key := strings.ToLower(strings.Trim(flag, "/"))
+		if !output.ValidOwnerKey(key) {
 			return "", fmt.Errorf("--repo must be \"owner/repo\" (got %q)", flag)
 		}
-		return output.OwnerKey(parts[0], parts[1]), nil
+		return key, nil
 	}
 	if key := output.OwnerFromState(s); key != "" {
 		return key, nil
@@ -419,20 +425,20 @@ func globFiles(root, glob string) []string {
 		return nil
 	}
 	var out []string
+	// Every "**" alternative is matched in one walk of the tree, so a
+	// brace group costs one traversal, not one per alternative.
+	var walkPatterns [][]string
 	for _, g := range expanded {
-		out = append(out, globFilesPlain(root, g)...)
+		if !strings.Contains(g, "**") {
+			matches, _ := filepath.Glob(filepath.Join(root, g))
+			out = append(out, matches...)
+			continue
+		}
+		walkPatterns = append(walkPatterns, strings.Split(path.Clean(filepath.ToSlash(g)), "/"))
 	}
-	return out
-}
-
-// globFilesPlain matches one brace-free glob.
-func globFilesPlain(root, glob string) []string {
-	if !strings.Contains(glob, "**") {
-		matches, _ := filepath.Glob(filepath.Join(root, glob))
-		return matches
+	if len(walkPatterns) == 0 {
+		return out
 	}
-	pat := strings.Split(path.Clean(filepath.ToSlash(glob)), "/")
-	var out []string
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -447,8 +453,12 @@ func globFilesPlain(root, glob string) []string {
 		if err != nil {
 			return nil
 		}
-		if matchSegments(pat, strings.Split(filepath.ToSlash(rel), "/")) {
-			out = append(out, p)
+		segs := strings.Split(filepath.ToSlash(rel), "/")
+		for _, pat := range walkPatterns {
+			if matchSegments(pat, segs) {
+				out = append(out, p)
+				break
+			}
 		}
 		return nil
 	})
