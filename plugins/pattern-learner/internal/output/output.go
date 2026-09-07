@@ -4,15 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/ButtersesHouse/Chalmuns/internal/format"
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
-	"gopkg.in/yaml.v3"
 )
 
 const maxCLAUDERules = 30
@@ -130,6 +129,7 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 	// collision fails the run with nothing written rather than after a
 	// map-ordered subset.
 	byFold := map[string]string{}
+	globsByDomain := map[string][]string{}
 	for domain, rules := range byDomain {
 		if !validDomain(domain) {
 			return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
@@ -142,23 +142,27 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 			return fmt.Errorf("skill domains %q and %q differ only by case and would share one directory; merge them into a single domain and rerun", other, domain)
 		}
 		byFold[folded] = domain
-		if _, err := collectGlobs(rules); err != nil {
+		globs, err := collectGlobs(rules)
+		if err != nil {
 			return fmt.Errorf("skill domain %q: %w", domain, err)
 		}
-		// A skill already at this path that this generator did not write is
-		// someone's hand-authored skill; overwriting it (and wiping its
-		// examples/ and rules/) would destroy their work. Ownership here is
-		// judged on the generator's fingerprint alone: a generated skill is
-		// regeneration whichever repo identity stamped it last (forks and
-		// renames change the stamp, not the fact that we wrote it).
-		existing := filepath.Join(skillsDir, domain, "SKILL.md")
-		if _, err := os.Stat(existing); err == nil && !isGeneratedSkill(existing, domain, anyOwner) {
-			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that skill, or delete the directory if it is a leftover from an older pattern-learner build, then rerun", existing)
+		globsByDomain[domain] = globs
+		// A directory already at this path that this generator did not
+		// write is someone's hand-authored skill (or hand-kept material);
+		// overwriting it and wiping its examples/ and rules/ would destroy
+		// their work. Ownership is judged on the generator's fingerprint
+		// alone: a generated skill is regeneration whichever repo identity
+		// stamped it last (forks and renames change the stamp, not the fact
+		// that we wrote it). A directory with no SKILL.md at all is foreign
+		// too: nothing in it can be ours.
+		skillDir := filepath.Join(skillsDir, domain)
+		if _, err := os.Stat(skillDir); err == nil && !isGeneratedSkill(filepath.Join(skillDir, "SKILL.md"), domain, "", true) {
+			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 		}
 	}
 
 	for domain, rules := range byDomain {
-		if err := writeSkillFile(domain, rules, skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, owner, opts); err != nil {
+		if err := writeSkillFile(domain, rules, globsByDomain[domain], skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, owner, opts); err != nil {
 			return err
 		}
 	}
@@ -173,16 +177,26 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 // user-level one) are pruned only by the run that owns them. Empty when the
 // state carries no repo information.
 func ownerKey(s state.State) string {
-	if s.Repo.Owner == "" || s.Repo.Repo == "" {
-		return ""
-	}
-	return strings.ToLower(s.Repo.Owner + "/" + s.Repo.Repo)
+	return OwnerKey(s.Repo.Owner, s.Repo.Repo)
 }
 
-// anyOwner, passed as the owner to isGeneratedSkill, accepts a generated
-// skill whatever repo stamped it. It is a value no real stamp can carry: a
-// stamp is written from ownerKey, which never contains whitespace.
-const anyOwner = "any owner"
+// OwnerKey is the canonical form of a repository identity for stamping:
+// "owner/repo", lower-cased. Every path that produces a stamp value goes
+// through it so a value written on one run compares equal on the next.
+// Empty when either part is missing.
+func OwnerKey(owner, repo string) string {
+	if owner == "" || repo == "" {
+		return ""
+	}
+	return strings.ToLower(owner + "/" + repo)
+}
+
+// ValidOwnerKey reports whether s is a value OwnerKey could have produced:
+// exactly one "/", no whitespace, both halves non-empty.
+func ValidOwnerKey(s string) bool {
+	parts := strings.Split(s, "/")
+	return len(parts) == 2 && parts[0] != "" && parts[1] != "" && strings.Join(strings.Fields(s), "") == s
+}
 
 // The owner stamp written under GeneratedMarker. Writing and parsing both
 // go through these two constants so the format cannot drift between them.
@@ -249,7 +263,7 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 			continue
 		}
 		dir := filepath.Join(skillsDir, e.Name())
-		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner) {
+		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner, false) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -272,34 +286,28 @@ var generatedBodyLines = []string{
 	"Read one of these before writing new code in this domain — they best represent the team's style:",
 }
 
-var reFrontmatterBlock = regexp.MustCompile(`(?s)^---\s*\n(.*?)\n---\s*\n?`)
-
-// frontmatterName parses the YAML frontmatter of a SKILL.md, as the
-// consuming agent does, and returns its name field.
+// frontmatterName reads a SKILL.md's name field through the module's one
+// frontmatter reader. A block that is not valid YAML (every skill this
+// generator wrote before it quoted its frontmatter) still yields the name
+// via the reader's line-by-line fallback, so those skills are recognised.
 func frontmatterName(content string) (string, bool) {
-	m := reFrontmatterBlock.FindStringSubmatch(content)
-	if m == nil {
-		return "", false
-	}
-	var fm struct {
-		Name string `yaml:"name"`
-	}
-	if err := yaml.Unmarshal([]byte(m[1]), &fm); err != nil || fm.Name == "" {
-		return "", false
-	}
-	return fm.Name, true
+	fields, _, _ := format.ParseFrontmatter(content)
+	name := fields["name"]
+	return name, name != ""
 }
 
 // isGeneratedSkill reports whether the SKILL.md at path is one this package
 // wrote for the skill directory dirName on behalf of the repository owner.
 // All of the following must hold:
 //
-//   - the frontmatter name equals dirName, so a generated skill a user
-//     copied elsewhere and adopted ("api-style/" carrying name "api") is not
-//     mistaken for the generator's own output;
-//   - if the file carries an owner stamp, it names this owner (or owner is
-//     anyOwner), so a skills directory shared by several repositories is
-//     only ever pruned by the repository that wrote each skill (a file
+//   - the frontmatter name equals dirName (ignoring case, since on a
+//     case-insensitive filesystem the path may resolve through an older
+//     casing of the directory), so a generated skill a user copied elsewhere
+//     and adopted ("api-style/" carrying name "api") is not mistaken for the
+//     generator's own output;
+//   - if the file carries an owner stamp, it names this owner (unless
+//     anyOwner is set), so a skills directory shared by several repositories
+//     is only ever pruned by the repository that wrote each skill (a file
 //     without a stamp predates stamping and is treated as ours); and
 //   - the body carries GeneratedMarker or, for a file from a build that
 //     predates the marker, one of generatedBodyLines as a whole line.
@@ -307,19 +315,19 @@ func frontmatterName(content string) (string, bool) {
 // A generated skill kept under its original directory name and hand-edited
 // is still recognised: that directory is documented as generator-owned and
 // regenerated wholesale, so its edits were never safe.
-func isGeneratedSkill(path, dirName, owner string) bool {
+func isGeneratedSkill(path, dirName, owner string, anyOwner bool) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
 	content := string(data)
-	if name, ok := frontmatterName(content); !ok || name != dirName {
+	if name, ok := frontmatterName(content); !ok || !strings.EqualFold(name, dirName) {
 		return false
 	}
 	fingerprinted := false
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
-		if stamped, ok := parseOwnerLine(line); ok && owner != anyOwner && stamped != owner {
+		if stamped, ok := parseOwnerLine(line); ok && !anyOwner && stamped != owner {
 			return false
 		}
 		if line == GeneratedMarker {
@@ -335,7 +343,7 @@ func isGeneratedSkill(path, dirName, owner string) bool {
 	return fingerprinted
 }
 
-func writeSkillFile(domain string, rules []state.Rule, skillsDir string, override string, watermark int, owner string, opts Options) error {
+func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -344,10 +352,6 @@ func writeSkillFile(domain string, rules []state.Rule, skillsDir string, overrid
 		return rules[i].Title < rules[j].Title
 	})
 
-	globs, err := collectGlobs(rules)
-	if err != nil {
-		return fmt.Errorf("skill domain %q: %w", domain, err)
-	}
 	if domain == UniversalSkillName {
 		// No paths gate: these rules apply to every file, so the skill must
 		// auto-load regardless of what is being edited.

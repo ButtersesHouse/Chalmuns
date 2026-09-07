@@ -977,6 +977,9 @@ func TestFrontmatterNameParsing(t *testing.T) {
 		"---\nname: api # trailing comment\ndescription: x\n---\nbody": "api",
 		"---\nname:\ndescription: \"x\"\n---\nbody":                    "",
 		"no frontmatter": "",
+		// Not valid YAML (legacy unquoted output): the lenient fallback
+		// still recovers the name.
+		"---\nname: api\ndescription: a: b\npaths: *.go\n---\nbody": "api",
 	}
 	for in, want := range cases {
 		got, ok := frontmatterName(in)
@@ -1008,8 +1011,76 @@ func TestIsGeneratedSkillUnquotesName(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !isGeneratedSkill(path, "café", "") {
+	if !isGeneratedSkill(path, "café", "", false) {
 		t.Error("escaped name should match its directory after unquoting")
+	}
+}
+
+// Skills written by the 0.2.0 generator have unquoted frontmatter that is
+// not valid YAML (a ": " in the description, a "*"-leading glob). They must
+// still be recognised as generated, so the upgrade run regenerates them and
+// prunes the stale ones instead of refusing.
+func TestLegacyUnparseableFrontmatterIsRecognised(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	legacy := "---\nname: api\ndescription: Conventions for HTTP API endpoints: error response format. Use when editing src/api/.\npaths: *.go, src/**/*.go\n---\n\n# Api Conventions\n\n## Rules\n\n" +
+		generatedBodyLines[0] + "\n\n### Old rule\n\nDo it.\n\n_Source: PRs #1_\n"
+	for _, d := range []string{"api", "old"} {
+		if err := os.MkdirAll(filepath.Join(skills, d), 0755); err != nil {
+			t.Fatal(err)
+		}
+		content := strings.Replace(legacy, "name: api", "name: "+d, 1)
+		if err := os.WriteFile(filepath.Join(skills, d, "SKILL.md"), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Write(stateWith(approvedRule("New rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("upgrade run must regenerate a legacy skill: %v", err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "SKILL.md")); !strings.Contains(got, GeneratedMarker) {
+		t.Error("legacy skill should have been regenerated with the marker")
+	}
+	if _, err := os.Stat(filepath.Join(skills, "old")); !os.IsNotExist(err) {
+		t.Error("stale legacy skill with unparseable frontmatter should have been pruned")
+	}
+}
+
+// A domain directory that exists without a SKILL.md is not ours either:
+// wiping its examples/ and rules/ would destroy whatever a user keeps there.
+func TestRefusesDirectoryWithoutSkillFile(t *testing.T) {
+	dir := t.TempDir()
+	keep := filepath.Join(dir, ".claude", "skills", "api", "rules", "checklist.md")
+	if err := os.MkdirAll(filepath.Dir(keep), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{})
+	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("expected a refusal, got %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("user content under the directory was removed")
+	}
+}
+
+func TestOwnerKey(t *testing.T) {
+	if got := OwnerKey("Acme", "Alpha"); got != "acme/alpha" {
+		t.Errorf("OwnerKey = %q", got)
+	}
+	if OwnerKey("", "x") != "" || OwnerKey("x", "") != "" {
+		t.Error("OwnerKey should be empty when a part is missing")
+	}
+	for _, ok := range []string{"acme/alpha", "a-b/c.d"} {
+		if !ValidOwnerKey(ok) {
+			t.Errorf("ValidOwnerKey(%q) should be true", ok)
+		}
+	}
+	for _, bad := range []string{"", "acme", "acme/", "/alpha", "a/b/c", "any owner", "a b/c"} {
+		if ValidOwnerKey(bad) {
+			t.Errorf("ValidOwnerKey(%q) should be false", bad)
+		}
 	}
 }
 
@@ -1089,7 +1160,7 @@ func TestWritePrunesStaleGeneratedSkills(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
 		t.Fatalf("first run should have written components: %v", err)
 	}
-	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components", "") {
+	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components", "", false) {
 		t.Fatal("generated SKILL.md should carry the generated marker")
 	}
 
@@ -1227,7 +1298,12 @@ func TestWriteSkillFileSmallStaysSingleFile(t *testing.T) {
 func TestStaleGeneratedFilesRemovedOnRewrite(t *testing.T) {
 	dir := t.TempDir()
 	skillDir := filepath.Join(dir, ".claude", "skills", "api")
-	// Simulate leftovers from a prior run whose rules were renamed/removed.
+	// A prior run wrote the skill (a directory with no generated SKILL.md
+	// would be refused as foreign); then simulate leftovers from that run
+	// whose rules were since renamed/removed.
+	if err := Write(stateWith(approvedRule("Old rule", "old", "api", "established", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
 	for _, stale := range []string{"examples/old-rule.md", "rules/old-rule.md"} {
 		p := filepath.Join(skillDir, stale)
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {

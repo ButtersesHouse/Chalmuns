@@ -176,3 +176,23 @@ func TestRunPromote_requiresState(t *testing.T) {
 		t.Error("promote should require --state")
 	}
 }
+
+func TestResolveOwner(t *testing.T) {
+	s := state.Empty()
+	if got, err := resolveOwner("Acme/Alpha/", s, t.TempDir()); err != nil || got != "acme/alpha" {
+		t.Errorf("flag: got %q, %v", got, err)
+	}
+	for _, bad := range []string{"acme", "a/b/c", "any owner", "github.com/acme/alpha"} {
+		if _, err := resolveOwner(bad, s, t.TempDir()); err == nil {
+			t.Errorf("--repo %q should be rejected", bad)
+		}
+	}
+	s.Repo = state.RepoInfo{Owner: "Acme", Repo: "Beta"}
+	if got, err := resolveOwner("", s, t.TempDir()); err != nil || got != "acme/beta" {
+		t.Errorf("state: got %q, %v", got, err)
+	}
+	// No flag, no state repo, no git remote: unowned, not an error.
+	if got, err := resolveOwner("", state.Empty(), t.TempDir()); err != nil || got != "" {
+		t.Errorf("fallback: got %q, %v", got, err)
+	}
+}

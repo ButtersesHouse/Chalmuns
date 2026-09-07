@@ -130,10 +130,14 @@ func runWriteOutputs(args []string) error {
 		anchorExamples(&s, outputDir)
 	}
 
+	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, outputDir)
+	if err != nil {
+		return err
+	}
 	opts := output.Options{
 		RAGHints:  ragHints,
 		SkillsDir: flagValue(args, "--skills-dir", ""),
-		Owner:     resolveOwner(flagValue(args, "--repo", ""), s, outputDir),
+		Owner:     owner,
 	}
 	return output.Write(s, outputDir, opts)
 }
@@ -141,18 +145,24 @@ func runWriteOutputs(args []string) error {
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
 // in a fixed order so it cannot flip between runs: an explicit --repo flag,
 // then the state's repo field, then the git remote of the output directory
-// (the same detection detect-repo performs). Empty when none is available.
-func resolveOwner(flag string, s state.State, outputDir string) string {
+// (the same detection detect-repo performs). Every branch produces the value
+// through output.OwnerKey so stamps compare equal across runs. Empty when
+// none is available.
+func resolveOwner(flag string, s state.State, outputDir string) (string, error) {
 	if flag != "" {
-		return strings.ToLower(strings.Trim(flag, "/"))
+		parts := strings.SplitN(strings.Trim(flag, "/"), "/", 2)
+		if len(parts) != 2 || !output.ValidOwnerKey(output.OwnerKey(parts[0], parts[1])) {
+			return "", fmt.Errorf("--repo must be \"owner/repo\" (got %q)", flag)
+		}
+		return output.OwnerKey(parts[0], parts[1]), nil
 	}
-	if s.Repo.Owner != "" && s.Repo.Repo != "" {
-		return strings.ToLower(s.Repo.Owner + "/" + s.Repo.Repo)
+	if key := output.OwnerKey(s.Repo.Owner, s.Repo.Repo); key != "" {
+		return key, nil
 	}
-	if r, err := detect.Detect(outputDir); err == nil && r.Owner != "" && r.Repo != "" {
-		return strings.ToLower(r.Owner + "/" + r.Repo)
+	if r, err := detect.Detect(outputDir); err == nil {
+		return output.OwnerKey(r.Owner, r.Repo), nil
 	}
-	return ""
+	return "", nil
 }
 
 // runPromote publishes the conventions into a top-level agent instruction

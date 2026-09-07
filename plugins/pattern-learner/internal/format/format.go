@@ -81,7 +81,7 @@ func AuditFile(path string) Result {
 	}
 
 	text := string(data)
-	fields, body, parseIssues := parseFrontmatter(text)
+	fields, body, parseIssues := ParseFrontmatter(text)
 	res.Name = fields["name"]
 	res.BodyLines = countLines(body)
 	res.OverBudget = res.BodyLines > BodyLineLimit
@@ -90,26 +90,32 @@ func AuditFile(path string) Result {
 	return res
 }
 
-// parseFrontmatter splits text into the frontmatter fields and the body that
-// follows the closing "---". The block is parsed as YAML, since that is how
-// the consuming agent reads it; a block that does not parse is reported as
-// an issue, and the fields are then recovered line-by-line so the remaining
-// checks (and the reported name) still have something to work with.
+// ParseFrontmatter splits a SKILL.md's text into its frontmatter fields and
+// the body that follows the closing "---". It is the one frontmatter reader
+// in the module: the audit uses it to check generated files, and the
+// generator uses it to recognise its own earlier output. The block is parsed
+// as YAML, since that is how the consuming agent reads it; a block that does
+// not parse is reported as an issue, and the fields are then recovered
+// line-by-line so callers (and the reported name) still have something to
+// work with — which is also what lets the generator recognise skills it
+// wrote before it quoted its frontmatter.
 //
 // Values are flattened to strings using the scalar's source text (so
 // `name: 007` is reported as "007", the literal the file carries, not the
 // integer 7 it decodes to); a list (the .claude/rules form of `paths`) is
 // joined with commas. Anything else is reported as an issue, since no
-// documented field takes a nested value.
-func parseFrontmatter(text string) (map[string]string, string, []string) {
-	fields := map[string]string{}
-	issues := []string{}
+// documented field takes a nested value. A repeated key is reported too:
+// yaml.v3 tolerates it when decoding into a Node, but strict loaders refuse
+// the file.
+func ParseFrontmatter(text string) (fields map[string]string, body string, issues []string) {
+	fields = map[string]string{}
+	issues = []string{}
 	m := reFrontmatter.FindStringSubmatchIndex(text)
 	if m == nil {
 		return fields, text, issues
 	}
 	fmText := text[m[2]:m[3]]
-	body := text[m[1]:]
+	body = text[m[1]:]
 
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(fmText), &root); err != nil {
@@ -131,8 +137,13 @@ func parseFrontmatter(text string) (map[string]string, string, []string) {
 		issues = append(issues, "frontmatter must be a key/value mapping (name:, description:, ...), not a bare value or list")
 		return fields, body, issues
 	}
+	seen := map[string]bool{}
 	for i := 0; i+1 < len(top.Content); i += 2 {
 		k, node := top.Content[i].Value, top.Content[i+1]
+		if seen[k] {
+			issues = append(issues, fmt.Sprintf("frontmatter key '%s' appears more than once; strict YAML loaders reject the file", k))
+		}
+		seen[k] = true
 		switch node.Kind {
 		case yaml.ScalarNode:
 			if node.Tag == "!!null" {
