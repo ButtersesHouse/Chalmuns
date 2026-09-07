@@ -116,6 +116,13 @@ func runWriteOutputs(args []string) error {
 	if statePath == "" {
 		return fmt.Errorf("--state required")
 	}
+	// state.Read treats a missing file as an empty state, which is right for
+	// a first run of the pipeline but not here: write-outputs prunes every
+	// generated skill absent from state, so a mistyped --state would delete
+	// them all. Require the file to exist, before any other work.
+	if _, err := os.Stat(statePath); err != nil {
+		return fmt.Errorf("--state %s: %w (write-outputs needs an existing state file; a missing one would prune every generated skill)", statePath, err)
+	}
 	// The output directory (default skills location, anchoring root) is
 	// the repository the state belongs to, not wherever the command was
 	// run from; an explicit --output-dir overrides it. The repository root
@@ -131,13 +138,6 @@ func runWriteOutputs(args []string) error {
 	ragHints := hasFlag(args, "--rag-hints")
 	ragAnchor := hasFlag(args, "--rag")
 
-	// state.Read treats a missing file as an empty state, which is right for
-	// a first run of the pipeline but not here: write-outputs prunes every
-	// generated skill absent from state, so a mistyped --state would delete
-	// them all. Require the file to exist.
-	if _, err := os.Stat(statePath); err != nil {
-		return fmt.Errorf("--state %s: %w (write-outputs needs an existing state file; a missing one would prune every generated skill)", statePath, err)
-	}
 	s, err := state.Read(statePath)
 	if err != nil {
 		return err
@@ -540,7 +540,7 @@ func (m *globMatcher) walkAll() {
 			// Globs are repository-relative; a leading "/" or "./" the
 			// model sometimes emits means the same thing.
 			cleaned := strings.TrimPrefix(path.Clean(filepath.ToSlash(g)), "/")
-			if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			if output.EscapesRoot(g) {
 				// A glob that climbs out of the repository anchors nothing:
 				// a reference outside the repo is refused on the RAG path
 				// (refExists) and would be no use to a reader here either.

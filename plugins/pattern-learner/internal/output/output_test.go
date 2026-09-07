@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/format"
@@ -2091,6 +2092,11 @@ func TestCarryOverCollisionIsReported(t *testing.T) {
 	if err := os.MkdirAll(retired2, 0755); err != nil {
 		t.Fatal(err)
 	}
+	// A retired copy of a generated skill carries its SKILL.md; a
+	// SKILL.md-less transient would be taken for a render in progress.
+	if err := os.WriteFile(filepath.Join(retired2, "SKILL.md"), []byte(readFile(t, filepath.Join(skills, "api", "SKILL.md"))), 0644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(retired2, "notes.md"), []byte("older"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -2147,6 +2153,44 @@ func TestUnidentifiedRunPrunesStampedSkillInTree(t *testing.T) {
 	}
 }
 
+// A transient with no SKILL.md yet may be another run's render in
+// progress; only an old one is cleared.
+func TestFreshEmptyTransientIsLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	inFlight := transientPath(filepath.Join(skills, "api"), stagingSuffix)
+	if err := os.MkdirAll(inFlight, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inFlight); err != nil {
+		t.Error("a fresh SKILL.md-less transient must be left for the run that is rendering it")
+	}
+	old := time.Now().Add(-2 * abandonedAfter)
+	if err := os.Chtimes(inFlight, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inFlight); !os.IsNotExist(err) {
+		t.Error("an old SKILL.md-less transient is abandoned and cleared")
+	}
+}
+
+func TestEscapesRoot(t *testing.T) {
+	for glob, want := range map[string]bool{
+		"../x/*.go": true, "..": true, "src/../../x": true, "/../x": false, // "/" is the repo root; it cannot climb
+		"src/*.go": false, "src/../x": false, "./x": false, "/src/**": false,
+	} {
+		if got := EscapesRoot(glob); got != want {
+			t.Errorf("EscapesRoot(%q) = %v, want %v", glob, got, want)
+		}
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)
@@ -2171,6 +2215,11 @@ func TestTransientDirsAreCleared(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(skills, leftover, "SKILL.md"), []byte("partial"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		// Old enough to count as abandoned rather than a render in progress.
+		old := time.Now().Add(-2 * abandonedAfter)
+		if err := os.Chtimes(filepath.Join(skills, leftover), old, old); err != nil {
 			t.Fatal(err)
 		}
 	}

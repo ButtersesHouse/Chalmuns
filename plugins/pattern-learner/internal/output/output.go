@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -81,9 +82,7 @@ func Write(s state.State, outputDir string, opts Options) error {
 	if err != nil {
 		return err
 	}
-	// Nothing happens between validation and the write here, so the
-	// validated plan is used as is rather than checked a second time.
-	return prepared.execute(false)
+	return prepared.Write()
 }
 
 // isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
@@ -111,6 +110,15 @@ func isSharedSkillsDir(skillsDir, outputDir string) bool {
 // the repository's own.
 func IsInside(path, root string) bool {
 	return !isSharedSkillsDir(path, root)
+}
+
+// EscapesRoot reports whether a repository-relative glob or path, once
+// cleaned, climbs out of the repository ("../x", ".."). It is the one
+// implementation of that test for slash-form globs; the paths gate and the
+// anchoring walk both use it so they agree on which globs are in-repo.
+func EscapesRoot(glob string) bool {
+	c := strings.TrimPrefix(path.Clean(filepath.ToSlash(glob)), "/")
+	return c == ".." || strings.HasPrefix(c, "../")
 }
 
 // IsOutsideRel reports whether a path returned by filepath.Rel points
@@ -199,36 +207,22 @@ func Validate(s *state.State, outputDir string, opts Options) (*Prepared, error)
 // Validate, the on-disk ones because the anchoring step can take long
 // enough for the skills tree to change underneath the run.
 func (pr *Prepared) Write() error {
-	return pr.execute(true)
-}
-
-// execute performs the run. With recheck set the plan is rebuilt from the
-// state as it now stands and validated again; without it the plan that
-// passed Validate is used as is, for a caller that did nothing in between.
-func (pr *Prepared) execute(recheck bool) error {
 	s := *pr.state
-	p := pr.plan
-	if recheck {
-		p = buildPlan(s, pr.plan.skillsDir, pr.plan.shared, pr.opts)
-		if err := p.validateRules(); err != nil {
-			return err
-		}
+	p := buildPlan(s, pr.plan.skillsDir, pr.plan.shared, pr.opts)
+	if err := p.validateRules(); err != nil {
+		return err
 	}
 
 	// Repair whatever an interrupted earlier run left (a domain mid-swap,
 	// a stale staging tree) before judging the tree, so the checks see
-	// every domain in its settled place. Recovery only restores or clears
-	// this run's own generated trees, so a plan that passed validation
-	// before it still passes.
+	// every domain in its settled place.
 	warnings, err := recoverTransients(p.skillsDir, p.owner, !p.shared)
 	pr.warnings = warnings // this run's only; a repeated Write reports afresh
 	if err != nil {
 		return err
 	}
-	if recheck {
-		if err := p.validateDisk(); err != nil {
-			return err
-		}
+	if err := p.validateDisk(); err != nil {
+		return err
 	}
 	for domain, rules := range p.byDomain {
 		if err := writeSkillFile(domain, rules, p.globs[domain], p.isUniversal(domain), p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
@@ -592,6 +586,11 @@ func isTransientDir(name string) bool {
 	return reTransient.MatchString(name)
 }
 
+// abandonedAfter is how long a transient tree with no SKILL.md may exist
+// before it is taken for the leftover of a dead run rather than another
+// run's render in progress. Rendering a domain takes well under this.
+var abandonedAfter = 10 * time.Minute
+
 // transientPath returns a fresh sibling name for base with the given marker.
 func transientPath(base, marker string) string {
 	var b [4]byte
@@ -646,8 +645,15 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			}
 			continue
 		}
-		if !anyOwner {
-			if info := inspectSkill(filepath.Join(dir, "SKILL.md"), ""); info.stamped && info.stamp != owner {
+		info := inspectSkill(filepath.Join(dir, "SKILL.md"), "")
+		if !anyOwner && info.stamped && info.stamp != owner {
+			continue
+		}
+		// A transient with no SKILL.md yet may be another run's render in
+		// progress (SKILL.md is the first file written, so the window is
+		// brief); only one that has sat untouched for a while is abandoned.
+		if !info.generated && !info.stamped {
+			if fi, err := os.Stat(dir); err == nil && time.Since(fi.ModTime()) < abandonedAfter {
 				continue
 			}
 		}
@@ -1484,7 +1490,7 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 				// A paths gate is repository-relative; a glob that climbs
 				// out of the repository can never match a file the skill
 				// should load for.
-				if c := path.Clean(filepath.ToSlash(e)); c == ".." || strings.HasPrefix(c, "../") {
+				if EscapesRoot(e) {
 					return nil, fmt.Errorf("file glob %q points outside the repository, which a paths gate cannot express; use a repository-relative glob and rerun", g)
 				}
 				all = append(all, e)
