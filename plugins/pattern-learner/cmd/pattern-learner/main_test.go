@@ -4,9 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/ButtersesHouse/Chalmuns/internal/output"
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
 
@@ -229,22 +231,19 @@ func TestRepoRoot(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := repoRoot(filepath.Join(stateDir, "state.json"), "/elsewhere")
+	got, ok := repoRoot(filepath.Join(stateDir, "state.json"))
 	want, _ := filepath.EvalSymlinks(repo)
 	if gotResolved, _ := filepath.EvalSymlinks(got); !ok || gotResolved != want {
 		t.Errorf("repoRoot = %q, %v; want %q", got, ok, want)
 	}
-	// State outside any git repo: fall back, and say so. A git repo with
-	// the state in a plain subdirectory keeps the fallback honest even
-	// when TMPDIR is inside a checkout.
-	if root, ok := repoRoot(filepath.Join(t.TempDir(), "state.json"), "/fallback"); ok {
-		// Inside a checkout this legitimately resolves to that checkout;
-		// only assert the fallback when git found nothing.
-		if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
-			t.Errorf("repoRoot fallback = %q, want /fallback", root)
+	// State outside any git repo: its own directory, and inGit false
+	// (unless TMPDIR itself sits inside a checkout).
+	plain := t.TempDir()
+	if root, ok := repoRoot(filepath.Join(plain, "state.json")); !ok {
+		wantPlain, _ := filepath.EvalSymlinks(plain)
+		if gotPlain, _ := filepath.EvalSymlinks(root); gotPlain != wantPlain {
+			t.Errorf("repoRoot outside git = %q, want %q", root, wantPlain)
 		}
-	} else if root != "/fallback" {
-		t.Errorf("repoRoot fallback = %q, want /fallback", root)
 	}
 
 	// A .claude/ that is a symlink into another repository must not make
@@ -264,7 +263,7 @@ func TestRepoRoot(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dotfiles, "claude"), filepath.Join(project, ".claude")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	got, ok = repoRoot(filepath.Join(project, ".claude", "pattern-learner", "state.json"), "/elsewhere")
+	got, ok = repoRoot(filepath.Join(project, ".claude", "pattern-learner", "state.json"))
 	wantProject, _ := filepath.EvalSymlinks(project)
 	if gotResolved, _ := filepath.EvalSymlinks(got); !ok || gotResolved != wantProject {
 		t.Errorf("repoRoot through a symlinked .claude = %q, %v; want the project %q", got, ok, wantProject)
@@ -339,13 +338,13 @@ func TestGlobMatcher(t *testing.T) {
 // A relative --skills-dir resolves against the output directory, and the
 // default lives under it.
 func TestResolveSkillsDir(t *testing.T) {
-	if got := resolveSkillsDir("", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
+	if got := output.ResolveSkillsDir("", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
 		t.Errorf("default: %q", got)
 	}
-	if got := resolveSkillsDir(".claude/skills", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
+	if got := output.ResolveSkillsDir(".claude/skills", "/repo"); got != filepath.Join("/repo", ".claude", "skills") {
 		t.Errorf("relative: %q", got)
 	}
-	if got := resolveSkillsDir("/shared/skills", "/repo"); got != "/shared/skills" {
+	if got := output.ResolveSkillsDir("/shared/skills", "/repo"); got != "/shared/skills" {
 		t.Errorf("absolute: %q", got)
 	}
 }
@@ -485,13 +484,35 @@ func TestPromoteDefaultsToStateRepo(t *testing.T) {
 }
 
 func TestEscapeGlobMeta(t *testing.T) {
-	if got := escapeGlobMeta("/p[1]/a*b?c"); got != "/p[[]1]/a[*]b[?]c" {
-		t.Errorf("got %q", got)
+	names := []string{"p[1]", "a*b?c"}
+	if runtime.GOOS != "windows" {
+		names = append(names, `a\b`)
 	}
-	root := filepath.Join(t.TempDir(), "p[1]")
-	writeTree(t, root, map[string]string{"a.go": "x\n"})
-	found, err := filepath.Glob(filepath.Join(escapeGlobMeta(root), "*.go"))
-	if err != nil || len(found) != 1 {
-		t.Errorf("escaped root should glob normally: %v, %v", found, err)
+	for _, name := range names {
+		root := filepath.Join(t.TempDir(), name)
+		writeTree(t, root, map[string]string{"a.go": "x\n"})
+		found, err := filepath.Glob(filepath.Join(escapeGlobMeta(root), "*.go"))
+		if err != nil || len(found) != 1 || found[0] != filepath.Join(root, "a.go") {
+			t.Errorf("%s: escaped root should glob normally and yield the real path: %v, %v", name, found, err)
+		}
+	}
+}
+
+// A state outside git still resolves to its own project directory, never
+// the process cwd.
+func TestRepoRootOutsideGitUsesStateProject(t *testing.T) {
+	project := t.TempDir()
+	stateDir := filepath.Join(project, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	root, inGit := repoRoot(filepath.Join(stateDir, "state.json"))
+	if inGit {
+		// TMPDIR is inside a checkout; the fallback branch is not reachable.
+		t.Skip("temp dir is inside a git checkout")
+	}
+	want, _ := filepath.EvalSymlinks(project)
+	if got, _ := filepath.EvalSymlinks(root); got != want {
+		t.Errorf("repoRoot outside git = %q, want the project %q", root, want)
 	}
 }

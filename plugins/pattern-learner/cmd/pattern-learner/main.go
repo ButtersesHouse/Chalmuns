@@ -121,7 +121,7 @@ func runWriteOutputs(args []string) error {
 	// run from; an explicit --output-dir overrides it. The repository root
 	// is resolved once and reused for the shared-directory judgement.
 	outputDir := flagValue(args, "--output-dir", "")
-	root, inGit := repoRoot(statePath, ".")
+	root, inGit := repoRoot(statePath)
 	if outputDir == "" {
 		outputDir = root
 	} else if !inGit {
@@ -153,7 +153,7 @@ func runWriteOutputs(args []string) error {
 	}
 	opts := output.Options{
 		RAGHints:  ragHints,
-		SkillsDir: resolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir),
+		SkillsDir: output.ResolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir),
 		Owner:     owner,
 		RepoRoot:  root,
 	}
@@ -177,27 +177,13 @@ func runWriteOutputs(args []string) error {
 	return err
 }
 
-// resolveSkillsDir applies the --skills-dir default and resolves a relative
-// value against the output directory rather than the process cwd, so the
-// skills, the example anchoring and the shared-directory judgement all
-// share one base wherever the command was run from.
-func resolveSkillsDir(flag, outputDir string) string {
-	if flag == "" {
-		return filepath.Join(outputDir, ".claude", "skills")
-	}
-	if filepath.IsAbs(flag) {
-		return flag
-	}
-	return filepath.Join(outputDir, flag)
-}
-
 // repoRoot finds the root of the repository a run writes for, which decides
 // whether the skills directory is the repo's own or a shared one. The state
 // file lives inside the repository, so its git top level is authoritative;
 // when the state is not under git, fall back to outputDir. Using the
 // current directory alone would misclassify a user-level skills directory
 // as repo-owned whenever the command is run from one of its ancestors.
-func repoRoot(statePath, fallback string) (root string, ok bool) {
+func repoRoot(statePath string) (root string, inGit bool) {
 	// Ask git from the state's logical location, not through whatever the
 	// path resolves to physically: a .claude/ that is a symlink into a
 	// dotfiles repository would otherwise name that repository. By
@@ -215,7 +201,13 @@ func repoRoot(statePath, fallback string) (root string, ok bool) {
 			return top, true
 		}
 	}
-	return fallback, false
+	// Not under git: the state's own project directory is still the
+	// repository this run is for, never the process cwd.
+	abs, err := filepath.Abs(askFrom)
+	if err != nil {
+		return askFrom, false
+	}
+	return abs, false
 }
 
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
@@ -270,7 +262,7 @@ func runPromote(args []string) error {
 	// Same default as write-outputs: the repository the state lives in.
 	outputDir := flagValue(args, "--output-dir", "")
 	if outputDir == "" {
-		outputDir, _ = repoRoot(statePath, ".")
+		outputDir, _ = repoRoot(statePath)
 	}
 
 	s, err := state.Read(statePath)
@@ -278,7 +270,7 @@ func runPromote(args []string) error {
 		return err
 	}
 
-	skillsDir := resolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir)
+	skillsDir := output.ResolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir)
 
 	// Default to AGENTS.md (the cross-agent convention) when no target is
 	// named; agents other than Claude Code have no other entry point.
@@ -604,15 +596,19 @@ func (m *globMatcher) dedupMatches() {
 }
 
 // escapeGlobMeta quotes the glob metacharacters in a literal path so it can
-// be joined with a pattern for filepath.Glob. Bracket classes work on every
-// platform, unlike a backslash escape; the backslash itself is an escape
-// character to filepath.Match everywhere but Windows, where it is the
-// separator and must pass through.
+// be joined with a pattern for filepath.Glob. Outside Windows a backslash
+// escape quotes every metacharacter, the backslash itself included (a
+// bracket class cannot hold one: "[\]" reads as an escaped "]"). On
+// Windows the backslash is the separator and no escape character exists,
+// so the three remaining metacharacters go in bracket classes.
 func escapeGlobMeta(p string) string {
 	var b strings.Builder
 	for _, r := range p {
 		switch {
-		case r == '*' || r == '?' || r == '[' || (r == '\\' && runtime.GOOS != "windows"):
+		case runtime.GOOS != "windows" && (r == '*' || r == '?' || r == '[' || r == '\\'):
+			b.WriteRune('\\')
+			b.WriteRune(r)
+		case runtime.GOOS == "windows" && (r == '*' || r == '?' || r == '['):
 			b.WriteRune('[')
 			b.WriteRune(r)
 			b.WriteRune(']')

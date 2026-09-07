@@ -80,7 +80,9 @@ func Write(s state.State, outputDir string, opts Options) error {
 	if err != nil {
 		return err
 	}
-	return prepared.Write()
+	// Nothing happens between validation and the write here, so the
+	// validated plan is used as is rather than checked a second time.
+	return prepared.execute(false)
 }
 
 // isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
@@ -171,11 +173,10 @@ func dedupeStrings(in []string) []string {
 // in place between validation and Write (example anchoring adds file
 // references); Write checks the state again as it stands at that point.
 type Prepared struct {
-	state     *state.State
-	skillsDir string
-	shared    bool
-	opts      Options
-	warnings  []string
+	state    *state.State
+	plan     *plan // the plan that passed validation
+	opts     Options
+	warnings []string
 }
 
 // Validate runs every check a run performs before it touches the skills
@@ -185,10 +186,11 @@ type Prepared struct {
 // would be refused does not walk the repository first.
 func Validate(s *state.State, outputDir string, opts Options) (*Prepared, error) {
 	skillsDir, shared := resolveDirs(outputDir, opts)
-	if err := buildPlan(*s, skillsDir, shared, opts).validate(); err != nil {
+	p := buildPlan(*s, skillsDir, shared, opts)
+	if err := p.validate(); err != nil {
 		return nil, err
 	}
-	return &Prepared{state: s, skillsDir: skillsDir, shared: shared, opts: opts}, nil
+	return &Prepared{state: s, plan: p, opts: opts}, nil
 }
 
 // Write performs the run on the state as it now stands. The checks are
@@ -196,22 +198,36 @@ func Validate(s *state.State, outputDir string, opts Options) (*Prepared, error)
 // Validate, the on-disk ones because the anchoring step can take long
 // enough for the skills tree to change underneath the run.
 func (pr *Prepared) Write() error {
+	return pr.execute(true)
+}
+
+// execute performs the run. With recheck set the plan is rebuilt from the
+// state as it now stands and validated again; without it the plan that
+// passed Validate is used as is, for a caller that did nothing in between.
+func (pr *Prepared) execute(recheck bool) error {
 	s := *pr.state
-	p := buildPlan(s, pr.skillsDir, pr.shared, pr.opts)
-	if err := p.validateRules(); err != nil {
-		return err
+	p := pr.plan
+	if recheck {
+		p = buildPlan(s, pr.plan.skillsDir, pr.plan.shared, pr.opts)
+		if err := p.validateRules(); err != nil {
+			return err
+		}
 	}
 
 	// Repair whatever an interrupted earlier run left (a domain mid-swap,
 	// a stale staging tree) before judging the tree, so the checks see
-	// every domain in its settled place.
+	// every domain in its settled place. Recovery only restores or clears
+	// this run's own generated trees, so a plan that passed validation
+	// before it still passes.
 	warnings, err := recoverTransients(p.skillsDir, p.owner, !p.shared)
 	pr.warnings = warnings // this run's only; a repeated Write reports afresh
 	if err != nil {
 		return err
 	}
-	if err := p.validateDisk(); err != nil {
-		return err
+	if recheck {
+		if err := p.validateDisk(); err != nil {
+			return err
+		}
 	}
 	for domain, rules := range p.byDomain {
 		if err := writeSkillFile(domain, rules, p.globs[domain], p.isUniversal(domain), p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
@@ -239,15 +255,27 @@ func (pr *Prepared) Warnings() []string {
 // resolveDirs applies the Options defaults for the skills directory and
 // decides whether it is shared.
 func resolveDirs(outputDir string, opts Options) (skillsDir string, shared bool) {
-	skillsDir = opts.SkillsDir
-	if skillsDir == "" {
-		skillsDir = filepath.Join(outputDir, ".claude", "skills")
-	}
+	skillsDir = ResolveSkillsDir(opts.SkillsDir, outputDir)
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		repoRoot = outputDir
 	}
 	return skillsDir, isSharedSkillsDir(skillsDir, repoRoot)
+}
+
+// ResolveSkillsDir is the one place the skills directory is derived from
+// its flag: empty means <outputDir>/.claude/skills, a relative value is
+// taken against outputDir rather than the process cwd (so the skills, the
+// example anchoring and the shared-directory judgement share one base
+// wherever the command was run from), and an absolute one is used as is.
+func ResolveSkillsDir(flag, outputDir string) string {
+	if flag == "" {
+		return filepath.Join(outputDir, ".claude", "skills")
+	}
+	if filepath.IsAbs(flag) {
+		return flag
+	}
+	return filepath.Join(outputDir, flag)
 }
 
 // plan is everything a run needs to know before it writes: the approved
@@ -500,8 +528,13 @@ func classifySlot(path string) slotKind {
 	}
 	fi, statErr := os.Stat(path)
 	switch {
-	case statErr != nil:
+	case statErr != nil && os.IsNotExist(statErr):
 		return slotDangling
+	case statErr != nil:
+		// Lstat saw an entry that Stat cannot follow (a link into a
+		// directory this user cannot read, a link loop): not free, and not
+		// something to delete to make room, so it is judged as a link.
+		return slotSymlinkDir
 	case !fi.IsDir():
 		return slotFile
 	case lst.Mode()&os.ModeSymlink != 0:
