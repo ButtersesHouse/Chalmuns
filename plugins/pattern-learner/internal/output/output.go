@@ -81,8 +81,8 @@ func Write(s state.State, outputDir string, opts Options) error {
 // shared by several repositories, where a different stamp means a
 // different repository's skill.
 func isSharedSkillsDir(skillsDir, outputDir string) bool {
-	absSkills, err1 := filepath.Abs(skillsDir)
-	absOut, err2 := filepath.Abs(outputDir)
+	absSkills, err1 := resolvePath(skillsDir)
+	absOut, err2 := resolvePath(outputDir)
 	if err1 != nil || err2 != nil {
 		return true
 	}
@@ -91,6 +91,32 @@ func isSharedSkillsDir(skillsDir, outputDir string) bool {
 		return true
 	}
 	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolvePath returns p as an absolute path with symlinks resolved, so a
+// .claude/skills that is a symlink into a user-level directory is judged by
+// where it really points. A path that does not exist yet is resolved
+// through its nearest existing ancestor.
+func resolvePath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	var missing []string
+	for cur := abs; ; {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return resolved, nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		missing = append(missing, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 // renderUniversalRules writes CLAUDE.md-targeted rules at the given heading level.
@@ -425,13 +451,6 @@ func inspectSkill(path, dirName string) skillInfo {
 	}
 	info.generated = nameMatches && fingerprinted
 	return info
-}
-
-// isGeneratedSkill reports whether the SKILL.md at path was generated for
-// dirName and, unless anyOwner is set, is stamped for owner or unstamped.
-func isGeneratedSkill(path, dirName, owner string, anyOwner bool) bool {
-	info := inspectSkill(path, dirName)
-	return info.generated && (anyOwner || !info.stamped || info.stamp == owner)
 }
 
 func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {

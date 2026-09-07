@@ -1101,8 +1101,50 @@ func TestIsGeneratedSkillUnquotesName(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if !isGeneratedSkill(path, "café", "", false) {
+	if !inspectSkill(path, "café").generated {
 		t.Error("escaped name should match its directory after unquoting")
+	}
+}
+
+// A .claude/skills that is a symlink into a shared directory is judged by
+// its target, so the shared-directory rules apply to it.
+func TestSymlinkedSkillsDirIsShared(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(shared, 0755); err != nil {
+		t.Fatal(err)
+	}
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".claude"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repo, ".claude", "skills")
+	if err := os.Symlink(shared, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if !isSharedSkillsDir(link, repo) {
+		t.Error("a symlink into a directory outside the repo is shared")
+	}
+	// A not-yet-existing subdirectory of the link resolves through it.
+	if !isSharedSkillsDir(filepath.Join(link, "sub"), repo) {
+		t.Error("a missing path under the symlink resolves through it")
+	}
+	// Another repo's stamped skill in the shared target must survive a run
+	// through the symlink.
+	other := filepath.Join(shared, "api")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stamped := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("acme/other") + "\n\nbody\n"
+	if err := os.WriteFile(filepath.Join(other, "SKILL.md"), []byte(stamped), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a := stateWith(approvedRule("Rule", "do it", "ui", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, repo, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "SKILL.md")); err != nil {
+		t.Error("another repo's skill in the symlinked shared directory was pruned")
 	}
 }
 
@@ -1309,7 +1351,7 @@ func TestWritePrunesStaleGeneratedSkills(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(skills, "components", "SKILL.md")); err != nil {
 		t.Fatalf("first run should have written components: %v", err)
 	}
-	if !isGeneratedSkill(filepath.Join(skills, "components", "SKILL.md"), "components", "", false) {
+	if !inspectSkill(filepath.Join(skills, "components", "SKILL.md"), "components").generated {
 		t.Fatal("generated SKILL.md should carry the generated marker")
 	}
 
