@@ -116,10 +116,19 @@ func writeSkillFiles(s state.State, skillsDir string, opts Options) error {
 
 	// Validate every domain before touching the tree, so a bad name fails the
 	// run with nothing written rather than after a map-ordered subset.
+	byFold := map[string]string{}
 	for domain := range byDomain {
 		if !validDomain(domain) {
 			return fmt.Errorf("skill domain %q is not a valid directory name; re-target its rules to a single-segment domain (e.g. \"api\") and rerun", domain)
 		}
+		// Two domains differing only by case share one directory on a
+		// case-insensitive filesystem, and the second write would wipe the
+		// first's examples/ and rules/. Refuse rather than lose rules.
+		folded := strings.ToLower(domain)
+		if other, dup := byFold[folded]; dup {
+			return fmt.Errorf("skill domains %q and %q differ only by case and would share one directory; merge them into a single domain and rerun", other, domain)
+		}
+		byFold[folded] = domain
 	}
 
 	// Prune before writing. Pruning afterwards would, on a case-insensitive
@@ -169,14 +178,17 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule) error {
 	return nil
 }
 
-// generatedBodyLines are the fixed explanatory sentences at the top of the
-// inline and chunked layouts. The generator has written them since before
-// GeneratedMarker existed, so they identify a skill from an older build,
-// which is the population pruning was added to clean up. Both are long and
-// exact, so a hand-written skill cannot match by accident.
+// generatedBodyLines are fixed sentences the generator writes into a skill
+// body. They identify a skill from a build that predates GeneratedMarker
+// (the first two since the progressive-disclosure layout, the third for
+// longer), which is the population pruning was added to clean up. Each is
+// long and exact, so a hand-written skill cannot match by accident. A skill
+// from a build older than all three carries no fingerprint and must be
+// removed by hand; SKILL.md says so.
 var generatedBodyLines = []string{
 	"Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.",
 	"This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.",
+	"Read one of these before writing new code in this domain — they best represent the team's style:",
 }
 
 var reFrontmatterName = regexp.MustCompile(`(?m)^name:\s*(.+?)\s*$`)
@@ -730,20 +742,21 @@ func capitalize(s string) string {
 	return string(unicode.ToUpper(r)) + s[size:]
 }
 
-// initialisms are domain words rendered upper-case in headings. Anything not
-// listed is simply capitalized; the list only needs to cover the common
-// cases so "Api Conventions" does not read as a typo.
-var initialisms = map[string]bool{
-	"api": true, "db": true, "sql": true, "http": true, "rest": true, "grpc": true,
-	"rpc": true, "ui": true, "ux": true, "cli": true, "css": true, "html": true,
-	"js": true, "ts": true, "orm": true, "dto": true, "jwt": true, "sdk": true,
-	"ci": true, "cd": true, "io": true, "id": true, "sso": true, "oauth": true,
-	"ssr": true, "i18n": true, "l10n": true, "k8s": true, "aws": true, "gcp": true,
+// initialisms maps domain words to their conventional heading spelling.
+// Anything not listed is simply capitalized; the list only needs to cover
+// the common cases so "Api Conventions" does not read as a typo. Numeronyms
+// keep their customary lower-case form.
+var initialisms = map[string]string{
+	"api": "API", "db": "DB", "sql": "SQL", "http": "HTTP", "rest": "REST", "grpc": "gRPC",
+	"rpc": "RPC", "ui": "UI", "ux": "UX", "cli": "CLI", "css": "CSS", "html": "HTML",
+	"js": "JS", "ts": "TS", "orm": "ORM", "dto": "DTO", "jwt": "JWT", "sdk": "SDK",
+	"ci": "CI", "cd": "CD", "io": "IO", "id": "ID", "sso": "SSO", "oauth": "OAuth",
+	"ssr": "SSR", "i18n": "i18n", "l10n": "l10n", "k8s": "k8s", "aws": "AWS", "gcp": "GCP",
 }
 
 // headingTitle turns a domain slug into heading text: hyphens and
-// underscores become spaces, known initialisms are upper-cased
-// ("rest-api" → "REST API"), everything else is capitalized
+// underscores become spaces, known initialisms take their conventional
+// spelling ("rest-api" → "REST API"), everything else is capitalized
 // ("components" → "Components").
 func headingTitle(domain string) string {
 	words := strings.FieldsFunc(domain, func(r rune) bool { return r == '-' || r == '_' })
@@ -751,8 +764,8 @@ func headingTitle(domain string) string {
 		return domain
 	}
 	for i, w := range words {
-		if initialisms[strings.ToLower(w)] {
-			words[i] = strings.ToUpper(w)
+		if canonical, ok := initialisms[strings.ToLower(w)]; ok {
+			words[i] = canonical
 		} else {
 			words[i] = capitalize(w)
 		}

@@ -148,6 +148,19 @@ func TestAuditFile_yamlValidity(t *testing.T) {
 	}
 }
 
+// Values are reported as the literal source text, so the agent is told what
+// the file actually says rather than what YAML decoded it to.
+func TestAuditFile_reportsSourceText(t *testing.T) {
+	path := writeSkill(t, t.TempDir(), "SKILL.md", "name: 007\ndescription: 1e3", "# body\n")
+	res := AuditFile(path)
+	if res.Name != "007" {
+		t.Errorf("name should be the source literal, got %q", res.Name)
+	}
+	if len(res.FrontmatterIssues) != 0 {
+		t.Errorf("digits-only name and description are valid; got %v", res.FrontmatterIssues)
+	}
+}
+
 // A YAML failure still reports the name (recovered leniently) so the caller
 // can say which domain is broken.
 func TestAuditFile_yamlFailureStillReportsName(t *testing.T) {

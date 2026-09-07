@@ -573,7 +573,10 @@ This writes:
     generator wrote) but whose domain no longer has approved rules (renamed, merged,
     or all rejected), so an outdated skill cannot keep auto-loading. Skills the
     generator did not write (hand-written ones sharing the directory) are never
-    touched.
+    touched. A skill directory written by a very old build (no marker, none of the
+    generator's fixed body sentences) carries no fingerprint and is left alone too;
+    if the Step 13 file list no longer names a `<skills-dir>/<domain>/` that still
+    exists, tell the user it is a leftover from an older version and can be deleted.
   - **Domain names must be single directory segments.** `write-outputs` refuses the
     whole run, writing nothing, if any approved rule's `target.location` contains a
     path separator or is `.`/`..`. Re-target those rules in state and rerun.

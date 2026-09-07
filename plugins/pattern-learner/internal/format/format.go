@@ -96,9 +96,11 @@ func AuditFile(path string) Result {
 // an issue, and the fields are then recovered line-by-line so the remaining
 // checks (and the reported name) still have something to work with.
 //
-// Values are flattened to strings: scalars via their string form, a list
-// (the .claude/rules form of `paths`) via a comma join. Anything else is
-// reported as an issue, since no documented field takes a nested value.
+// Values are flattened to strings using the scalar's source text (so
+// `name: 007` is reported as "007", the literal the file carries, not the
+// integer 7 it decodes to); a list (the .claude/rules form of `paths`) is
+// joined with commas. Anything else is reported as an issue, since no
+// documented field takes a nested value.
 func parseFrontmatter(text string) (map[string]string, string, []string) {
 	fields := map[string]string{}
 	issues := []string{}
@@ -109,28 +111,32 @@ func parseFrontmatter(text string) (map[string]string, string, []string) {
 	fmText := text[m[2]:m[3]]
 	body := text[m[1]:]
 
-	var doc map[string]any
+	var doc map[string]yaml.Node
 	if err := yaml.Unmarshal([]byte(fmText), &doc); err != nil {
 		issues = append(issues, "frontmatter is not valid YAML (the skill will fail to load): "+
 			strings.Join(strings.Fields(err.Error()), " "))
 		return lenientFields(fmText), body, issues
 	}
-	for k, v := range doc {
-		switch val := v.(type) {
-		case nil:
-			fields[k] = ""
-		case string:
-			fields[k] = val
-		case []any:
-			parts := make([]string, 0, len(val))
-			for _, item := range val {
-				parts = append(parts, fmt.Sprint(item))
+	for k, node := range doc {
+		switch node.Kind {
+		case yaml.ScalarNode:
+			if node.Tag == "!!null" {
+				fields[k] = ""
+			} else {
+				fields[k] = node.Value
+			}
+		case yaml.SequenceNode:
+			parts := make([]string, 0, len(node.Content))
+			for _, item := range node.Content {
+				if item.Kind != yaml.ScalarNode {
+					issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+					break
+				}
+				parts = append(parts, item.Value)
 			}
 			fields[k] = strings.Join(parts, ",")
-		case map[string]any:
-			issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
 		default:
-			fields[k] = fmt.Sprint(val)
+			issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
 		}
 	}
 	return fields, body, issues

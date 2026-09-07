@@ -669,6 +669,9 @@ func TestHeadingTitle(t *testing.T) {
 		"auth":       "Auth",
 		"état-api":   "État API", // first rune is multi-byte
 		"---":        "---",      // no words: fall back to the raw domain
+		"i18n":       "i18n",     // numeronyms keep their customary form
+		"k8s-config": "k8s Config",
+		"grpc":       "gRPC",
 	}
 	for in, want := range cases {
 		if got := headingTitle(in); got != want {
@@ -776,6 +779,18 @@ func TestCopiedMarkerSkillIsNotPruned(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(copyDir, "SKILL.md")); err != nil {
 		t.Errorf("copied skill must be preserved: %v", err)
+	}
+}
+
+// Two domains that differ only by case would share one directory on a
+// case-insensitive filesystem; refuse the run instead of losing one.
+func TestCaseCollidingDomainsRejected(t *testing.T) {
+	err := Write(stateWith(
+		approvedRule("A", "do it", "Api", "stated", 1),
+		approvedRule("B", "do it", "api", "stated", 2),
+	), t.TempDir(), Options{})
+	if err == nil || !strings.Contains(err.Error(), "differ only by case") {
+		t.Errorf("expected a case-collision error, got %v", err)
 	}
 }
 
