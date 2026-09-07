@@ -302,20 +302,33 @@ type fenceBlock struct {
 func fenceBlocks(s string) []fenceBlock {
 	var out []fenceBlock
 	var open, nested bool
+	var marker string
 	var block fenceBlock
 	var buf strings.Builder
 	offset := 0
 	for _, line := range strings.SplitAfter(s, "\n") {
 		bare := strings.TrimLeft(strings.TrimRight(line, "\r\n"), " \t")
-		isFence := strings.HasPrefix(bare, "```")
+		// Both fence syntaxes are legal markdown and reviewers use both; a
+		// fence must be closed by its own character, so a ``` inside a ~~~
+		// block is content.
+		fenceChar := ""
+		if strings.HasPrefix(bare, "```") {
+			fenceChar = "`"
+		} else if strings.HasPrefix(bare, "~~~") {
+			fenceChar = "~"
+		}
+		isFence := fenceChar != ""
 		switch {
 		case !open && isFence:
-			open, nested = true, false
+			open, nested, marker = true, false, fenceChar
 			block = fenceBlock{start: offset}
 			buf.Reset()
-		case open && isFence && strings.Trim(bare, "`") == "":
+		case open && fenceChar == marker && strings.Trim(bare, marker) == "":
 			block.end = offset + len(line)
-			block.code = buf.String()
+			// A CRLF document would otherwise carry a stray carriage return
+			// into every extracted example, and from there into the generated
+			// skill's code block.
+			block.code = strings.ReplaceAll(buf.String(), "\r\n", "\n")
 			// A block that swallowed another opening fence means the writer
 			// forgot a closing one: by the letter of the syntax everything up
 			// to the next bare ``` is code, but in a review it is the

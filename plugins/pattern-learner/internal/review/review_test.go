@@ -550,3 +550,49 @@ func TestSelect_subSecondWatermark(t *testing.T) {
 		t.Errorf("want the two sub-second captures, got %+v", got)
 	}
 }
+
+// A CRLF document would otherwise carry a stray carriage return into every
+// extracted example, and from there into the generated skill's code block.
+func TestCapture_markdownCRLF(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## R\r\n\r\nBefore:\r\n\r\n```go\r\nx()\r\n```\r\n\r\nAfter:\r\n\r\n```go\r\ny()\r\n```\r\n")
+	f := a.Findings[0]
+	if f.CodeBefore != "x()" || f.CodeAfter != "y()" {
+		t.Errorf("carriage returns leaked into the code: before=%q after=%q", f.CodeBefore, f.CodeAfter)
+	}
+}
+
+// Both fence syntaxes are legal markdown and reviewers use both.
+func TestCapture_markdownTildeFences(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## R\n\nBefore:\n\n~~~go\nx()\n~~~\n\nAfter:\n\n~~~go\ny()\n~~~\n")
+	f := a.Findings[0]
+	if f.CodeBefore != "x()" || f.CodeAfter != "y()" {
+		t.Errorf("tilde fences not extracted: before=%q after=%q", f.CodeBefore, f.CodeAfter)
+	}
+	// A fence must be closed by its own character: a ``` inside a ~~~ block is
+	// content, not a terminator.
+	b := capture(t, "code-review", FormatMarkdown, "## R\n\nBefore:\n\n~~~\na ``` b\nx()\n~~~\n")
+	if !strings.Contains(b.Findings[0].CodeBefore, "a ``` b") {
+		t.Errorf("a foreign fence marker should be content; got %q", b.Findings[0].CodeBefore)
+	}
+}
+
+// The confidence model counts artifacts as independent reviews, so a tool that
+// reports the same findings in a different order between runs must still be
+// recognised as the same review rather than a second one agreeing.
+func TestCapture_findingOrderDoesNotChangeTheReviewID(t *testing.T) {
+	one := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/a.js","messages":[{"ruleId":"no-console","message":"m1","line":1},{"ruleId":"no-var","message":"m2","line":2}]}]`)
+	swapped := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/a.js","messages":[{"ruleId":"no-var","message":"m2","line":2},{"ruleId":"no-console","message":"m1","line":1}]}]`)
+	if one.ReviewID != swapped.ReviewID {
+		t.Errorf("reordered findings must be the same review: %q vs %q", one.ReviewID, swapped.ReviewID)
+	}
+	// Genuinely different findings are still a different review.
+	other := capture(t, "eslint", FormatAuto,
+		`[{"filePath":"/a.js","messages":[{"ruleId":"no-eval","message":"m3","line":1}]}]`)
+	if other.ReviewID == one.ReviewID {
+		t.Error("different findings must be a different review")
+	}
+}

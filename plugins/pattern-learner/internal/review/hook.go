@@ -88,7 +88,7 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		Data:   []byte(text),
 		Source: matched.Name,
 		Format: matched.Format,
-		Label:  hookLabel(toolName, skill, command),
+		Label:  hookLabel(matched.Name, toolName, skill, command),
 		Now:    now,
 	})
 	if err != nil {
@@ -147,25 +147,23 @@ func PayloadCWD(payload []byte) string {
 }
 
 // hookLabel records what produced the artifact, for the approval display.
-func hookLabel(toolName, skill, command string) string {
+//
+// It names the designated reviewer, never the raw command line. A command line
+// routinely carries credentials — `SEMGREP_APP_TOKEN=… semgrep --json .` is the
+// documented way to run that tool — and the label is persisted to an artifact
+// inside the repository, where it can be committed and shared. The command adds
+// nothing the watcher's name does not already say, so recording it is all risk
+// and no benefit.
+func hookLabel(watcher, toolName, skill, command string) string {
 	switch {
 	case skill != "":
 		return "hook capture: /" + strings.TrimPrefix(skill, "/")
-	case command != "":
-		return "hook capture: " + truncateLabel(command)
+	case watcher != "":
+		return "hook capture: " + watcher
 	case toolName != "":
 		return "hook capture: " + toolName
 	}
 	return "hook capture"
-}
-
-func truncateLabel(s string) string {
-	const max = 120
-	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
-	if len([]rune(s)) > max {
-		return string([]rune(s)[:max]) + "…"
-	}
-	return s
 }
 
 // responseText finds the review text in the payload. A structured response is

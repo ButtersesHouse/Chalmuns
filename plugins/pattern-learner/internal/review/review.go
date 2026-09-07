@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -228,14 +229,21 @@ func artifactID(source string, findings []Finding, data []byte) string {
 		// are all the identity there is.
 		h.Write(data)
 	} else {
+		// Sorted, so a tool that reports the same findings in a different
+		// order between runs — a parallel scanner, or one whose worklist
+		// order follows the filesystem — is still recognised as the same
+		// review rather than counting as a second one agreeing.
+		keys := make([]string, 0, len(findings))
 		for _, f := range findings {
 			// Deliberately excludes Line, Index, Severity and Verdict —
 			// everything that can differ between two runs reporting the same
 			// unchanged problem.
-			for _, part := range []string{f.File, f.Title, f.Body, f.Evidence, f.CodeBefore, f.CodeAfter} {
-				h.Write([]byte(part))
-				h.Write([]byte{0})
-			}
+			keys = append(keys, strings.Join(
+				[]string{f.File, f.Title, f.Body, f.Evidence, f.CodeBefore, f.CodeAfter}, "\x00"))
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			h.Write([]byte(k))
 			h.Write([]byte{'\n'})
 		}
 	}

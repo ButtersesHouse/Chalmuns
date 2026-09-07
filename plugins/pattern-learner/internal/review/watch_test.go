@@ -1,6 +1,7 @@
 package review
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -372,6 +373,51 @@ func TestMatch_quotedTextIsDataNotACommand(t *testing.T) {
 	for _, cmd := range realRuns {
 		if Match(ws, "Bash", "", cmd) == nil {
 			t.Errorf("a real invocation was missed: %q", cmd)
+		}
+	}
+}
+
+// A command line routinely carries credentials — `SEMGREP_APP_TOKEN=… semgrep`
+// is the documented way to run that tool — and the label is persisted to an
+// artifact inside the repository, where it can be committed and shared. The
+// label names the reviewer, never the command.
+func TestFromHook_labelDoesNotRecordTheCommandLine(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	const secret = "sk-secret-abc123"
+	payload := `{"tool_name":"Bash","tool_input":{"command":"SEMGREP_APP_TOKEN=` + secret + ` semgrep --json ."},` +
+		`"tool_response":{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",` +
+		`\"extra\":{\"message\":\"Use the shared client please.\"}}]}"}}`
+
+	a, _, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok {
+		t.Fatal("a designated tool's output should be captured")
+	}
+	if a.Label != "hook capture: semgrep" {
+		t.Errorf("label should name the reviewer; got %q", a.Label)
+	}
+	blob, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), secret) {
+		t.Error("a credential on the command line must not reach the stored artifact")
+	}
+}
+
+func TestSkillFromCommand(t *testing.T) {
+	cases := map[string]string{
+		"/code-review":       "/code-review",
+		"/code-review --fix": "/code-review",
+		"  /code-review ":    "/code-review",
+		"/usr/local/bin/x":   "", // a path runs a program
+		"/":                  "", // names nothing
+		"//x":                "",
+		"semgrep --json .":   "",
+		"":                   "",
+	}
+	for cmd, want := range cases {
+		if got := SkillFromCommand(cmd); got != want {
+			t.Errorf("SkillFromCommand(%q) = %q, want %q", cmd, got, want)
 		}
 	}
 }

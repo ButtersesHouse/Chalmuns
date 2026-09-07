@@ -155,6 +155,10 @@ func SkillFromCommand(command string) string {
 	if strings.Contains(strings.TrimPrefix(fields[0], "/"), "/") {
 		return ""
 	}
+	// A bare "/" names nothing.
+	if strings.Trim(fields[0], "/") == "" {
+		return ""
+	}
 	return fields[0]
 }
 
