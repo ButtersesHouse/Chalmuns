@@ -214,6 +214,10 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 			return fmt.Errorf("skill domains %q and %q differ only by case and would share one directory; merge them into a single domain and rerun", other, domain)
 		}
 		byFold[folded] = domain
+		// Sort here, before the globs are collected, so the paths gate and
+		// description follow the rendered rule order rather than the order
+		// rules happen to sit in state (which the agent rewrites each run).
+		sortRules(rules)
 		// The universal skill carries no paths gate, so its globs are never
 		// emitted and need no validation.
 		if domain != UniversalSkillName {
@@ -373,6 +377,14 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 			continue
 		}
 		dir := filepath.Join(skillsDir, name)
+		// A transient that is not a real directory (a dangling symlink that
+		// got retired, a stray file) holds nothing to restore or carry.
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			if err := os.RemoveAll(dir); err != nil {
+				return err
+			}
+			continue
+		}
 		if !anyOwner {
 			if info := inspectSkill(filepath.Join(dir, "SKILL.md"), ""); info.stamped && info.stamp != owner {
 				continue
@@ -385,6 +397,16 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 					return err
 				}
 				continue
+			}
+			// The live slot is taken. In a shared directory it may since
+			// have been taken by another repository (the guard reports that
+			// conflict when the domain is live for this run); our retired
+			// copy must not be folded into their skill, so it is left as
+			// is for the user to resolve.
+			if !anyOwner {
+				if info := inspectSkill(filepath.Join(live, "SKILL.md"), ""); info.stamped && info.stamp != owner {
+					continue
+				}
 			}
 			if err := carryOver(dir, live); err != nil {
 				return err
@@ -410,8 +432,11 @@ func carryOver(from, to string) error {
 	if err != nil {
 		return err
 	}
+	leftoverTmp := filepath.Base(tmpPath("SKILL.md"))
 	for _, e := range entries {
-		if generatedEntries[e.Name()] {
+		// The generator's own entries are replaced, and the temp file of
+		// an older build's interrupted write is debris, not the user's.
+		if generatedEntries[e.Name()] || e.Name() == leftoverTmp {
 			continue
 		}
 		dst := filepath.Join(to, e.Name())
@@ -600,7 +625,9 @@ func inspectSkill(path, dirName string) skillInfo {
 // and owner stamp may occupy. The generator writes them first and second.
 const headerLineBudget = 2
 
-func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
+// sortRules orders rules for rendering: stated, then established, then
+// emerging, alphabetically by title within each tier.
+func sortRules(rules []state.Rule) {
 	sort.Slice(rules, func(i, j int) bool {
 		ri, rj := confidenceRank(rules[i].Confidence), confidenceRank(rules[j].Confidence)
 		if ri != rj {
@@ -608,7 +635,11 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 		}
 		return rules[i].Title < rules[j].Title
 	})
+}
 
+// writeSkillFile renders one domain; rules must already be in rendering
+// order (writeSkillFiles sorts them before collecting globs).
+func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
 	if domain == UniversalSkillName {
 		// No paths gate: these rules apply to every file, so the skill must
 		// auto-load regardless of what is being edited.
@@ -673,9 +704,15 @@ func renderSkillDir(dir, domain, desc string, globs []string, rules []state.Rule
 // new one before the previous tree is removed.
 func swapDir(staging, live, retired string) error {
 	hadLive := false
-	if _, err := os.Lstat(live); err == nil {
+	if fi, err := os.Stat(live); err == nil && fi.IsDir() {
 		hadLive = true
 		if err := os.Rename(live, retired); err != nil {
+			return err
+		}
+	} else if _, err := os.Lstat(live); err == nil {
+		// A dangling symlink or a stray file at the live path: nothing to
+		// retire, but it must not block the rename.
+		if err := os.RemoveAll(live); err != nil {
 			return err
 		}
 	}
@@ -1234,7 +1271,8 @@ func validDomain(domain string) bool {
 	if domain == "" || domain == "." || domain == ".." {
 		return false
 	}
-	if len(domain) > maxDomainBytes {
+	// The longest name actually created is the staging sibling.
+	if len(domain)+len(stagingSuffix) > maxDomainBytes {
 		return false
 	}
 	for _, r := range domain {
@@ -1263,7 +1301,8 @@ func validDomain(domain string) bool {
 }
 
 // maxDomainBytes is the file-name length limit common to the major
-// filesystems (255 bytes), which a directory segment must respect.
+// filesystems (255 bytes), which every directory segment written for a
+// domain (the domain itself and its transient siblings) must respect.
 const maxDomainBytes = 255
 
 var windowsReservedNames = map[string]bool{

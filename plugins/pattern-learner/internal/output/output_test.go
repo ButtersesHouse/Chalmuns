@@ -1147,7 +1147,7 @@ func TestValidDomainRejectsOSInvalidNames(t *testing.T) {
 			t.Errorf("validDomain(%q) should be false", bad)
 		}
 	}
-	for _, ok := range []string{"api", "rest-api", "état", strings.Repeat("a", 255)} {
+	for _, ok := range []string{"api", "rest-api", "état", strings.Repeat("a", maxDomainBytes-len(stagingSuffix))} {
 		if !validDomain(ok) {
 			t.Errorf("validDomain(%q) should be true", ok)
 		}
@@ -1364,6 +1364,114 @@ func TestQuotedFingerprintInBodyIsNotGenerated(t *testing.T) {
 	}
 	if info := inspectSkill(path, "api"); !info.generated || info.stamp != "acme/alpha" {
 		t.Errorf("generated header should classify: %+v", info)
+	}
+}
+
+// A dangling symlink at a domain's path is cleared, not retired, so the
+// run and every later run succeed.
+func TestDanglingSymlinkAtDomainPathIsReplaced(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := os.MkdirAll(skills, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "no-such-target"), filepath.Join(skills, "api")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	s := stateWith(approvedRule("Rule", "do it", "api", "stated", 1))
+	for i := 0; i < 2; i++ {
+		if err := Write(s, dir, Options{}); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+	}
+	if !inspectSkill(filepath.Join(skills, "api", "SKILL.md"), "api").generated {
+		t.Error("skill should have been written in place of the dangling link")
+	}
+	if _, err := os.Lstat(filepath.Join(skills, "api"+retiredSuffix)); !os.IsNotExist(err) {
+		t.Error("no retired sibling should remain")
+	}
+}
+
+// In a shared directory, a retired copy whose live slot another repository
+// has since taken is left alone rather than folded into their skill.
+func TestSharedDirRetiredCopyNotFoldedIntoForeignSkill(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	retired := filepath.Join(shared, "api"+retiredSuffix)
+	if err := os.MkdirAll(retired, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ours := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("a/one") + "\n\nbody\n"
+	if err := os.WriteFile(filepath.Join(retired, "SKILL.md"), []byte(ours), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "NOTES.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Repo B took the slot meanwhile.
+	b := stateWith(approvedRule("B rule", "do it", "api", "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "b", Repo: "two"}
+	if err := Write(b, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	// Repo A runs without the domain: its retired copy stays untouched.
+	a := state.Empty()
+	a.Repo = state.RepoInfo{Owner: "a", Repo: "one"}
+	if err := Write(a, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(retired, "NOTES.md")); err != nil {
+		t.Error("our retired copy must not be removed while another repo holds the live slot")
+	}
+	if _, err := os.Stat(filepath.Join(shared, "api", "NOTES.md")); !os.IsNotExist(err) {
+		t.Error("our files must not be moved into another repo's skill")
+	}
+}
+
+// The staging sibling is the longest name written, so the length check
+// must leave room for its suffix.
+func TestValidDomainLeavesRoomForSuffix(t *testing.T) {
+	limit := maxDomainBytes - len(stagingSuffix)
+	if !validDomain(strings.Repeat("a", limit)) {
+		t.Error("a domain that fits with its suffix should be valid")
+	}
+	if validDomain(strings.Repeat("a", limit+1)) {
+		t.Error("a domain whose staging name would exceed the limit should be invalid")
+	}
+}
+
+// The paths gate follows rendering order, not state order, so reordering
+// rules in state does not churn the frontmatter.
+func TestPathsGateFollowsRenderOrder(t *testing.T) {
+	dir := t.TempDir()
+	zed := approvedRule("Zed", "z", "api", "emerging", 1)
+	zed.Target.FileGlob = []string{"b/**"}
+	alpha := approvedRule("Alpha", "a", "api", "stated", 2)
+	alpha.Target.FileGlob = []string{"a/**"}
+	if err := Write(stateWith(zed, alpha), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := frontmatter(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if got := doc["paths"]; got != "a/**,b/**" {
+		t.Errorf("paths = %v, want stated rule's glob first", got)
+	}
+}
+
+// The temp file of an older build's interrupted write is debris, not a
+// user file, and is not carried into the regenerated directory.
+func TestLeftoverTmpNotCarriedOver(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md.tmp"), []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "SKILL.md.tmp")); !os.IsNotExist(err) {
+		t.Error("stray temp file should not survive regeneration")
 	}
 }
 
