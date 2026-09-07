@@ -112,9 +112,15 @@ func runStateWrite(args []string) error {
 
 func runWriteOutputs(args []string) error {
 	statePath := flagValue(args, "--state", "")
-	outputDir := flagValue(args, "--output-dir", ".")
 	if statePath == "" {
 		return fmt.Errorf("--state required")
+	}
+	// The output directory (default skills location, anchoring root) is
+	// the repository the state belongs to, not wherever the command was
+	// run from; an explicit --output-dir overrides it.
+	outputDir := flagValue(args, "--output-dir", "")
+	if outputDir == "" {
+		outputDir = repoRoot(statePath, ".")
 	}
 	ragHints := hasFlag(args, "--rag-hints")
 	ragAnchor := hasFlag(args, "--rag")
@@ -470,7 +476,9 @@ func (m *globMatcher) files(glob string) []string {
 	if files, ok := m.matches[glob]; ok {
 		return files
 	}
-	return newGlobMatcher(m.root, []string{glob}).files(glob)
+	files := newGlobMatcher(m.root, []string{glob}).files(glob)
+	m.matches[glob] = files
+	return files
 }
 
 // walkAll resolves every registered glob: plain globs through

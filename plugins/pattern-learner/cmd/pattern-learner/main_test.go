@@ -310,3 +310,35 @@ func TestGlobMatcher(t *testing.T) {
 		t.Errorf("unregistered glob should still resolve: got %v", got)
 	}
 }
+
+// Without --output-dir, write-outputs writes into the repository the state
+// lives in, not the current directory.
+func TestWriteOutputsDefaultsToStateRepo(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	stateDir := filepath.Join(repo, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "Rule", Rule: "Do it.", Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "api", FileGlob: []string{"src/**/*.go"}},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "a", Snippet: "q", Strength: "explicit"}},
+	}}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWriteOutputs([]string{"--state", statePath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".claude", "skills", "api", "SKILL.md")); err != nil {
+		t.Errorf("skill should be written under the state's repository: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".claude", "skills", "api")); err == nil {
+		t.Error("nothing should be written under the current directory")
+	}
+}

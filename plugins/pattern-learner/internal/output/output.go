@@ -207,7 +207,7 @@ func (pr *Prepared) Write() error {
 		return err
 	}
 	for domain, rules := range p.byDomain {
-		if err := writeSkillFile(domain, rules, p.globs[domain], p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
+		if err := writeSkillFile(domain, rules, p.globs[domain], p.isUniversal(domain), p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
 			return err
 		}
 	}
@@ -251,6 +251,9 @@ type plan struct {
 	owner     string
 	skillsDir string
 	shared    bool
+	// hasUniversal records whether repo-wide rules were merged under
+	// UniversalSkillName; only then is that domain rendered ungated.
+	hasUniversal bool
 }
 
 func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan {
@@ -279,7 +282,13 @@ func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan
 	if owner == "" {
 		owner = OwnerFromState(s)
 	}
-	return &plan{byDomain: byDomain, globs: map[string][]string{}, owner: owner, skillsDir: skillsDir, shared: shared}
+	return &plan{byDomain: byDomain, globs: map[string][]string{}, owner: owner, skillsDir: skillsDir, shared: shared, hasUniversal: len(universal) > 0}
+}
+
+// isUniversal reports whether domain is rendered as the ungated repo-wide
+// skill: the universal domain name, and only when universal rules exist.
+func (p *plan) isUniversal(domain string) bool {
+	return p.hasUniversal && domain == UniversalSkillName
 }
 
 // validate checks every domain before anything is written, so a bad name or
@@ -314,8 +323,10 @@ func (p *plan) validateRules() error {
 		// rules happen to sit in state (which the agent rewrites each run).
 		sortRules(rules)
 		// The universal skill carries no paths gate, so its globs are never
-		// emitted and need no validation.
-		if domain != UniversalSkillName {
+		// emitted and need no validation. A domain that merely shares its
+		// name, with no universal rules merged in, is an ordinary scoped
+		// skill and keeps its gate.
+		if !p.isUniversal(domain) {
 			globs, err := collectGlobs(rules)
 			if err != nil {
 				return fmt.Errorf("skill domain %q: %w", domain, err)
@@ -371,7 +382,7 @@ func (p *plan) validateDisk() error {
 					runFor = "an unidentified repository (no --repo, state.repo, or git remote)"
 				}
 				remedy := "rename the domain in one of them or use separate skills directories"
-				if domain == UniversalSkillName {
+				if p.isUniversal(domain) {
 					remedy = "the universal '" + UniversalSkillName + "' skill has a fixed name, so give each repository its own skills directory"
 				}
 				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s", skillDir, existing.stamp, runFor, remedy)
@@ -409,6 +420,9 @@ func OwnerKey(owner, repo string) string {
 // in a shared directory would make the skill unprunable by its own repo.
 func NormalizeOwnerKey(s string) string {
 	key := strings.ToLower(strings.Trim(s, "/"))
+	// A value copied from a clone URL carries ".git"; the repo detection
+	// strips it, so the flag path must too or the two never compare equal.
+	key = strings.TrimSuffix(key, ".git")
 	if !ValidOwnerKey(key) {
 		return ""
 	}
@@ -571,6 +585,13 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 			// directory one stamped for us or not stamped at all. Anything
 			// else (a hand-written skill, another repository's) must not
 			// receive our files, so the copy is left and the user told.
+			// A slot that is a resolving symlink is refused by validateDisk
+			// when the domain is live; folding our files through it first
+			// would move them into the link target before that refusal.
+			if lst, err := os.Lstat(live); err == nil && lst.Mode()&os.ModeSymlink != 0 {
+				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s is now a symlink; move anything you want out of the leftover and delete it", dir, liveName, live))
+				continue
+			}
 			// An empty directory at the slot (as validateDisk also allows)
 			// gives way to the retired copy wholesale.
 			if isEmptyDir(live) {
@@ -852,13 +873,13 @@ func sortRules(rules []state.Rule) {
 
 // writeSkillFile renders one domain; rules must already be in rendering
 // order (plan.validate sorts them before collecting globs).
-func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
-	if domain == UniversalSkillName {
+func writeSkillFile(domain string, rules []state.Rule, globs []string, universal bool, skillsDir string, override string, watermark int, owner string, opts Options) error {
+	if universal {
 		// No paths gate: these rules apply to every file, so the skill must
 		// auto-load regardless of what is being edited.
 		globs = nil
 	}
-	desc := buildDescription(domain, globs, override)
+	desc := buildDescription(domain, globs, universal, override)
 	skillDir := filepath.Join(skillsDir, domain)
 
 	// The whole domain is rendered into a staging sibling and then swapped
@@ -869,7 +890,7 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// means renamed or removed rules leave no stale companion files behind.
 	staging := transientPath(skillDir, stagingSuffix)
 	retired := transientPath(skillDir, retiredSuffix)
-	if err := renderSkillDir(staging, domain, desc, globs, rules, watermark, owner, opts); err != nil {
+	if err := renderSkillDir(staging, domain, desc, globs, universal, rules, watermark, owner, opts); err != nil {
 		os.RemoveAll(staging)
 		return err
 	}
@@ -882,9 +903,9 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 
 // renderSkillDir writes a domain's complete skill tree (SKILL.md plus
 // companion files) under dir.
-func renderSkillDir(dir, domain, desc string, globs []string, rules []state.Rule, watermark int, owner string, opts Options) error {
+func renderSkillDir(dir, domain, desc string, globs []string, universal bool, rules []state.Rule, watermark int, owner string, opts Options) error {
 	slugs := ruleSlugs(rules)
-	header := renderSkillHeader(domain, desc, globs, rules, owner)
+	header := renderSkillHeader(domain, desc, globs, universal, rules, owner)
 
 	// Examples always live in companion files (progressive disclosure): the
 	// SKILL.md body is a recurring token cost once loaded, so it carries only
@@ -950,7 +971,7 @@ const maxSkillLines = 450
 // maxExamplePairs caps rendered do/don't pairs; state caps the arrays at 4.
 const maxExamplePairs = 4
 
-func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule, owner string) string {
+func renderSkillHeader(domain, desc string, globs []string, universal bool, rules []state.Rule, owner string) string {
 	var b strings.Builder
 	// Every value is emitted as a double-quoted YAML scalar. Claude Code
 	// parses this block as real YAML, and unquoted values break in exactly
@@ -974,7 +995,7 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule, 
 	}
 	b.WriteString("\n")
 	// "conventions" is already the noun, so don't render "Conventions Conventions".
-	if domain == UniversalSkillName {
+	if universal {
 		b.WriteString("# Repo-Wide Conventions\n\n")
 		b.WriteString("These rules apply to every file in this repository, regardless of what you are editing.\n\n")
 	} else {
@@ -1455,14 +1476,14 @@ func splitTopLevel(s string) []string {
 // buildDescription returns the SKILL.md frontmatter description for a domain.
 // If override is non-empty, it is used directly (truncated if needed). Otherwise
 // a generic fallback is constructed from the domain name and globs.
-func buildDescription(domain string, globs []string, override string) string {
+func buildDescription(domain string, globs []string, universal bool, override string) string {
 	// The override is model-supplied; a newline would break the YAML
 	// frontmatter line it is rendered into, and a whitespace-only value is
 	// no description at all.
 	if override = strings.Join(strings.Fields(override), " "); override != "" {
 		return truncate(override, maxDescriptionRunes)
 	}
-	if domain == UniversalSkillName {
+	if universal {
 		return "Repo-wide coding conventions extracted from PR review history. Applies to every file; read before writing or reviewing code anywhere in this repository."
 	}
 	base := fmt.Sprintf("Coding conventions for %s", domain)

@@ -358,7 +358,7 @@ func TestUniversalRulesMergeWithCollidingDomain(t *testing.T) {
 
 func TestBuildDescriptionTruncation(t *testing.T) {
 	globs := []string{strings.Repeat("a", 200)}
-	desc := buildDescription("api", globs, "")
+	desc := buildDescription("api", globs, false, "")
 	if len(desc) > 200 {
 		t.Errorf("description should be capped at 200 chars, got %d", len(desc))
 	}
@@ -369,7 +369,7 @@ func TestBuildDescriptionTruncation(t *testing.T) {
 
 func TestBuildDescriptionOverride(t *testing.T) {
 	override := "Conventions for HTTP API endpoints: error responses, validation, auth middleware. Use when editing src/api/"
-	desc := buildDescription("api", []string{"src/api/**"}, override)
+	desc := buildDescription("api", []string{"src/api/**"}, false, override)
 	if desc != override {
 		t.Errorf("override should be used verbatim when present, got %q", desc)
 	}
@@ -377,7 +377,7 @@ func TestBuildDescriptionOverride(t *testing.T) {
 
 func TestBuildDescriptionOverrideTruncated(t *testing.T) {
 	override := strings.Repeat("a", 250)
-	desc := buildDescription("api", nil, override)
+	desc := buildDescription("api", nil, false, override)
 	if len(desc) != 200 {
 		t.Errorf("override should be truncated to 200 chars, got %d", len(desc))
 	}
@@ -634,7 +634,7 @@ func TestSkillFrontmatterIsValidYAML(t *testing.T) {
 // character and leave invalid UTF-8 in the frontmatter.
 func TestBuildDescriptionTruncatesOnRunes(t *testing.T) {
 	long := strings.Repeat("é", 250) // 2 bytes each
-	desc := buildDescription("api", nil, long)
+	desc := buildDescription("api", nil, false, long)
 	if !utf8.ValidString(desc) {
 		t.Fatal("truncated description is not valid UTF-8")
 	}
@@ -644,7 +644,7 @@ func TestBuildDescriptionTruncatesOnRunes(t *testing.T) {
 	if !strings.HasSuffix(desc, "...") {
 		t.Error("truncated description should end in an ellipsis")
 	}
-	if short := buildDescription("api", nil, "short"); short != "short" {
+	if short := buildDescription("api", nil, false, "short"); short != "short" {
 		t.Errorf("short description should be untouched, got %q", short)
 	}
 }
@@ -1882,8 +1882,79 @@ func TestSharedDirLeftoverIsWarned(t *testing.T) {
 	}
 }
 
+// A scoped domain that merely shares the universal skill's name keeps its
+// paths gate and heading when no universal rules exist.
+func TestConventionsDomainWithoutUniversalRulesStaysGated(t *testing.T) {
+	dir := t.TempDir()
+	r := approvedRule("Legacy rule", "do it", UniversalSkillName, "stated", 1)
+	r.Target.FileGlob = []string{"src/legacy/**/*.go"}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	doc, content := frontmatter(t, filepath.Join(dir, ".claude", "skills", UniversalSkillName, "SKILL.md"))
+	if got := doc["paths"]; got != "src/legacy/**/*.go" {
+		t.Errorf("scoped 'conventions' domain should keep its paths gate, got %v", got)
+	}
+	if strings.Contains(content, "Repo-Wide Conventions") {
+		t.Error("scoped 'conventions' domain must not be presented as repo-wide")
+	}
+	// And its globs are validated like any other domain's.
+	bad := approvedRule("Legacy rule", "do it", UniversalSkillName, "stated", 1)
+	bad.Target.FileGlob = []string{"src/{a,b"}
+	if err := Write(stateWith(bad), t.TempDir(), Options{}); err == nil {
+		t.Error("a scoped 'conventions' domain's globs must be validated")
+	}
+}
+
+// A retired copy whose live slot is a resolving symlink is left alone and
+// reported; nothing is moved through the link.
+func TestRetiredCopyNotFoldedThroughSymlink(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "api-target")
+	if err := Write(stateWith(approvedRule("Rule", "t", "api", "stated", 1)), filepath.Dir(filepath.Dir(target)), Options{SkillsDir: filepath.Dir(target)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(filepath.Dir(target), "api"), filepath.Join(skills, "api")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	next := stateWith(approvedRule("Rule", "x", "ui", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(target), "api", "notes.md")); !os.IsNotExist(err) {
+		t.Error("nothing may be moved through the symlink")
+	}
+	if _, err := os.Stat(filepath.Join(retired, "notes.md")); err != nil {
+		t.Error("the leftover must be kept")
+	}
+	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], "is now a symlink") {
+		t.Errorf("expected a symlink warning, got %v", w)
+	}
+}
+
+func TestNormalizeOwnerKeyStripsGitSuffix(t *testing.T) {
+	if got := NormalizeOwnerKey("Acme/Widgets.git"); got != "acme/widgets" {
+		t.Errorf("got %q", got)
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
-	if got := buildDescription("api", []string{"src/**"}, "  \n \t"); got == "" || !strings.Contains(got, "api") {
+	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)
 	}
 }
