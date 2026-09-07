@@ -1277,15 +1277,89 @@ func TestIsSharedSkillsDir(t *testing.T) {
 	}
 }
 
-// An empty directory at a domain's path holds nothing to lose and is used.
+// An empty directory at a domain's path, or one holding only the temp file
+// of an older build's interrupted write, holds nothing to lose and is used.
 func TestEmptyDirectoryIsRegenerated(t *testing.T) {
+	for _, leftover := range []string{"", "SKILL.md.tmp"} {
+		dir := t.TempDir()
+		skillDir := filepath.Join(dir, ".claude", "skills", "api")
+		if err := os.MkdirAll(skillDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if leftover != "" {
+			if err := os.WriteFile(filepath.Join(skillDir, leftover), []byte("partial"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+			t.Errorf("leftover %q: expected regeneration, got %v", leftover, err)
+		}
+	}
+}
+
+// A run interrupted between swapDir's two renames leaves only the retired
+// copy; the next run restores it before rendering, so a render failure
+// cannot destroy the last copy, and a domain that vanished is pruned from
+// the restored directory like any other.
+func TestInterruptedSwapIsRecovered(t *testing.T) {
 	dir := t.TempDir()
-	skillDir := filepath.Join(dir, ".claude", "skills", "api")
-	if err := os.MkdirAll(skillDir, 0755); err != nil {
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "old text", "api", "stated", 1)), dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
-		t.Errorf("expected regeneration into an empty directory, got %v", err)
+	if err := os.Rename(filepath.Join(skills, "api"), filepath.Join(skills, "api"+retiredSuffix)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "new text", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api", "SKILL.md")); !strings.Contains(got, "new text") {
+		t.Error("live skill should be the regenerated one")
+	}
+	if _, err := os.Lstat(filepath.Join(skills, "api"+retiredSuffix)); !os.IsNotExist(err) {
+		t.Error("retired copy should be gone after a successful swap")
+	}
+	if err := recoverSwap(filepath.Join(skills, "nothing"), filepath.Join(skills, "nothing"+retiredSuffix)); err != nil {
+		t.Errorf("recoverSwap with no leftovers should be a no-op: %v", err)
+	}
+}
+
+// A domain name carrying a transient suffix would be cleared by prune.
+func TestTransientSuffixDomainRejected(t *testing.T) {
+	for _, bad := range []string{"api" + stagingSuffix, "api" + retiredSuffix} {
+		if validDomain(bad) {
+			t.Errorf("validDomain(%q) should be false", bad)
+		}
+	}
+}
+
+// Fingerprints count only in the header region, so a hand-written skill
+// that quotes a generator sentence or the marker in its body is left alone.
+func TestQuotedFingerprintInBodyIsNotGenerated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "SKILL.md")
+	content := "---\nname: api\ndescription: My skill.\n---\n\n# API\n\n## Rules\n\n### About pattern-learner\n\n" +
+		"Its generated files start with " + GeneratedMarker + "\n\n" + exemplaryFilesIntro + "\n\n" + ownerLine("acme/other") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info := inspectSkill(path, "api")
+	if info.generated || info.stamped {
+		t.Errorf("quoted fingerprints in the body must not classify the skill as generated: %+v", info)
+	}
+	// The real header layout still classifies.
+	real := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("acme/alpha") + "\n\n# API Conventions\n\n## Rules\n\n" + inlineRulesIntro + "\n\n### Rule\n"
+	if err := os.WriteFile(path, []byte(real), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if info := inspectSkill(path, "api"); !info.generated || info.stamp != "acme/alpha" {
+		t.Errorf("generated header should classify: %+v", info)
+	}
+}
+
+func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
+	if got := buildDescription("api", []string{"src/**"}, "  \n \t"); got == "" || !strings.Contains(got, "api") {
+		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)
 	}
 }
 

@@ -312,10 +312,21 @@ func parseOwnerLine(line string) (string, bool) {
 	return strings.TrimSuffix(strings.TrimPrefix(line, ownerStampPrefix), ownerStampSuffix), true
 }
 
-// isEmptyDir reports whether dir exists and holds no entries.
+// isEmptyDir reports whether dir exists and holds nothing to lose: no
+// entries, or only the SKILL.md temp file an older build's interrupted
+// atomicWrite left behind (before domains were staged and swapped whole).
 func isEmptyDir(dir string) bool {
 	entries, err := os.ReadDir(dir)
-	return err == nil && len(entries) == 0
+	if err != nil {
+		return false
+	}
+	leftover := filepath.Base(tmpPath("SKILL.md"))
+	for _, e := range entries {
+		if e.Name() != leftover {
+			return false
+		}
+	}
+	return true
 }
 
 // Each domain is written into a staging sibling and swapped into place, so
@@ -470,15 +481,33 @@ func inspectSkill(path, dirName string) skillInfo {
 	var info skillInfo
 	name, ok := frontmatterName(content)
 	nameMatches := ok && strings.EqualFold(name, dirName)
+
+	// Only the header region is inspected, where the generator puts these
+	// lines: the marker and stamp are the first body lines after the
+	// frontmatter, and the fixed sentences precede the first rule heading
+	// or index entry. A hand-written skill that quotes one of them further
+	// down (say, in a rule about pattern-learner itself) must not be taken
+	// for generated output.
+	_, body, _ := format.ParseFrontmatter(content)
 	fingerprinted := false
-	for _, line := range strings.Split(content, "\n") {
+	nonEmpty := 0
+	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
-		if stamped, ok := parseOwnerLine(line); ok && !info.stamped {
-			info.stamp, info.stamped = stamped, true
-		}
-		if line == GeneratedMarker {
-			fingerprinted = true
+		if line == "" {
 			continue
+		}
+		nonEmpty++
+		if strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "- [") {
+			break
+		}
+		if nonEmpty <= headerLineBudget {
+			if stamped, ok := parseOwnerLine(line); ok && !info.stamped {
+				info.stamp, info.stamped = stamped, true
+			}
+			if line == GeneratedMarker {
+				fingerprinted = true
+				continue
+			}
 		}
 		for _, generated := range generatedBodyLines {
 			if line == generated {
@@ -489,6 +518,10 @@ func inspectSkill(path, dirName string) skillInfo {
 	info.generated = nameMatches && fingerprinted
 	return info
 }
+
+// headerLineBudget is how many non-empty body lines from the top the marker
+// and owner stamp may occupy. The generator writes them first and second.
+const headerLineBudget = 2
 
 func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
 	sort.Slice(rules, func(i, j int) bool {
@@ -515,16 +548,32 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// means renamed or removed rules leave no stale companion files behind.
 	staging := skillDir + stagingSuffix
 	retired := skillDir + retiredSuffix
-	for _, transient := range []string{staging, retired} {
-		if err := os.RemoveAll(transient); err != nil {
-			return err
-		}
+	if err := recoverSwap(skillDir, retired); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(staging); err != nil {
+		return err
 	}
 	if err := renderSkillDir(staging, domain, desc, globs, rules, watermark, owner, opts); err != nil {
 		os.RemoveAll(staging)
 		return err
 	}
 	return swapDir(staging, skillDir, retired)
+}
+
+// recoverSwap repairs the state an interrupted swapDir can leave. If the
+// live directory is absent but its retired copy exists, the run died
+// between the two renames and the retired copy is the only one: put it
+// back so a render failure in this run cannot destroy it. If both exist,
+// the run died after the swap and the retired copy is just leftover.
+func recoverSwap(live, retired string) error {
+	if _, err := os.Lstat(retired); err != nil {
+		return nil
+	}
+	if _, err := os.Lstat(live); err != nil {
+		return os.Rename(retired, live)
+	}
+	return os.RemoveAll(retired)
 }
 
 // renderSkillDir writes a domain's complete skill tree (SKILL.md plus
@@ -1049,10 +1098,11 @@ func splitTopLevel(s string) []string {
 // If override is non-empty, it is used directly (truncated if needed). Otherwise
 // a generic fallback is constructed from the domain name and globs.
 func buildDescription(domain string, globs []string, override string) string {
-	if override != "" {
-		// The override is model-supplied; a newline would break the YAML
-		// frontmatter line it is rendered into.
-		return truncate(strings.Join(strings.Fields(override), " "), maxDescriptionRunes)
+	// The override is model-supplied; a newline would break the YAML
+	// frontmatter line it is rendered into, and a whitespace-only value is
+	// no description at all.
+	if override = strings.Join(strings.Fields(override), " "); override != "" {
+		return truncate(override, maxDescriptionRunes)
 	}
 	if domain == UniversalSkillName {
 		return "Repo-wide coding conventions extracted from PR review history. Applies to every file; read before writing or reviewing code anywhere in this repository."
@@ -1100,6 +1150,11 @@ func validDomain(domain string) bool {
 		}
 	}
 	if strings.ContainsAny(domain, `/\<>:"|?*`) {
+		return false
+	}
+	// A name carrying one of the transient-directory suffixes would be
+	// mistaken for a leftover of an interrupted swap and cleared.
+	if isTransientDir(domain) {
 		return false
 	}
 	// Windows: a trailing dot or space is stripped by the filesystem, and
@@ -1179,8 +1234,8 @@ func headingTitle(domain string) string {
 }
 
 // tmpPath is the temp file atomicWrite stages path's content in. It is a
-// helper rather than an inline literal because isEmptyShell must recognise
-// the leftover of an interrupted write by the same name.
+// helper rather than an inline literal because isEmptyDir must recognise
+// the leftover of an interrupted pre-staging write by the same name.
 func tmpPath(path string) string {
 	return path + ".tmp"
 }
