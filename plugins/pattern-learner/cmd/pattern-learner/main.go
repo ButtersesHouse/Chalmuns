@@ -131,16 +131,19 @@ func runWriteOutputs(args []string) error {
 		return err
 	}
 
+	// Cheap flag validation first; anchoring below walks the repository
+	// (or calls cursor-agent per rule) and should not run for a bad flag.
+	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, outputDir)
+	if err != nil {
+		return err
+	}
+
 	if ragAnchor {
 		anchorExamplesRAG(&s, outputDir)
 	} else {
 		anchorExamples(&s, outputDir)
 	}
 
-	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, outputDir)
-	if err != nil {
-		return err
-	}
 	opts := output.Options{
 		RAGHints:  ragHints,
 		SkillsDir: flagValue(args, "--skills-dir", ""),
@@ -409,8 +412,14 @@ func anchorExamples(s *state.State, outputDir string) {
 // subagents to emit (e.g. "src/api/**/*.go") — and brace groups, expanded
 // the same way the skill frontmatter expands them.
 func globFiles(root, glob string) []string {
+	expanded, err := output.ExpandBraces(glob)
+	if err != nil {
+		// A malformed glob is refused by write-outputs itself; anchoring
+		// is advisory and simply finds nothing for it.
+		return nil
+	}
 	var out []string
-	for _, g := range output.ExpandBraces(glob) {
+	for _, g := range expanded {
 		out = append(out, globFilesPlain(root, g)...)
 	}
 	return out

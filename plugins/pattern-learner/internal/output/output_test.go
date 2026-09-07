@@ -981,8 +981,13 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 	if got != want {
 		t.Errorf("collectGlobs = %q, want %q", got, want)
 	}
-	if x := ExpandBraces("src/{a/**/*.go"); len(x) != 1 || x[0] != "src/{a/**/*.go" {
-		t.Errorf("unbalanced brace should be left alone, got %v", x)
+	for _, bad := range []string{"src/{a/**/*.go", "src/a}/**", "src/{a,{b}/x"} {
+		if _, err := ExpandBraces(bad); err == nil {
+			t.Errorf("ExpandBraces(%q) should report an unbalanced brace", bad)
+		}
+	}
+	if x, err := ExpandBraces("plain/*.go"); err != nil || len(x) != 1 || x[0] != "plain/*.go" {
+		t.Errorf("brace-free glob should pass through, got %v, %v", x, err)
 	}
 
 	// A comma that survives expansion cannot be represented: the run must
@@ -1317,8 +1322,8 @@ func TestInterruptedSwapIsRecovered(t *testing.T) {
 	if got := readFile(t, filepath.Join(skills, "api", "SKILL.md")); !strings.Contains(got, "new text") {
 		t.Error("live skill should be the regenerated one")
 	}
-	if _, err := os.Lstat(filepath.Join(skills, "api"+retiredSuffix)); !os.IsNotExist(err) {
-		t.Error("retired copy should be gone after a successful swap")
+	if left := transientEntries(t, skills); len(left) != 0 {
+		t.Errorf("retired copy should be gone after a successful swap, found %v", left)
 	}
 	// A stale domain mid-swap is restored and then pruned like any other.
 	if err := os.Rename(filepath.Join(skills, "api"), filepath.Join(skills, "api"+retiredSuffix)); err != nil {
@@ -1387,8 +1392,87 @@ func TestDanglingSymlinkAtDomainPathIsReplaced(t *testing.T) {
 	if !inspectSkill(filepath.Join(skills, "api", "SKILL.md"), "api").generated {
 		t.Error("skill should have been written in place of the dangling link")
 	}
-	if _, err := os.Lstat(filepath.Join(skills, "api"+retiredSuffix)); !os.IsNotExist(err) {
-		t.Error("no retired sibling should remain")
+	if left := transientEntries(t, skills); len(left) != 0 {
+		t.Errorf("no transient sibling should remain, found %v", left)
+	}
+}
+
+// transientEntries lists the staging/retired siblings present under dir.
+func transientEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if isTransientDir(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// A live symlinked domain directory is refused rather than replaced.
+func TestSymlinkedLiveDomainIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "api-target")
+	if err := os.Rename(filepath.Join(skills, "api"), target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(skills, "api")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := Write(stateWith(approvedRule("Rule", "changed", "api", "stated", 1)), dir, Options{})
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("expected a symlink refusal, got %v", err)
+	}
+	if fi, err := os.Lstat(filepath.Join(skills, "api")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink must be left in place")
+	}
+	if _, err := os.Stat(filepath.Join(target, "notes.md")); err != nil {
+		t.Error("the link target's files must be untouched")
+	}
+}
+
+// Another repository's leftover transient in a shared directory (named with
+// its own random tail) cannot block this repository's swap.
+func TestForeignTransientDoesNotBlockSwap(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	a := stateWith(approvedRule("Rule", "v1", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := transientPath(filepath.Join(shared, "api"), retiredSuffix)
+	if err := os.MkdirAll(foreign, 0755); err != nil {
+		t.Fatal(err)
+	}
+	theirs := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("acme/beta") + "\n\nbody\n"
+	if err := os.WriteFile(filepath.Join(foreign, "SKILL.md"), []byte(theirs), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a2 := stateWith(approvedRule("Rule", "v2", "api", "stated", 1))
+	a2.Repo = a.Repo
+	if err := Write(a2, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatalf("regeneration must not be blocked by another repo's leftover: %v", err)
+	}
+	if got := readFile(t, filepath.Join(shared, "api", "SKILL.md")); !strings.Contains(got, "v2") {
+		t.Error("skill should be regenerated")
+	}
+	if _, err := os.Stat(filepath.Join(foreign, "SKILL.md")); err != nil {
+		t.Error("the other repo's leftover must be left for it")
+	}
+	left := transientEntries(t, shared)
+	if len(left) != 1 || left[0] != filepath.Base(foreign) {
+		t.Errorf("only the foreign leftover should remain, found %v", left)
 	}
 }
 

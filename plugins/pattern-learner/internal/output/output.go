@@ -1,6 +1,8 @@
 package output
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -239,6 +241,15 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 		// conventions. A directory with no SKILL.md is foreign too, unless
 		// it is empty (nothing in it to lose).
 		skillDir := filepath.Join(skillsDir, domain)
+		// Regeneration replaces the directory wholesale, which would turn a
+		// symlinked domain into a real directory, strand the link target
+		// with a stale SKILL.md, and pull the user's files out of it. A
+		// link that still resolves is refused; a dangling one is cleared.
+		if fi, err := os.Lstat(skillDir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if _, err := os.Stat(skillDir); err == nil {
+				return fmt.Errorf("%s is a symlink; pattern-learner regenerates a domain directory by replacing it, which would break the link — replace it with a real directory, or point --skills-dir at the directory the link targets, then rerun", skillDir)
+			}
+		}
 		existing := inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
 		if _, err := os.Stat(skillDir); err == nil && !existing.generated && !isEmptyDir(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
@@ -343,16 +354,38 @@ func isEmptyDir(dir string) bool {
 }
 
 // Each domain is written into a staging sibling and swapped into place, so
-// a domain directory is only ever seen complete or absent. These suffixes
-// name the two transient siblings; anything carrying one is ours by
-// construction and is cleared away by the next run.
+// a domain directory is only ever seen complete or absent. These markers
+// name the two transient siblings ("<domain><marker>-<random>"); anything
+// carrying one was written by this generator and is settled by the next
+// run that owns it. The random tail keeps one run's transients from
+// colliding with another's, so a leftover another repository left in a
+// shared directory can never block this repository's swap.
 const (
 	stagingSuffix = ".pattern-learner-staging"
 	retiredSuffix = ".pattern-learner-old"
 )
 
 func isTransientDir(name string) bool {
-	return strings.HasSuffix(name, stagingSuffix) || strings.HasSuffix(name, retiredSuffix)
+	return strings.Contains(name, stagingSuffix) || strings.Contains(name, retiredSuffix)
+}
+
+// transientPath returns a fresh sibling name for base with the given marker.
+func transientPath(base, marker string) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return base + marker + "-" + hex.EncodeToString(b[:])
+}
+
+// liveOfRetired returns the live directory name a retired sibling belongs
+// to, and whether name is a retired sibling at all.
+func liveOfRetired(name string) (string, bool) {
+	idx := strings.Index(name, retiredSuffix)
+	if idx < 0 {
+		return "", false
+	}
+	return name[:idx], true
 }
 
 // recoverTransients settles whatever an interrupted swap left under
@@ -390,8 +423,8 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 				continue
 			}
 		}
-		if strings.HasSuffix(name, retiredSuffix) {
-			live := filepath.Join(skillsDir, strings.TrimSuffix(name, retiredSuffix))
+		if liveName, ok := liveOfRetired(name); ok {
+			live := filepath.Join(skillsDir, liveName)
 			if _, err := os.Lstat(live); err != nil {
 				if err := os.Rename(dir, live); err != nil {
 					return err
@@ -654,18 +687,17 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// sibling the next run clears), never a SKILL.md pointing at companion
 	// files that were wiped and not rewritten. Rendering from scratch also
 	// means renamed or removed rules leave no stale companion files behind.
-	staging := skillDir + stagingSuffix
-	retired := skillDir + retiredSuffix
-	// recoverTransients has already settled any leftover of this domain's
-	// earlier swap, so both siblings are free to use.
-	if err := os.RemoveAll(staging); err != nil {
-		return err
-	}
+	staging := transientPath(skillDir, stagingSuffix)
+	retired := transientPath(skillDir, retiredSuffix)
 	if err := renderSkillDir(staging, domain, desc, globs, rules, watermark, owner, opts); err != nil {
 		os.RemoveAll(staging)
 		return err
 	}
-	return swapDir(staging, skillDir, retired)
+	if err := swapDir(staging, skillDir, retired); err != nil {
+		os.RemoveAll(staging)
+		return err
+	}
+	return nil
 }
 
 // renderSkillDir writes a domain's complete skill tree (SKILL.md plus
@@ -1003,13 +1035,7 @@ func approvedRules(s state.State, location string) []state.Rule {
 			out = append(out, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		ri, rj := confidenceRank(out[i].Confidence), confidenceRank(out[j].Confidence)
-		if ri != rj {
-			return ri < rj
-		}
-		return out[i].Title < out[j].Title
-	})
+	sortRules(out)
 	return out
 }
 
@@ -1125,35 +1151,35 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 			if g == "" {
 				continue
 			}
-			// An empty brace alternative ("src/{a,}/**", "*.{ts,}") is the
-			// shell idiom for "or nothing"; it has no equivalent in a paths
-			// gate and would emit a glob that matches nothing.
-			if hasEmptyAlternative(g) {
-				return nil, fmt.Errorf("file glob %q has an empty brace alternative, which a paths gate cannot express; list the alternatives explicitly and rerun", g)
+			expanded, err := ExpandBraces(g)
+			if err != nil {
+				return nil, fmt.Errorf("file glob %q: %w", g, err)
 			}
-			for _, expanded := range ExpandBraces(g) {
-				if strings.ContainsAny(expanded, "{}") {
-					return nil, fmt.Errorf("file glob %q has an unbalanced brace; close every {a,b} group (or remove the stray brace) and rerun", g)
-				}
-				if strings.Contains(expanded, ",") {
+			for _, e := range expanded {
+				if strings.Contains(e, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
 				}
-				all = append(all, expanded)
+				all = append(all, e)
 			}
 		}
 	}
 	return dedupeStrings(all), nil
 }
 
-// ExpandBraces expands the first {a,b,...} group in glob, recursing so
-// nested and successive groups expand fully. A glob with no group, or with
-// an unbalanced brace, is returned unchanged. It is the one brace expander
-// for rule file globs: the frontmatter paths gate and the example anchoring
-// in the CLI both go through it, so a glob means the same thing in both.
-func ExpandBraces(glob string) []string {
+// ExpandBraces expands every {a,b,...} group in glob, nested and successive
+// groups included. It is the one brace parser for rule file globs: the
+// frontmatter paths gate and the example anchoring in the CLI both go
+// through it, so a glob means the same thing in both, and it is where a
+// malformed group is diagnosed: an unbalanced brace, or an empty alternative
+// ("{a,}", "{,a}", "{}" — the shell idiom for "or nothing", which a paths
+// gate cannot express and which would emit a glob matching nothing).
+func ExpandBraces(glob string) ([]string, error) {
 	open := strings.Index(glob, "{")
 	if open < 0 {
-		return []string{glob}
+		if strings.Contains(glob, "}") {
+			return nil, errUnbalancedBrace
+		}
+		return []string{glob}, nil
 	}
 	depth := 0
 	for i := open; i < len(glob); i++ {
@@ -1165,44 +1191,26 @@ func ExpandBraces(glob string) []string {
 			if depth == 0 {
 				var out []string
 				for _, alt := range splitTopLevel(glob[open+1 : i]) {
-					out = append(out, ExpandBraces(glob[:open]+alt+glob[i+1:])...)
+					if alt == "" {
+						return nil, errEmptyAlternative
+					}
+					sub, err := ExpandBraces(glob[:open] + alt + glob[i+1:])
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, sub...)
 				}
-				return out
+				return out, nil
 			}
 		}
 	}
-	return []string{glob}
+	return nil, errUnbalancedBrace
 }
 
-// hasEmptyAlternative reports whether any balanced brace group in glob has
-// an empty alternative ("{a,}", "{,a}", "{}"), at any nesting depth.
-func hasEmptyAlternative(glob string) bool {
-	for open := strings.Index(glob, "{"); open >= 0; open = strings.Index(glob, "{") {
-		depth, end := 0, -1
-		for i := open; i < len(glob); i++ {
-			switch glob[i] {
-			case '{':
-				depth++
-			case '}':
-				depth--
-			}
-			if depth == 0 {
-				end = i
-				break
-			}
-		}
-		if end < 0 {
-			return false // unbalanced: reported separately
-		}
-		for _, alt := range splitTopLevel(glob[open+1 : end]) {
-			if alt == "" || hasEmptyAlternative(alt) {
-				return true
-			}
-		}
-		glob = glob[end+1:]
-	}
-	return false
-}
+var (
+	errUnbalancedBrace  = fmt.Errorf("has an unbalanced brace; close every {a,b} group (or remove the stray brace) and rerun")
+	errEmptyAlternative = fmt.Errorf("has an empty brace alternative, which a paths gate cannot express; list the alternatives explicitly and rerun")
+)
 
 // splitTopLevel splits s on commas that are not inside a nested brace group.
 func splitTopLevel(s string) []string {
