@@ -133,8 +133,26 @@ func runWriteOutputs(args []string) error {
 	opts := output.Options{
 		RAGHints:  ragHints,
 		SkillsDir: flagValue(args, "--skills-dir", ""),
+		Owner:     resolveOwner(flagValue(args, "--repo", ""), s, outputDir),
 	}
 	return output.Write(s, outputDir, opts)
+}
+
+// resolveOwner picks the "owner/repo" identity stamped into generated skills,
+// in a fixed order so it cannot flip between runs: an explicit --repo flag,
+// then the state's repo field, then the git remote of the output directory
+// (the same detection detect-repo performs). Empty when none is available.
+func resolveOwner(flag string, s state.State, outputDir string) string {
+	if flag != "" {
+		return strings.ToLower(strings.Trim(flag, "/"))
+	}
+	if s.Repo.Owner != "" && s.Repo.Repo != "" {
+		return strings.ToLower(s.Repo.Owner + "/" + s.Repo.Repo)
+	}
+	if r, err := detect.Detect(outputDir); err == nil && r.Owner != "" && r.Repo != "" {
+		return strings.ToLower(r.Owner + "/" + r.Repo)
+	}
+	return ""
 }
 
 // runPromote publishes the conventions into a top-level agent instruction

@@ -17,24 +17,19 @@ func TestVersionLiteralsAgree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var m struct {
-		Version string `json:"version"`
-	}
-	if err := json.Unmarshal(manifest, &m); err != nil {
-		t.Fatal(err)
-	}
-	if m.Version != Version {
-		t.Errorf("plugin.json version %q != main.Version %q", m.Version, Version)
-	}
-
-	// The marketplace manifest and plugin.json describe the same plugin;
-	// keep the two descriptions from drifting apart (they already did once).
 	var pm struct {
+		Version     string `json:"version"`
 		Description string `json:"description"`
 	}
 	if err := json.Unmarshal(manifest, &pm); err != nil {
 		t.Fatal(err)
 	}
+	if pm.Version != Version {
+		t.Errorf("plugin.json version %q != main.Version %q", pm.Version, Version)
+	}
+
+	// The marketplace manifest and plugin.json describe the same plugin;
+	// keep the two descriptions from drifting apart (they already did once).
 	// The marketplace manifest lives at the repository root, outside this Go
 	// module. An installed copy of the plugin has only the module, so its
 	// absence is not a failure.

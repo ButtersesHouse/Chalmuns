@@ -111,13 +111,28 @@ func parseFrontmatter(text string) (map[string]string, string, []string) {
 	fmText := text[m[2]:m[3]]
 	body := text[m[1]:]
 
-	var doc map[string]yaml.Node
-	if err := yaml.Unmarshal([]byte(fmText), &doc); err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(fmText), &root); err != nil {
 		issues = append(issues, "frontmatter is not valid YAML (the skill will fail to load): "+
 			strings.Join(strings.Fields(err.Error()), " "))
 		return lenientFields(fmText), body, issues
 	}
-	for k, node := range doc {
+	// A parsed document wraps one top-level node, which must be a mapping;
+	// valid YAML that is a bare scalar or a list is a different problem from
+	// a parse error and is reported as such.
+	var top *yaml.Node
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		top = root.Content[0]
+	}
+	if top == nil {
+		return fields, body, issues
+	}
+	if top.Kind != yaml.MappingNode {
+		issues = append(issues, "frontmatter must be a key/value mapping (name:, description:, ...), not a bare value or list")
+		return fields, body, issues
+	}
+	for i := 0; i+1 < len(top.Content); i += 2 {
+		k, node := top.Content[i].Value, top.Content[i+1]
 		switch node.Kind {
 		case yaml.ScalarNode:
 			if node.Tag == "!!null" {

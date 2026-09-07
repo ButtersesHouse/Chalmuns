@@ -882,13 +882,107 @@ func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
 func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 	r := approvedRule("R", "do it", "api", "stated", 1)
 	r.Target.FileGlob = []string{"", "src/{a,b}/**/*.go", "lib/{x,{y,z}}/*.ts", "src/a/**/*.go"}
-	got := strings.Join(collectGlobs([]state.Rule{r}), "|")
+	globs, err := collectGlobs([]state.Rule{r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(globs, "|")
 	want := "src/a/**/*.go|src/b/**/*.go|lib/x/*.ts|lib/y/*.ts|lib/z/*.ts"
 	if got != want {
 		t.Errorf("collectGlobs = %q, want %q", got, want)
 	}
 	if x := expandBraces("src/{a/**/*.go"); len(x) != 1 || x[0] != "src/{a/**/*.go" {
 		t.Errorf("unbalanced brace should be left alone, got %v", x)
+	}
+
+	// A comma that survives expansion cannot be represented: the run must
+	// refuse rather than silently widen the paths gate.
+	bad := approvedRule("R", "do it", "api", "stated", 1)
+	bad.Target.FileGlob = []string{"src/[a,b]/**/*.go"}
+	if err := Write(stateWith(bad), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "contains a comma") {
+		t.Errorf("expected a comma-glob refusal, got %v", err)
+	}
+}
+
+// A fork or renamed repo changes the stamp, not the fact that the skill was
+// generated: a live domain's generated skill is regenerated and re-stamped.
+func TestForkRegeneratesStampedSkill(t *testing.T) {
+	dir := t.TempDir()
+	a := stateWith(approvedRule("Rule", "do it", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	fork := stateWith(approvedRule("Rule", "do it again", "api", "stated", 1))
+	fork.Repo = state.RepoInfo{Owner: "bob", Repo: "alpha"}
+	if err := Write(fork, dir, Options{}); err != nil {
+		t.Fatalf("fork must be able to regenerate a generated skill: %v", err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "do it again") || !strings.Contains(content, ownerLine("bob/alpha")) {
+		t.Errorf("skill should be regenerated and re-stamped; got:\n%s", content)
+	}
+	// An unowned run regenerates too.
+	if err := Write(stateWith(approvedRule("Rule", "third", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatalf("unowned run must be able to regenerate a generated skill: %v", err)
+	}
+}
+
+// On a case-sensitive filesystem a re-cased domain leaves the old casing as
+// a separate directory; it is stale and must be pruned, while on a
+// case-insensitive one the single directory is the live skill and must stay.
+func TestRecasedDomainPrunesOldCasing(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "do it", "Api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(skills)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	caseSensitive := len(names) == 2 || (len(names) == 1 && names[0] == "api")
+	if caseSensitive && (len(names) != 1 || names[0] != "api") {
+		t.Errorf("old casing should be pruned on a case-sensitive filesystem, got %v", names)
+	}
+	if len(names) != 1 {
+		t.Errorf("exactly one skill directory should remain, got %v", names)
+	}
+}
+
+// Stamp writing and parsing share one format.
+func TestOwnerLineRoundTrip(t *testing.T) {
+	got, ok := parseOwnerLine(ownerLine("acme/alpha"))
+	if !ok || got != "acme/alpha" {
+		t.Errorf("parseOwnerLine(ownerLine(x)) = %q, %v", got, ok)
+	}
+	if _, ok := parseOwnerLine("<!-- something else -->"); ok {
+		t.Error("non-stamp line should not parse as a stamp")
+	}
+}
+
+// The name is read through the YAML parser, so quoting styles and comments
+// are handled the way the consuming agent handles them.
+func TestFrontmatterNameParsing(t *testing.T) {
+	cases := map[string]string{
+		"---\nname: \"caf\\u00e9\"\ndescription: \"x\"\n---\nbody":     "café",
+		"---\nname: 'it''s'\ndescription: x\n---\nbody":                "it's",
+		"---\nname: api # trailing comment\ndescription: x\n---\nbody": "api",
+		"---\nname:\ndescription: \"x\"\n---\nbody":                    "",
+		"no frontmatter": "",
+	}
+	for in, want := range cases {
+		got, ok := frontmatterName(in)
+		if got != want || ok != (want != "") {
+			t.Errorf("frontmatterName(%q) = %q, %v; want %q", in, got, ok, want)
+		}
 	}
 }
 
@@ -905,8 +999,8 @@ func TestValidDomainRejectsOSInvalidNames(t *testing.T) {
 	}
 }
 
-// The name line is read back with strconv.Unquote so an escaped name still
-// identifies its directory.
+// The name line is read back through the YAML parser so an escaped name
+// still identifies its directory.
 func TestIsGeneratedSkillUnquotesName(t *testing.T) {
 	dir := t.TempDir()
 	content := "---\nname: \"caf\\u00e9\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n\nbody\n"
