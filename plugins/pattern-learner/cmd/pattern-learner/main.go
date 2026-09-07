@@ -448,7 +448,7 @@ func newGlobMatcher(root string, globs []string) *globMatcher {
 
 // files returns the files under root matching glob. The walk happens on
 // the first call and covers every glob the matcher was built with; a glob
-// it was not built with is resolved on its own.
+// it was not built with costs a walk of its own.
 func (m *globMatcher) files(glob string) []string {
 	if !m.walked {
 		m.walkAll()
@@ -456,9 +456,11 @@ func (m *globMatcher) files(glob string) []string {
 	if files, ok := m.matches[glob]; ok {
 		return files
 	}
-	return globFiles(m.root, glob)
+	return newGlobMatcher(m.root, []string{glob}).files(glob)
 }
 
+// walkAll resolves every registered glob: plain globs through
+// filepath.Glob, "**" globs together in one traversal of the tree.
 func (m *globMatcher) walkAll() {
 	m.walked = true
 	m.matches = map[string][]string{}
@@ -474,6 +476,8 @@ func (m *globMatcher) walkAll() {
 		m.matches[glob] = nil
 		expanded, err := output.ExpandBraces(glob)
 		if err != nil {
+			// A malformed glob is refused by write-outputs itself;
+			// anchoring is advisory and simply finds nothing for it.
 			continue
 		}
 		for _, g := range expanded {
@@ -522,51 +526,7 @@ func (m *globMatcher) walkAll() {
 // subagents to emit (e.g. "src/api/**/*.go") — and brace groups, expanded
 // the same way the skill frontmatter expands them.
 func globFiles(root, glob string) []string {
-	expanded, err := output.ExpandBraces(glob)
-	if err != nil {
-		// A malformed glob is refused by write-outputs itself; anchoring
-		// is advisory and simply finds nothing for it.
-		return nil
-	}
-	var out []string
-	// Every "**" alternative is matched in one walk of the tree, so a
-	// brace group costs one traversal, not one per alternative.
-	var walkPatterns [][]string
-	for _, g := range expanded {
-		if !strings.Contains(g, "**") {
-			matches, _ := filepath.Glob(filepath.Join(root, g))
-			out = append(out, matches...)
-			continue
-		}
-		walkPatterns = append(walkPatterns, strings.Split(path.Clean(filepath.ToSlash(g)), "/"))
-	}
-	if len(walkPatterns) == 0 {
-		return out
-	}
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return nil
-		}
-		segs := strings.Split(filepath.ToSlash(rel), "/")
-		for _, pat := range walkPatterns {
-			if matchSegments(pat, segs) {
-				out = append(out, p)
-				break
-			}
-		}
-		return nil
-	})
-	return out
+	return newGlobMatcher(root, []string{glob}).files(glob)
 }
 
 // matchSegments matches path segments against pattern segments where "**"

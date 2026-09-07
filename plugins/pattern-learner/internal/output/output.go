@@ -539,30 +539,43 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 		}
 		if liveName, ok := liveOfRetired(name); ok {
 			live := filepath.Join(skillsDir, liveName)
-			// The live slot counts as taken only by a real directory; a
-			// dangling symlink or stray file there is cleared so the
-			// retired copy can go back, as swapDir would clear it.
-			if fi, err := os.Stat(live); err != nil || !fi.IsDir() {
-				if _, err := os.Lstat(live); err == nil {
-					if err := os.RemoveAll(live); err != nil {
-						return warnings, err
-					}
-				}
+			// The live slot is free when nothing is there or only a dangling
+			// symlink is (cleared, as swapDir would clear it). A stray file
+			// at the path is the user's and is left alone, like the
+			// overwrite guard leaves it.
+			if _, err := os.Lstat(live); err != nil {
 				if err := os.Rename(dir, live); err != nil {
 					return warnings, err
 				}
 				continue
 			}
-			// The live slot is taken. In a shared directory it may since
-			// have been taken by another repository (the guard reports that
-			// conflict when the domain is live for this run); our retired
-			// copy must not be folded into their skill, so it is left as
-			// is and the user is told where it is.
-			if !anyOwner {
-				if info := inspectSkill(filepath.Join(live, "SKILL.md"), ""); info.stamped && info.stamp != owner {
-					warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s now belongs to repository %q; move anything you want out of it and delete it", dir, liveName, live, info.stamp))
-					continue
+			if fi, err := os.Stat(live); err != nil {
+				if err := os.RemoveAll(live); err != nil {
+					return warnings, err
 				}
+				if err := os.Rename(dir, live); err != nil {
+					return warnings, err
+				}
+				continue
+			} else if !fi.IsDir() {
+				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s is now a file that pattern-learner did not write; move anything you want out of the leftover and delete it", dir, liveName, live))
+				continue
+			}
+			// The live slot is taken. Our retired copy is folded into it
+			// only when what is there is a generated skill we may
+			// regenerate anyway: inside the repo's tree any generated
+			// skill, in a shared directory one stamped for us. Anything
+			// else (a hand-written skill, another repository's) must not
+			// receive our files, so the copy is left and the user told.
+			liveInfo := inspectSkill(filepath.Join(live, "SKILL.md"), liveName)
+			ours := liveInfo.generated && (anyOwner || (liveInfo.stamped && liveInfo.stamp == owner))
+			if !ours {
+				holder := "was not written by pattern-learner"
+				if liveInfo.stamped && liveInfo.stamp != owner {
+					holder = fmt.Sprintf("now belongs to repository %q", liveInfo.stamp)
+				}
+				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, holder))
+				continue
 			}
 			if err := carryOver(dir, live); err != nil {
 				return warnings, err
@@ -646,8 +659,13 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		if isTransientDir(e.Name()) {
 			continue
 		}
-		// Stat rather than the entry type so a symlinked skill directory
-		// is judged like the overwrite guard judges it (which follows links).
+		// A symlinked skill is judged by its target (so a stale one stops
+		// auto-loading) but only the link is ever removed: the target may
+		// be another repository's skill or a user's own directory.
+		isLink := false
+		if lst, err := os.Lstat(dir); err == nil && lst.Mode()&os.ModeSymlink != 0 {
+			isLink = true
+		}
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 			continue
 		}
@@ -669,6 +687,12 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 			continue
 		}
 		if !anyOwner && (!info.stamped || info.stamp != owner) {
+			continue
+		}
+		if isLink {
+			if err := os.Remove(dir); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := removeGenerated(dir); err != nil {
@@ -1318,6 +1342,9 @@ func ExpandBraces(glob string) ([]string, error) {
 	open, depth := -1, 0
 	for i := 0; i < len(glob); i++ {
 		switch glob[i] {
+		case '\\':
+			// An escaped character is literal, as path.Match reads it.
+			i++
 		case '[':
 			// A character class may legitimately contain braces
 			// ("[{}]"); skip to its end so they are not read as a group.
@@ -1390,6 +1417,8 @@ func splitTopLevel(s string) []string {
 	depth, start := 0, 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case '\\':
+			i++
 		case '[':
 			if end := classEnd(s, i); end > i {
 				i = end

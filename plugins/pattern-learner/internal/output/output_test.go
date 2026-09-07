@@ -1887,6 +1887,101 @@ func TestSymlinkedStaleSkillIsPruned(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
 		t.Error("stale symlinked generated skill should have been pruned")
 	}
+	// Only the link goes; the target keeps its contents.
+	if _, err := os.Stat(filepath.Join(moved, "SKILL.md")); err != nil {
+		t.Error("the link target's SKILL.md must survive pruning the link")
+	}
+}
+
+// A retired copy is folded only into a generated live skill; a hand-written
+// one at the slot is left alone and the leftover is reported.
+func TestRetiredCopyNotFoldedIntoHandWrittenSkill(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(retired, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(skills, "api")
+	if err := os.MkdirAll(mine, 0755); err != nil {
+		t.Fatal(err)
+	}
+	handWritten := "---\nname: api\ndescription: mine\n---\n\nMine.\n"
+	if err := os.WriteFile(filepath.Join(mine, "SKILL.md"), []byte(handWritten), 0644); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := Validate(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(mine, "notes.md")); !os.IsNotExist(err) {
+		t.Error("nothing may be moved into a hand-written skill")
+	}
+	if got := readFile(t, filepath.Join(mine, "SKILL.md")); got != handWritten {
+		t.Error("hand-written skill must be untouched")
+	}
+	if _, err := os.Stat(filepath.Join(retired, "notes.md")); err != nil {
+		t.Error("the leftover must be kept for the user")
+	}
+	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], "was not written by pattern-learner") {
+		t.Errorf("expected a warning about the leftover, got %v", w)
+	}
+}
+
+// A user's regular file at a domain's path is never deleted to make room
+// for a retired copy.
+func TestRetiredCopyLeavesUserFileAtSlot(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	retired := transientPath(filepath.Join(skills, "api"), retiredSuffix)
+	if err := os.Rename(filepath.Join(skills, "api"), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skills, "api"), []byte("a note"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := Validate(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1))); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(skills, "api")); got != "a note" {
+		t.Error("user's file at the slot must be untouched")
+	}
+	if _, err := os.Stat(filepath.Join(retired, "SKILL.md")); err != nil {
+		t.Error("the leftover must be kept")
+	}
+	if w := prepared.Warnings(); len(w) != 1 {
+		t.Errorf("expected one warning, got %v", w)
+	}
+}
+
+// Backslash-escaped braces are literal characters, as path.Match reads them.
+func TestExpandBracesHonoursEscapes(t *testing.T) {
+	for _, g := range []string{`src/\{legacy\}/**/*.go`, `src/\{a/**`, `a\,b`} {
+		out, err := ExpandBraces(g)
+		if err != nil || len(out) != 1 || out[0] != g {
+			t.Errorf("ExpandBraces(%q) = %v, %v; want the glob unchanged", g, out, err)
+		}
+	}
+	out, err := ExpandBraces(`src/{a\,b,c}/x`)
+	if err != nil || len(out) != 2 || out[0] != `src/a\,b/x` || out[1] != "src/c/x" {
+		t.Errorf("an escaped comma must not split the group: %v, %v", out, err)
+	}
 }
 
 // A domain directory that exists without a SKILL.md is not ours either:
