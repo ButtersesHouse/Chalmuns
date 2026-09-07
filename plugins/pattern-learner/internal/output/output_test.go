@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/ButtersesHouse/Chalmuns/internal/format"
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 	"gopkg.in/yaml.v3"
 )
@@ -991,12 +992,12 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 	if err := Write(stateWith(bad), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "contains a comma") {
 		t.Errorf("expected a comma-glob refusal, got %v", err)
 	}
-	// An empty brace alternative yields an empty path segment; refuse too.
-	for _, g := range []string{"src/{a,}/**/*.go", "{,src}/**/*.go", "src/{}/x.go"} {
+	// An empty brace alternative cannot be expressed in a paths gate; refuse.
+	for _, g := range []string{"src/{a,}/**/*.go", "{,src}/**/*.go", "src/{}/x.go", "**/*.{ts,}", "lib/{x,{y,}}/*.ts"} {
 		empty := approvedRule("R", "do it", "api", "stated", 1)
 		empty.Target.FileGlob = []string{g}
-		if err := Write(stateWith(empty), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "empty path segment") {
-			t.Errorf("%s: expected an empty-segment refusal, got %v", g, err)
+		if err := Write(stateWith(empty), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "empty brace alternative") {
+			t.Errorf("%s: expected an empty-alternative refusal, got %v", g, err)
 		}
 	}
 	// A brace-free glob that ends in a slash is the author's choice, not an
@@ -1132,9 +1133,9 @@ func TestFrontmatterNameParsing(t *testing.T) {
 		"---\nname: api\ndescription: a: b\npaths: *.go\n---\nbody": "api",
 	}
 	for in, want := range cases {
-		got, ok := frontmatterName(in)
-		if got != want || ok != (want != "") {
-			t.Errorf("frontmatterName(%q) = %q, %v; want %q", in, got, ok, want)
+		fields, _, _ := format.ParseFrontmatter(in)
+		if got := fields["name"]; got != want {
+			t.Errorf("ParseFrontmatter(%q) name = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -1319,8 +1320,17 @@ func TestInterruptedSwapIsRecovered(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(skills, "api"+retiredSuffix)); !os.IsNotExist(err) {
 		t.Error("retired copy should be gone after a successful swap")
 	}
-	if err := recoverSwap(filepath.Join(skills, "nothing"), filepath.Join(skills, "nothing"+retiredSuffix)); err != nil {
-		t.Errorf("recoverSwap with no leftovers should be a no-op: %v", err)
+	// A stale domain mid-swap is restored and then pruned like any other.
+	if err := os.Rename(filepath.Join(skills, "api"), filepath.Join(skills, "api"+retiredSuffix)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, gone := range []string{"api", "api" + retiredSuffix} {
+		if _, err := os.Lstat(filepath.Join(skills, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s should not remain", gone)
+		}
 	}
 }
 
@@ -1363,12 +1373,20 @@ func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	}
 }
 
-// Leftovers of an interrupted swap (the staging and retired siblings) are
-// cleared by the next run, and a live directory is only ever complete.
+// Leftovers of an interrupted swap are settled by the next run: staging
+// trees are cleared, a retired copy with no live directory is restored
+// (and then pruned if its domain is gone), and a live directory is only
+// ever complete.
 func TestTransientDirsAreCleared(t *testing.T) {
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".claude", "skills")
-	for _, leftover := range []string{"api" + stagingSuffix, "old" + retiredSuffix, "gone" + stagingSuffix} {
+	if err := Write(stateWith(approvedRule("Rule", "do it", "old", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(skills, "old"), filepath.Join(skills, "old"+retiredSuffix)); err != nil {
+		t.Fatal(err)
+	}
+	for _, leftover := range []string{"api" + stagingSuffix, "gone" + stagingSuffix} {
 		if err := os.MkdirAll(filepath.Join(skills, leftover), 0755); err != nil {
 			t.Fatal(err)
 		}

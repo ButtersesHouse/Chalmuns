@@ -187,7 +187,14 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 
 	owner := opts.Owner
 	if owner == "" {
-		owner = ownerKey(s)
+		owner = OwnerFromState(s)
+	}
+
+	// Repair whatever an interrupted earlier run left (a domain mid-swap,
+	// a stale staging tree) before anything is judged, so the ownership
+	// checks below see every domain in its settled place.
+	if err := recoverTransients(skillsDir, owner, !shared); err != nil {
+		return err
 	}
 
 	// Validate every domain before touching the tree, so a bad name or a
@@ -266,11 +273,13 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 	return pruneStaleSkills(skillsDir, byDomain, owner, !shared)
 }
 
-// ownerKey identifies the repository a state file belongs to, so generated
-// skills in a skills directory shared by several repositories (say a
-// user-level one) are pruned only by the run that owns them. Empty when the
-// state carries no repo information.
-func ownerKey(s state.State) string {
+// OwnerFromState identifies the repository a state file belongs to, so
+// generated skills in a skills directory shared by several repositories
+// (say a user-level one) are pruned only by the run that owns them. Empty
+// when the state carries no repo information. It is the one place the
+// state's repo field is turned into a stamp value; the CLI's resolution
+// order (flag, then this, then the git remote) calls it too.
+func OwnerFromState(s state.State) string {
 	return OwnerKey(s.Repo.Owner, s.Repo.Repo)
 }
 
@@ -342,6 +351,80 @@ func isTransientDir(name string) bool {
 	return strings.HasSuffix(name, stagingSuffix) || strings.HasSuffix(name, retiredSuffix)
 }
 
+// recoverTransients settles whatever an interrupted swap left under
+// skillsDir. A retired copy whose live directory is absent is the only copy
+// (the run died between swapDir's two renames) and is put back; one beside
+// a live directory is the previous version, whose user-added files are
+// carried over before it is removed; a staging tree is an unfinished render
+// and is removed. In a shared directory a transient is only touched when it
+// is ours to touch: stamped for this owner, unstamped, or without a
+// SKILL.md at all (too incomplete to belong to anyone).
+func recoverTransients(skillsDir, owner string, anyOwner bool) error {
+	entries, err := os.ReadDir(skillsDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !isTransientDir(name) {
+			continue
+		}
+		dir := filepath.Join(skillsDir, name)
+		if !anyOwner {
+			if info := inspectSkill(filepath.Join(dir, "SKILL.md"), ""); info.stamped && info.stamp != owner {
+				continue
+			}
+		}
+		if strings.HasSuffix(name, retiredSuffix) {
+			live := filepath.Join(skillsDir, strings.TrimSuffix(name, retiredSuffix))
+			if _, err := os.Lstat(live); err != nil {
+				if err := os.Rename(dir, live); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := carryOver(dir, live); err != nil {
+				return err
+			}
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// generatedEntries are the top-level names a rendered skill directory
+// contains. Anything else found in a previous version of the directory is
+// the user's and is carried over when the directory is regenerated.
+var generatedEntries = map[string]bool{"SKILL.md": true, "examples": true, "rules": true}
+
+// carryOver moves every entry of from that the generator does not write
+// into to, so files a user keeps beside a generated SKILL.md survive
+// regeneration. Entries to already has are left as they are.
+func carryOver(from, to string) error {
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if generatedEntries[e.Name()] {
+			continue
+		}
+		dst := filepath.Join(to, e.Name())
+		if _, err := os.Lstat(dst); err == nil {
+			continue
+		}
+		if err := os.Rename(filepath.Join(from, e.Name()), dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // pruneStaleSkills removes generated skill directories under skillsDir whose
 // domain no longer has approved rules. Without this, a renamed or merged
 // domain (or one whose rules were all rejected) leaves its old SKILL.md
@@ -377,11 +460,9 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 	}
 	for _, e := range entries {
 		dir := filepath.Join(skillsDir, e.Name())
-		// Leftovers of an interrupted swap are ours whatever they hold.
+		// Transients were settled by recoverTransients before any write;
+		// one still here belongs to another repository.
 		if isTransientDir(e.Name()) {
-			if err := os.RemoveAll(dir); err != nil {
-				return err
-			}
 			continue
 		}
 		// Stat rather than the entry type so a symlinked skill directory
@@ -436,16 +517,6 @@ const (
 // SKILL.md says so.
 var generatedBodyLines = []string{inlineRulesIntro, chunkedIndexIntro, exemplaryFilesIntro}
 
-// frontmatterName reads a SKILL.md's name field through the module's one
-// frontmatter reader. A block that is not valid YAML (every skill this
-// generator wrote before it quoted its frontmatter) still yields the name
-// via the reader's line-by-line fallback, so those skills are recognised.
-func frontmatterName(content string) (string, bool) {
-	fields, _, _ := format.ParseFrontmatter(content)
-	name := fields["name"]
-	return name, name != ""
-}
-
 // skillInfo is what one read of a SKILL.md tells us about its provenance.
 type skillInfo struct {
 	// generated: the file carries the generator's fingerprint and its
@@ -479,8 +550,15 @@ func inspectSkill(path, dirName string) skillInfo {
 	}
 	content := string(data)
 	var info skillInfo
-	name, ok := frontmatterName(content)
-	nameMatches := ok && strings.EqualFold(name, dirName)
+	// One pass through the module's frontmatter reader gives both the name
+	// and the body. A block that is not valid YAML (every skill this
+	// generator wrote before it quoted its frontmatter) still yields the
+	// name via the reader's line-by-line fallback, so those skills are
+	// recognised. With dirName empty the name is not checked, for callers
+	// that only need the stamp.
+	fields, body, _ := format.ParseFrontmatter(content)
+	name := fields["name"]
+	nameMatches := dirName == "" || (name != "" && strings.EqualFold(name, dirName))
 
 	// Only the header region is inspected, where the generator puts these
 	// lines: the marker and stamp are the first body lines after the
@@ -488,7 +566,6 @@ func inspectSkill(path, dirName string) skillInfo {
 	// or index entry. A hand-written skill that quotes one of them further
 	// down (say, in a rule about pattern-learner itself) must not be taken
 	// for generated output.
-	_, body, _ := format.ParseFrontmatter(content)
 	fingerprinted := false
 	nonEmpty := 0
 	for _, line := range strings.Split(body, "\n") {
@@ -548,9 +625,8 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 	// means renamed or removed rules leave no stale companion files behind.
 	staging := skillDir + stagingSuffix
 	retired := skillDir + retiredSuffix
-	if err := recoverSwap(skillDir, retired); err != nil {
-		return err
-	}
+	// recoverTransients has already settled any leftover of this domain's
+	// earlier swap, so both siblings are free to use.
 	if err := os.RemoveAll(staging); err != nil {
 		return err
 	}
@@ -559,21 +635,6 @@ func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir
 		return err
 	}
 	return swapDir(staging, skillDir, retired)
-}
-
-// recoverSwap repairs the state an interrupted swapDir can leave. If the
-// live directory is absent but its retired copy exists, the run died
-// between the two renames and the retired copy is the only one: put it
-// back so a render failure in this run cannot destroy it. If both exist,
-// the run died after the swap and the retired copy is just leftover.
-func recoverSwap(live, retired string) error {
-	if _, err := os.Lstat(retired); err != nil {
-		return nil
-	}
-	if _, err := os.Lstat(live); err != nil {
-		return os.Rename(retired, live)
-	}
-	return os.RemoveAll(retired)
 }
 
 // renderSkillDir writes a domain's complete skill tree (SKILL.md plus
@@ -607,7 +668,9 @@ func renderSkillDir(dir, domain, desc string, globs []string, rules []state.Rule
 
 // swapDir moves the complete tree at staging to live, retiring whatever was
 // at live first. If the final rename fails the previous tree is put back,
-// so live is never left absent when it existed before.
+// so live is never left absent when it existed before. Files the user kept
+// in the previous tree beside the generated ones are carried over into the
+// new one before the previous tree is removed.
 func swapDir(staging, live, retired string) error {
 	hadLive := false
 	if _, err := os.Lstat(live); err == nil {
@@ -623,6 +686,9 @@ func swapDir(staging, live, retired string) error {
 		return err
 	}
 	if hadLive {
+		if err := carryOver(retired, live); err != nil {
+			return err
+		}
 		return os.RemoveAll(retired)
 	}
 	return nil
@@ -1022,21 +1088,18 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 			if g == "" {
 				continue
 			}
-			braced := strings.ContainsAny(g, "{}")
+			// An empty brace alternative ("src/{a,}/**", "*.{ts,}") is the
+			// shell idiom for "or nothing"; it has no equivalent in a paths
+			// gate and would emit a glob that matches nothing.
+			if hasEmptyAlternative(g) {
+				return nil, fmt.Errorf("file glob %q has an empty brace alternative, which a paths gate cannot express; list the alternatives explicitly and rerun", g)
+			}
 			for _, expanded := range ExpandBraces(g) {
 				if strings.ContainsAny(expanded, "{}") {
 					return nil, fmt.Errorf("file glob %q has an unbalanced brace; close every {a,b} group (or remove the stray brace) and rerun", g)
 				}
 				if strings.Contains(expanded, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
-				}
-				// An empty brace alternative ("src/{a,}/**") yields a path
-				// with an empty segment that a matcher never satisfies; the
-				// shell idiom has no equivalent in a paths gate. Only a glob
-				// that had a group can produce this; a plain "docs/" is left
-				// as the author wrote it.
-				if braced && (expanded == "" || strings.HasPrefix(expanded, "/") || strings.HasSuffix(expanded, "/") || strings.Contains(expanded, "//")) {
-					return nil, fmt.Errorf("file glob %q expands to %q, which has an empty path segment (an empty brace alternative); list the alternatives explicitly and rerun", g, expanded)
 				}
 				all = append(all, expanded)
 			}
@@ -1072,6 +1135,36 @@ func ExpandBraces(glob string) []string {
 		}
 	}
 	return []string{glob}
+}
+
+// hasEmptyAlternative reports whether any balanced brace group in glob has
+// an empty alternative ("{a,}", "{,a}", "{}"), at any nesting depth.
+func hasEmptyAlternative(glob string) bool {
+	for open := strings.Index(glob, "{"); open >= 0; open = strings.Index(glob, "{") {
+		depth, end := 0, -1
+		for i := open; i < len(glob); i++ {
+			switch glob[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+		if end < 0 {
+			return false // unbalanced: reported separately
+		}
+		for _, alt := range splitTopLevel(glob[open+1 : end]) {
+			if alt == "" || hasEmptyAlternative(alt) {
+				return true
+			}
+		}
+		glob = glob[end+1:]
+	}
+	return false
 }
 
 // splitTopLevel splits s on commas that are not inside a nested brace group.

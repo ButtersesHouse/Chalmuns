@@ -566,9 +566,12 @@ This writes:
     each entry linking `<domain>/rules/<slug>.md`), and each rule file carries the
     full rule with its examples inline. The index also tells the agent it can
     `grep -ril "<keyword>" rules/` for full-text lookup.
-  - `examples/` and `rules/` are **generator-owned**: `write-outputs` wipes and
-    regenerates them each run, so never hand-edit files there (edit rules via the
-    pipeline instead).
+  - `SKILL.md`, `examples/` and `rules/` are **generator-owned**: `write-outputs`
+    renders the whole domain directory afresh each run (into a staging sibling that is
+    swapped into place, so the directory is only ever complete or absent), so never
+    hand-edit those (edit rules via the pipeline instead). Any other file or directory
+    a user keeps at the top level of a generated domain directory is carried over
+    unchanged.
   - **Frontmatter is emitted as quoted YAML** (`name`, `description`, and the
     comma-separated `paths` string are all double-quoted), so descriptions
     containing `: ` and globs starting with `*` load correctly. Do not strip the

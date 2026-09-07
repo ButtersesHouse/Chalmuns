@@ -181,7 +181,7 @@ func resolveOwner(flag string, s state.State, outputDir string) (string, error) 
 		}
 		return output.OwnerKey(parts[0], parts[1]), nil
 	}
-	if key := output.OwnerKey(s.Repo.Owner, s.Repo.Repo); key != "" {
+	if key := output.OwnerFromState(s); key != "" {
 		return key, nil
 	}
 	if r, err := detect.Detect(outputDir); err == nil {
