@@ -540,6 +540,12 @@ func (m *globMatcher) walkAll() {
 			// Globs are repository-relative; a leading "/" or "./" the
 			// model sometimes emits means the same thing.
 			cleaned := strings.TrimPrefix(path.Clean(filepath.ToSlash(g)), "/")
+			if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+				// A glob that climbs out of the repository anchors nothing:
+				// a reference outside the repo is refused on the RAG path
+				// (refExists) and would be no use to a reader here either.
+				continue
+			}
 			if !strings.Contains(cleaned, "**") {
 				// A plain glob is a few directory listings; only "**"
 				// needs the tree walk. The root is escaped so that glob

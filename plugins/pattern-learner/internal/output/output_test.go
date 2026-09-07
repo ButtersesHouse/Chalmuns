@@ -1022,6 +1022,14 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 			t.Errorf("%s: expected an empty-alternative refusal, got %v", g, err)
 		}
 	}
+	// A glob that climbs out of the repository cannot be a paths gate.
+	for _, g := range []string{"../shared/*.go", "src/../../x/*.go", ".."} {
+		outside := approvedRule("R", "do it", "api", "stated", 1)
+		outside.Target.FileGlob = []string{g}
+		if err := Write(stateWith(outside), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "outside the repository") {
+			t.Errorf("%s: expected an outside-repository refusal, got %v", g, err)
+		}
+	}
 	// A brace-free glob that ends in a slash is the author's choice, not an
 	// empty alternative, and is accepted as before.
 	plain := approvedRule("R", "do it", "api", "stated", 1)

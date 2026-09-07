@@ -597,8 +597,11 @@ This writes:
     generated skills and those stamped for this repo are pruned; one stamped for a
     *different* repo (a leftover from before a fork or rename, or a skill the user
     copied in from another repo on purpose) is left in place with a `warning:` line
-    naming it, since the two cases cannot be told apart. In a skills directory
-    **outside** the repo, only skills carrying this repo's stamp are pruned. Skills the generator did not write (hand-written ones sharing the
+    naming it, since the two cases cannot be told apart — except when the run has no
+    identity of its own (no `--repo`, empty `state.repo`, no git remote), in which case
+    it cannot tell a foreign stamp from its former one and prunes every stale generated
+    skill in its tree. In a skills directory **outside** the repo, only skills carrying
+    this repo's stamp are pruned. Skills the generator did not write (hand-written ones sharing the
     directory) and skills another repo generated into a shared skills directory are
     never touched. A skill directory written by a very
     old build (no marker, none of the generator's fixed body sentences) carries no

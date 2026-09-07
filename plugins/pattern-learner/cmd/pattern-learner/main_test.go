@@ -567,3 +567,16 @@ func TestWriteOutputsRelativeOutputDir(t *testing.T) {
 		t.Error("the relative output dir must not be doubled")
 	}
 }
+
+// A glob that climbs out of the repository anchors nothing.
+func TestGlobMatcherIgnoresGlobsOutsideRoot(t *testing.T) {
+	base := t.TempDir()
+	writeTree(t, base, map[string]string{"shared/x.go": "x\n", "repo/src/a.go": "a\n"})
+	root := filepath.Join(base, "repo")
+	if got := globFiles(root, "../shared/*.go"); got != nil {
+		t.Errorf("a glob outside the root must not match: %v", got)
+	}
+	if got := globFiles(root, "src/*.go"); len(got) != 1 {
+		t.Errorf("an in-root glob still matches: %v", got)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1479,6 +1480,12 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 			for _, e := range expanded {
 				if strings.Contains(e, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
+				}
+				// A paths gate is repository-relative; a glob that climbs
+				// out of the repository can never match a file the skill
+				// should load for.
+				if c := path.Clean(filepath.ToSlash(e)); c == ".." || strings.HasPrefix(c, "../") {
+					return nil, fmt.Errorf("file glob %q points outside the repository, which a paths gate cannot express; use a repository-relative glob and rerun", g)
 				}
 				all = append(all, e)
 			}
