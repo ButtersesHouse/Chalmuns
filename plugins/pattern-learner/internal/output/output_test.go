@@ -1707,6 +1707,120 @@ func TestLeftoverTmpNotCarriedOver(t *testing.T) {
 	}
 }
 
+// Pruning a stale generated skill removes only what the generator wrote;
+// a user's file kept beside it stays, and the directory goes only when
+// empty.
+func TestPruneKeepsUserFiles(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, ".claude", "skills", "api")
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "notes.md"), []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "http-api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "SKILL.md")); !os.IsNotExist(err) {
+		t.Error("stale SKILL.md should be removed")
+	}
+	if got := readFile(t, filepath.Join(skillDir, "notes.md")); got != "mine" {
+		t.Error("user file should survive pruning")
+	}
+	// Without user files the directory itself goes.
+	other := t.TempDir()
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), other, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "ui", "stated", 1)), other, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(other, ".claude", "skills", "api")); !os.IsNotExist(err) {
+		t.Error("an emptied stale directory should be removed")
+	}
+}
+
+// A hand-written skill that appears between Validate and Write (the slow
+// anchoring window) is still refused.
+func TestPreparedWriteRechecksDisk(t *testing.T) {
+	dir := t.TempDir()
+	prepared, err := Validate(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := filepath.Join(dir, ".claude", "skills", "api")
+	if err := os.MkdirAll(mine, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mine, "SKILL.md"), []byte("---\nname: api\ndescription: mine\n---\n\nMine.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1))); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Errorf("expected the disk re-check to refuse, got %v", err)
+	}
+}
+
+// Braces inside a character class are class members, not a group.
+func TestExpandBracesSkipsCharacterClasses(t *testing.T) {
+	for _, g := range []string{"src/[{}]*.js", "src/[{]*.ts", "src/[]{]x", "src/[!{]*.go"} {
+		out, err := ExpandBraces(g)
+		if err != nil || len(out) != 1 || out[0] != g {
+			t.Errorf("ExpandBraces(%q) = %v, %v; want the glob unchanged", g, out, err)
+		}
+	}
+	out, err := ExpandBraces("src/{a,[,]}/x")
+	if err != nil || len(out) != 2 || out[0] != "src/a/x" || out[1] != "src/[,]/x" {
+		t.Errorf("a comma inside a class must not split the group: %v, %v", out, err)
+	}
+}
+
+func TestNormalizeOwnerKey(t *testing.T) {
+	cases := map[string]string{
+		"Acme/Alpha": "acme/alpha", "/acme/alpha/": "acme/alpha",
+		"acme": "", "a/b/c": "", "acme/al pha": "", "acme/al\npha": "", "": "",
+	}
+	for in, want := range cases {
+		if got := NormalizeOwnerKey(in); got != want {
+			t.Errorf("NormalizeOwnerKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := OwnerKey("acme", "al\npha"); got != "" {
+		t.Errorf("OwnerKey with a newline should be empty, got %q", got)
+	}
+}
+
+// A retired copy left in a shared directory because another repo holds
+// the slot is reported as a warning rather than passed over silently.
+func TestSharedDirLeftoverIsWarned(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	retired := transientPath(filepath.Join(shared, "api"), retiredSuffix)
+	if err := os.MkdirAll(retired, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ours := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("a/one") + "\n\nbody\n"
+	if err := os.WriteFile(filepath.Join(retired, "SKILL.md"), []byte(ours), 0644); err != nil {
+		t.Fatal(err)
+	}
+	b := stateWith(approvedRule("B rule", "do it", "api", "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "b", Repo: "two"}
+	if err := Write(b, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	a := state.Empty()
+	a.Repo = state.RepoInfo{Owner: "a", Repo: "one"}
+	prepared, err := Validate(a, t.TempDir(), Options{SkillsDir: shared})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(a); err != nil {
+		t.Fatal(err)
+	}
+	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], filepath.Base(retired)) {
+		t.Errorf("expected one warning naming the leftover, got %v", w)
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)

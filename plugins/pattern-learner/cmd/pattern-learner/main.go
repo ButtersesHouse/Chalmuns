@@ -156,7 +156,11 @@ func runWriteOutputs(args []string) error {
 		anchorExamples(&s, outputDir)
 	}
 
-	return prepared.Write(s)
+	err = prepared.Write(s)
+	for _, w := range prepared.Warnings() {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	return err
 }
 
 // repoRoot finds the root of the repository a run writes for, which decides
@@ -184,8 +188,8 @@ func repoRoot(statePath, outputDir string) string {
 // none is available.
 func resolveOwner(flag string, s state.State, outputDir string) (string, error) {
 	if flag != "" {
-		key := strings.ToLower(strings.Trim(flag, "/"))
-		if !output.ValidOwnerKey(key) {
+		key := output.NormalizeOwnerKey(flag)
+		if key == "" {
 			return "", fmt.Errorf("--repo must be \"owner/repo\" (got %q)", flag)
 		}
 		return key, nil
@@ -264,6 +268,7 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 		return
 	}
 
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s))
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 {
@@ -284,7 +289,7 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 		out, err := runCursorAgent(prompt)
 		if err != nil || strings.TrimSpace(out) == "" {
 			// Fall back to grep for this rule.
-			anchorSingleRule(r, outputDir)
+			anchorSingleRule(r, outputDir, matcher)
 			continue
 		}
 
@@ -295,9 +300,21 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 		if ref != "" && refExists(ref, outputDir) {
 			r.DoExamples[0].FileRef = ref
 		} else {
-			anchorSingleRule(r, outputDir)
+			anchorSingleRule(r, outputDir, matcher)
 		}
 	}
+}
+
+// approvedGlobs collects every file glob an approved rule carries, so one
+// matcher can resolve them all in a single walk.
+func approvedGlobs(s *state.State) []string {
+	var globs []string
+	for _, r := range s.Rules {
+		if r.Status == "approved" {
+			globs = append(globs, r.Target.FileGlob...)
+		}
+	}
+	return globs
 }
 
 // isCursorAgentAvailable checks whether cursor-agent is on PATH.
@@ -373,7 +390,7 @@ func extractFileRef(text string) string {
 }
 
 // anchorSingleRule is the grep fallback for one rule.
-func anchorSingleRule(r *state.Rule, outputDir string) {
+func anchorSingleRule(r *state.Rule, outputDir string, matcher *globMatcher) {
 	if len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
 		return
 	}
@@ -382,7 +399,7 @@ func anchorSingleRule(r *state.Rule, outputDir string) {
 		return
 	}
 	for _, glob := range r.Target.FileGlob {
-		for _, file := range globFiles(outputDir, glob) {
+		for _, file := range matcher.files(glob) {
 			lineNum, ok := findInFile(file, token)
 			if !ok {
 				continue
@@ -401,6 +418,7 @@ func anchorSingleRule(r *state.Rule, outputDir string) {
 // each approved rule's first do_example and sets FileRef when found. Errors are
 // silently ignored — this is advisory metadata only.
 func anchorExamples(s *state.State, outputDir string) {
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s))
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
@@ -409,8 +427,94 @@ func anchorExamples(s *state.State, outputDir string) {
 		if r.DoExamples[0].FileRef != "" {
 			continue
 		}
-		anchorSingleRule(&s.Rules[i], outputDir)
+		anchorSingleRule(&s.Rules[i], outputDir, matcher)
 	}
+}
+
+// globMatcher resolves the files matching each of a fixed set of globs
+// with a single walk of the tree, however many rules share a glob or how
+// many "**" globs there are; the previous per-rule, per-glob walks grew
+// linearly with the rule count.
+type globMatcher struct {
+	root    string
+	globs   []string
+	matches map[string][]string
+	walked  bool
+}
+
+func newGlobMatcher(root string, globs []string) *globMatcher {
+	return &globMatcher{root: root, globs: globs}
+}
+
+// files returns the files under root matching glob. The walk happens on
+// the first call and covers every glob the matcher was built with; a glob
+// it was not built with is resolved on its own.
+func (m *globMatcher) files(glob string) []string {
+	if !m.walked {
+		m.walkAll()
+	}
+	if files, ok := m.matches[glob]; ok {
+		return files
+	}
+	return globFiles(m.root, glob)
+}
+
+func (m *globMatcher) walkAll() {
+	m.walked = true
+	m.matches = map[string][]string{}
+	type walkPattern struct {
+		glob string
+		segs []string
+	}
+	var walkPatterns []walkPattern
+	for _, glob := range m.globs {
+		if _, seen := m.matches[glob]; seen {
+			continue
+		}
+		m.matches[glob] = nil
+		expanded, err := output.ExpandBraces(glob)
+		if err != nil {
+			continue
+		}
+		for _, g := range expanded {
+			if !strings.Contains(g, "**") {
+				found, _ := filepath.Glob(filepath.Join(m.root, g))
+				m.matches[glob] = append(m.matches[glob], found...)
+				continue
+			}
+			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(path.Clean(filepath.ToSlash(g)), "/")})
+		}
+	}
+	if len(walkPatterns) == 0 {
+		return
+	}
+	filepath.WalkDir(m.root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(m.root, p)
+		if err != nil {
+			return nil
+		}
+		segs := strings.Split(filepath.ToSlash(rel), "/")
+		matchedGlob := map[string]bool{}
+		for _, wp := range walkPatterns {
+			if matchedGlob[wp.glob] {
+				continue
+			}
+			if matchSegments(wp.segs, segs) {
+				m.matches[wp.glob] = append(m.matches[wp.glob], p)
+				matchedGlob[wp.glob] = true
+			}
+		}
+		return nil
+	})
 }
 
 // globFiles returns files under root matching glob. Unlike filepath.Glob it

@@ -159,19 +159,13 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// writeSkillFiles writes per-domain skill files under skillsDir.
-// skillsDir is the root under which per-domain subdirs are created (e.g.
-// ".claude/skills" → ".claude/skills/api/SKILL.md").
 // Prepared is a run that has passed every pre-write check. Validate
-// produces it and its Write method performs the run, so the checks run
-// once and the tree written is the one that passed.
+// produces it and its Write method performs the run, so the name and glob
+// checks run once and the tree written is the one that passed.
 type Prepared struct {
-	skillsDir string
-	shared    bool
-	owner     string
-	globs     map[string][]string
-	domains   map[string]bool
-	opts      Options
+	plan     *plan
+	opts     Options
+	warnings []string
 }
 
 // Validate runs every check a run performs before it touches the skills
@@ -185,37 +179,41 @@ func Validate(s state.State, outputDir string, opts Options) (*Prepared, error) 
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
-	domains := map[string]bool{}
-	for d := range p.byDomain {
-		domains[d] = true
-	}
-	return &Prepared{skillsDir: skillsDir, shared: shared, owner: p.owner, globs: p.globs, domains: domains, opts: opts}, nil
+	return &Prepared{plan: p, opts: opts}, nil
 }
 
 // Write performs the validated run. s is the state Validate saw, possibly
 // enriched since (example anchoring adds file references); its set of
 // approved domains must be unchanged, since those are what was checked.
+// The on-disk checks are repeated first, because the anchoring step can
+// take long enough for the skills tree to change underneath the run.
 func (pr *Prepared) Write(s state.State) error {
-	p := buildPlan(s, pr.skillsDir, pr.shared, pr.opts)
-	if len(p.byDomain) != len(pr.domains) {
+	validated := pr.plan
+	p := buildPlan(s, validated.skillsDir, validated.shared, pr.opts)
+	if len(p.byDomain) != len(validated.byDomain) {
 		return fmt.Errorf("state changed since validation (domain set differs); rerun")
 	}
 	for domain, rules := range p.byDomain {
-		if !pr.domains[domain] {
+		if _, ok := validated.byDomain[domain]; !ok {
 			return fmt.Errorf("state changed since validation: domain %q was not validated; rerun", domain)
 		}
 		sortRules(rules)
 	}
+	p.globs = validated.globs
 
 	// Repair whatever an interrupted earlier run left (a domain mid-swap,
-	// a stale staging tree) before writing. Recovery only restores or
-	// clears this run's own generated trees, so it cannot turn the tree
-	// that passed validation into one that would have failed.
-	if err := recoverTransients(pr.skillsDir, pr.owner, !pr.shared); err != nil {
+	// a stale staging tree) before writing, then re-check the tree as it
+	// now stands.
+	warnings, err := recoverTransients(p.skillsDir, p.owner, !p.shared)
+	pr.warnings = append(pr.warnings, warnings...)
+	if err != nil {
+		return err
+	}
+	if err := p.validateDisk(); err != nil {
 		return err
 	}
 	for domain, rules := range p.byDomain {
-		if err := writeSkillFile(domain, rules, pr.globs[domain], pr.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, pr.owner, pr.opts); err != nil {
+		if err := writeSkillFile(domain, rules, p.globs[domain], p.skillsDir, s.DomainDescriptions[domain], s.LastExtractedPRNumber, p.owner, pr.opts); err != nil {
 			return err
 		}
 	}
@@ -225,7 +223,14 @@ func (pr *Prepared) Write(s state.State) error {
 	// the overwrite guard: inside the repo's own tree every generated skill
 	// is ours whatever it is stamped with; in a shared directory only those
 	// stamped for this run are.
-	return pruneStaleSkills(pr.skillsDir, p.byDomain, pr.owner, !pr.shared)
+	return pruneStaleSkills(p.skillsDir, p.byDomain, p.owner, !p.shared)
+}
+
+// Warnings reports conditions the run could not resolve on its own and the
+// user should hear about (a retired copy left in a shared directory because
+// another repository now holds its slot). Available after Write.
+func (pr *Prepared) Warnings() []string {
+	return pr.warnings
 }
 
 // resolveDirs applies the Options defaults for the skills directory and
@@ -288,7 +293,6 @@ func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan
 // map-ordered subset. It also sorts each domain's rules into rendering
 // order and records the expanded globs.
 func (p *plan) validate() error {
-	skillsDir, shared, owner := p.skillsDir, p.shared, p.owner
 	byFold := map[string]string{}
 	for domain, rules := range p.byDomain {
 		if !validDomain(domain) {
@@ -315,6 +319,18 @@ func (p *plan) validate() error {
 			}
 			p.globs[domain] = globs
 		}
+	}
+	return p.validateDisk()
+}
+
+// validateDisk checks each domain's slot in the skills tree: nothing that
+// this generator did not write is overwritten, symlinked slots are refused,
+// and in a shared directory another repository's skill is not clobbered.
+// It runs at validation and again just before writing, since the slow
+// anchoring step can sit between the two.
+func (p *plan) validateDisk() error {
+	skillsDir, shared, owner := p.skillsDir, p.shared, p.owner
+	for domain := range p.byDomain {
 		// A directory already at this path that this generator did not
 		// write is someone's hand-authored skill (or hand-kept material);
 		// overwriting it and wiping its examples/ and rules/ would destroy
@@ -380,7 +396,20 @@ func OwnerKey(owner, repo string) string {
 	if owner == "" || repo == "" {
 		return ""
 	}
-	return strings.ToLower(owner + "/" + repo)
+	return NormalizeOwnerKey(owner + "/" + repo)
+}
+
+// NormalizeOwnerKey turns a user- or model-supplied "owner/repo" (any case,
+// optional surrounding slashes) into the canonical stamp value, or "" when
+// it is not a usable key: a stray path segment, whitespace, or a newline
+// would produce a stamp that never parses back, and an unparseable stamp
+// in a shared directory would make the skill unprunable by its own repo.
+func NormalizeOwnerKey(s string) string {
+	key := strings.ToLower(strings.Trim(s, "/"))
+	if !ValidOwnerKey(key) {
+		return ""
+	}
+	return key
 }
 
 // ValidOwnerKey reports whether s is a value OwnerKey could have produced:
@@ -481,13 +510,13 @@ func liveOfRetired(name string) (string, bool) {
 // and is removed. In a shared directory a transient is only touched when it
 // is ours to touch: stamped for this owner, unstamped, or without a
 // SKILL.md at all (too incomplete to belong to anyone).
-func recoverTransients(skillsDir, owner string, anyOwner bool) error {
+func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []string, err error) {
 	entries, err := os.ReadDir(skillsDir)
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -499,7 +528,7 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 		// got retired, a stray file) holds nothing to restore or carry.
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 			if err := os.RemoveAll(dir); err != nil {
-				return err
+				return warnings, err
 			}
 			continue
 		}
@@ -516,11 +545,11 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 			if fi, err := os.Stat(live); err != nil || !fi.IsDir() {
 				if _, err := os.Lstat(live); err == nil {
 					if err := os.RemoveAll(live); err != nil {
-						return err
+						return warnings, err
 					}
 				}
 				if err := os.Rename(dir, live); err != nil {
-					return err
+					return warnings, err
 				}
 				continue
 			}
@@ -528,21 +557,22 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) error {
 			// have been taken by another repository (the guard reports that
 			// conflict when the domain is live for this run); our retired
 			// copy must not be folded into their skill, so it is left as
-			// is for the user to resolve.
+			// is and the user is told where it is.
 			if !anyOwner {
 				if info := inspectSkill(filepath.Join(live, "SKILL.md"), ""); info.stamped && info.stamp != owner {
+					warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s now belongs to repository %q; move anything you want out of it and delete it", dir, liveName, live, info.stamp))
 					continue
 				}
 			}
 			if err := carryOver(dir, live); err != nil {
-				return err
+				return warnings, err
 			}
 		}
 		if err := os.RemoveAll(dir); err != nil {
-			return err
+			return warnings, err
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 // generatedEntries are the top-level names a rendered skill directory
@@ -581,7 +611,7 @@ func carryOver(from, to string) error {
 // domain (or one whose rules were all rejected) leaves its old SKILL.md
 // behind, and the consuming agent keeps auto-loading conventions that state
 // no longer holds. Only directories whose SKILL.md this generator wrote for
-// this repository (see isGeneratedSkill) are candidates; hand-authored
+// this repository (see inspectSkill) are candidates; hand-authored
 // skills and other repositories' generated skills sharing the root are
 // never removed.
 //
@@ -641,9 +671,27 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		if !anyOwner && (!info.stamped || info.stamp != owner) {
 			continue
 		}
-		if err := os.RemoveAll(dir); err != nil {
+		if err := removeGenerated(dir); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// removeGenerated removes what the generator wrote in a stale skill
+// directory (SKILL.md, examples/, rules/) and then the directory itself if
+// nothing else is in it. Files a user kept beside the generated ones are
+// left where they are, under the same carry-over guarantee regeneration
+// gives them; without a SKILL.md the directory is no longer a skill and
+// nothing auto-loads from it.
+func removeGenerated(dir string) error {
+	for name := range generatedEntries {
+		if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	if isEmptyDir(dir) {
+		return os.RemoveAll(dir)
 	}
 	return nil
 }
@@ -764,7 +812,7 @@ func sortRules(rules []state.Rule) {
 }
 
 // writeSkillFile renders one domain; rules must already be in rendering
-// order (writeSkillFiles sorts them before collecting globs).
+// order (plan.validate sorts them before collecting globs).
 func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
 	if domain == UniversalSkillName {
 		// No paths gate: these rules apply to every file, so the skill must
@@ -1267,19 +1315,24 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 // ("{a,}", "{,a}", "{}" — the shell idiom for "or nothing", which a paths
 // gate cannot express and which would emit a glob matching nothing).
 func ExpandBraces(glob string) ([]string, error) {
-	open := strings.Index(glob, "{")
-	if open < 0 {
-		if strings.Contains(glob, "}") {
-			return nil, errUnbalancedBrace
-		}
-		return []string{glob}, nil
-	}
-	depth := 0
-	for i := open; i < len(glob); i++ {
+	open, depth := -1, 0
+	for i := 0; i < len(glob); i++ {
 		switch glob[i] {
+		case '[':
+			// A character class may legitimately contain braces
+			// ("[{}]"); skip to its end so they are not read as a group.
+			if end := classEnd(glob, i); end > i {
+				i = end
+			}
 		case '{':
+			if depth == 0 {
+				open = i
+			}
 			depth++
 		case '}':
+			if depth == 0 {
+				return nil, errUnbalancedBrace
+			}
 			depth--
 			if depth == 0 {
 				var out []string
@@ -1297,7 +1350,10 @@ func ExpandBraces(glob string) ([]string, error) {
 			}
 		}
 	}
-	return nil, errUnbalancedBrace
+	if depth != 0 {
+		return nil, errUnbalancedBrace
+	}
+	return []string{glob}, nil
 }
 
 var (
@@ -1305,12 +1361,39 @@ var (
 	errEmptyAlternative = fmt.Errorf("has an empty brace alternative, which a paths gate cannot express; list the alternatives explicitly and rerun")
 )
 
-// splitTopLevel splits s on commas that are not inside a nested brace group.
+// classEnd returns the index of the ']' closing the character class that
+// opens at s[open], or -1 when the class is not closed (in which case the
+// '[' is an ordinary character, as path.Match treats it).
+func classEnd(s string, open int) int {
+	i := open + 1
+	if i < len(s) && (s[i] == '^' || s[i] == '!') {
+		i++
+	}
+	if i < len(s) && s[i] == ']' {
+		i++ // a leading ']' is a literal member
+	}
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case ']':
+			return i
+		}
+	}
+	return -1
+}
+
+// splitTopLevel splits s on commas that are not inside a nested brace group
+// or a character class.
 func splitTopLevel(s string) []string {
 	var parts []string
 	depth, start := 0, 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case '[':
+			if end := classEnd(s, i); end > i {
+				i = end
+			}
 		case '{':
 			depth++
 		case '}':

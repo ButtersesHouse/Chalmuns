@@ -552,6 +552,11 @@ $BIN write-outputs \
   [--rag-hints] [--rag]
 ```
 
+If the command prints `warning:` lines on stderr (it succeeded, but found something
+it could not resolve on its own, such as a leftover copy of a skill in a shared
+directory whose slot another repo now holds), relay each warning to the user
+verbatim in the Step 13 summary.
+
 This writes:
 - `<skills-dir>/<domain>/SKILL.md` — one skill per domain, generated with progressive
   disclosure so the always-loaded body stays lean (skill bodies are a recurring token
@@ -583,7 +588,9 @@ This writes:
     `<skills-dir>/<domain>/` whose SKILL.md carries that marker (or the fixed header
     sentence older versions of the generator wrote) but whose domain no longer has
     approved rules (renamed, merged, or all rejected), so an outdated skill cannot
-    keep auto-loading. Inside the repo's own tree the stamp is ignored for this (a
+    keep auto-loading. Only the generated entries (`SKILL.md`, `examples/`, `rules/`)
+    are removed; any other file a user kept in that directory stays, and the
+    directory is removed only once it is empty. Inside the repo's own tree the stamp is ignored for this (a
     fork or renamed repo still prunes skills stamped with its old identity); in a
     skills directory **outside** the repo, only skills carrying this repo's stamp are
     pruned. Skills the generator did not write (hand-written ones sharing the

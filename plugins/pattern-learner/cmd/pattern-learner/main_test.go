@@ -72,7 +72,7 @@ func TestAnchorSingleRule_doubleStarGlob(t *testing.T) {
 		DoExamples: []state.Example{{Code: code, Language: "go"}},
 		Target:     state.Target{Location: "api", FileGlob: []string{"src/api/**/*.go"}},
 	}
-	anchorSingleRule(r, root)
+	anchorSingleRule(r, root, newGlobMatcher(root, r.Target.FileGlob))
 	want := "src/api/handlers/users.go:L4"
 	if r.DoExamples[0].FileRef != want {
 		t.Errorf("FileRef: want %q, got %q", want, r.DoExamples[0].FileRef)
@@ -275,5 +275,26 @@ func TestWriteOutputsRefusesMissingState(t *testing.T) {
 	err := runWriteOutputs([]string{"--state", filepath.Join(dir, "missing.json"), "--output-dir", dir})
 	if err == nil {
 		t.Fatal("expected an error for a missing state file")
+	}
+}
+
+// One matcher resolves every glob with a single walk, and globs it was
+// not built with still resolve.
+func TestGlobMatcher(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"src/api/h.go":   "a\n",
+		"src/web/h.go":   "b\n",
+		"docs/readme.md": "c\n",
+	})
+	m := newGlobMatcher(root, []string{"src/{api,web}/**/*.go", "src/api/**/*.go", "src/api/**/*.go"})
+	if got := m.files("src/{api,web}/**/*.go"); len(got) != 2 {
+		t.Errorf("brace glob: got %v", got)
+	}
+	if got := m.files("src/api/**/*.go"); len(got) != 1 || got[0] != filepath.Join(root, "src/api/h.go") {
+		t.Errorf("plain glob: got %v", got)
+	}
+	if got := m.files("docs/*.md"); len(got) != 1 {
+		t.Errorf("unregistered glob should still resolve: got %v", got)
 	}
 }
