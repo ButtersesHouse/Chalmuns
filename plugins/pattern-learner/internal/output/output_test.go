@@ -885,6 +885,39 @@ func TestSharedSkillsDirPrunesOnlyOwnSkills(t *testing.T) {
 	}
 }
 
+// In a shared directory an unstamped generated skill (written before
+// stamping) cannot be attributed to a repository, so no run prunes it; a
+// run whose live domain collides with it regenerates it, which is the only
+// way it ever becomes stamped.
+func TestSharedDirLeavesUnstampedSkillsToTheirOwner(t *testing.T) {
+	shared := filepath.Join(t.TempDir(), "shared")
+	legacy := filepath.Join(shared, "ui")
+	if err := os.MkdirAll(legacy, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := "---\nname: ui\ndescription: UI conventions.\n---\n\n# Ui Conventions\n\n## Rules\n\n" +
+		generatedBodyLines[0] + "\n\n### Old rule\n\nDo it.\n"
+	if err := os.WriteFile(filepath.Join(legacy, "SKILL.md"), []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a := stateWith(approvedRule("A rule", "do it", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(legacy, "SKILL.md")); err != nil {
+		t.Error("an unstamped skill in a shared directory must not be pruned by another repo")
+	}
+	b := stateWith(approvedRule("B rule", "do it", "ui", "stated", 1))
+	b.Repo = state.RepoInfo{Owner: "acme", Repo: "beta"}
+	if err := Write(b, t.TempDir(), Options{SkillsDir: shared}); err != nil {
+		t.Fatalf("a live domain regenerates an unstamped generated skill: %v", err)
+	}
+	if got := readFile(t, filepath.Join(legacy, "SKILL.md")); !strings.Contains(got, ownerLine("acme/beta")) {
+		t.Error("regenerated skill should now be stamped")
+	}
+}
+
 // Inside the repo's own tree, ownership ignores the stamp for pruning as
 // well as for overwriting: after a fork or rename, a stale skill stamped
 // with the previous identity is still pruned.
@@ -1046,7 +1079,8 @@ func TestFrontmatterNameParsing(t *testing.T) {
 }
 
 func TestValidDomainRejectsOSInvalidNames(t *testing.T) {
-	for _, bad := range []string{strings.Repeat("a", 256), "api\x00", "api\tx", "a:b", "a?b", "a*b", "a<b", "a|b", `a"b`} {
+	for _, bad := range []string{strings.Repeat("a", 256), "api\x00", "api\tx", "a:b", "a?b", "a*b", "a<b", "a|b", `a"b`,
+		"aux", "CON", "com1", "nul.md", "lpt9", "api.", "api "} {
 		if validDomain(bad) {
 			t.Errorf("validDomain(%q) should be false", bad)
 		}

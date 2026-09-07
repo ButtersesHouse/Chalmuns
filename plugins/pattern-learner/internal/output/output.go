@@ -183,13 +183,17 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 		// conventions. A directory with no SKILL.md is foreign too, unless
 		// it is the empty shell an interrupted first write leaves behind.
 		skillDir := filepath.Join(skillsDir, domain)
-		if _, err := os.Stat(skillDir); err == nil && !isGeneratedSkill(filepath.Join(skillDir, "SKILL.md"), domain, "", true) && !isEmptyShell(skillDir) {
+		existing := inspectSkill(filepath.Join(skillDir, "SKILL.md"), domain)
+		if _, err := os.Stat(skillDir); err == nil && !existing.generated && !isEmptyShell(skillDir) {
 			return fmt.Errorf("%s exists and was not written by pattern-learner; refusing to overwrite it — rename the domain, move that directory, or delete it if it is a leftover from an older pattern-learner build, then rerun", skillDir)
 		}
 		if shared {
 			// Any stamp that is not ours, including when this run has no
-			// identity of its own, marks another repository's skill.
-			if stamped, ok := stampedOwner(filepath.Join(skillDir, "SKILL.md")); ok && stamped != "" && stamped != owner {
+			// identity of its own, marks another repository's skill. An
+			// unstamped generated skill (written before stamping) cannot be
+			// attributed; regenerating it is the only way to migrate it, and
+			// its content is reproducible from whichever state wrote it.
+			if existing.stamped && existing.stamp != owner {
 				runFor := owner
 				if runFor == "" {
 					runFor = "an unidentified repository (no --repo, state.repo, or git remote)"
@@ -198,7 +202,7 @@ func writeSkillFiles(s state.State, skillsDir string, shared bool, opts Options)
 				if domain == UniversalSkillName {
 					remedy = "the universal '" + UniversalSkillName + "' skill has a fixed name, so give each repository its own skills directory"
 				}
-				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s", skillDir, stamped, runFor, remedy)
+				return fmt.Errorf("%s was generated for repository %q and this run is for %s; the shared skills directory cannot hold both under one domain name — %s", skillDir, existing.stamp, runFor, remedy)
 			}
 		}
 	}
@@ -263,21 +267,6 @@ func parseOwnerLine(line string) (string, bool) {
 	return strings.TrimSuffix(strings.TrimPrefix(line, ownerStampPrefix), ownerStampSuffix), true
 }
 
-// stampedOwner returns the owner stamped into the SKILL.md at path, and
-// whether the file carries a stamp.
-func stampedOwner(path string) (string, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if owner, ok := parseOwnerLine(strings.TrimSpace(line)); ok {
-			return owner, true
-		}
-	}
-	return "", false
-}
-
 // isEmptyShell reports whether dir holds nothing but what an interrupted
 // first write of ours could leave: no entries, or only the SKILL.md.tmp of
 // an atomicWrite that never reached its rename. (SKILL.md is written before
@@ -303,6 +292,12 @@ func isEmptyShell(dir string) bool {
 // this repository (see isGeneratedSkill) are candidates; hand-authored
 // skills and other repositories' generated skills sharing the root are
 // never removed.
+//
+// With anyOwner set (the repo's own tree) every generated skill is ours.
+// Otherwise (a shared directory) only a skill stamped for this owner is:
+// an unstamped one was written before stamping by some repository that
+// cannot be identified, and deleting another repository's conventions is
+// worse than leaving a stale skill for its owner to regenerate or remove.
 //
 // An entry is live when it exactly names a live domain. It is also treated
 // as live when it names one case-insensitively and the exact-cased directory
@@ -340,7 +335,11 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 			continue
 		}
 		dir := filepath.Join(skillsDir, e.Name())
-		if !isGeneratedSkill(filepath.Join(dir, "SKILL.md"), e.Name(), owner, anyOwner) {
+		info := inspectSkill(filepath.Join(dir, "SKILL.md"), e.Name())
+		if !info.generated {
+			continue
+		}
+		if !anyOwner && (!info.stamped || info.stamp != owner) {
 			continue
 		}
 		if err := os.RemoveAll(dir); err != nil {
@@ -373,39 +372,46 @@ func frontmatterName(content string) (string, bool) {
 	return name, name != ""
 }
 
-// isGeneratedSkill reports whether the SKILL.md at path is one this package
-// wrote for the skill directory dirName on behalf of the repository owner.
-// All of the following must hold:
+// skillInfo is what one read of a SKILL.md tells us about its provenance.
+type skillInfo struct {
+	// generated: the file carries the generator's fingerprint and its
+	// frontmatter name matches its directory.
+	generated bool
+	// stamp is the repository named by the owner stamp line, when stamped.
+	stamp   string
+	stamped bool
+}
+
+// inspectSkill reads the SKILL.md at path once and reports whether this
+// package wrote it for the skill directory dirName, and for which
+// repository. It is generated when both hold:
 //
 //   - the frontmatter name equals dirName (ignoring case, since on a
 //     case-insensitive filesystem the path may resolve through an older
 //     casing of the directory), so a generated skill a user copied elsewhere
 //     and adopted ("api-style/" carrying name "api") is not mistaken for the
-//     generator's own output;
-//   - if the file carries an owner stamp, it names this owner (unless
-//     anyOwner is set), so a skills directory shared by several repositories
-//     is only ever pruned by the repository that wrote each skill (a file
-//     without a stamp predates stamping and is treated as ours); and
+//     generator's own output; and
 //   - the body carries GeneratedMarker or, for a file from a build that
 //     predates the marker, one of generatedBodyLines as a whole line.
 //
 // A generated skill kept under its original directory name and hand-edited
 // is still recognised: that directory is documented as generator-owned and
-// regenerated wholesale, so its edits were never safe.
-func isGeneratedSkill(path, dirName, owner string, anyOwner bool) bool {
+// regenerated wholesale, so its edits were never safe. Whether a generated
+// skill is *ours* is the caller's decision, made from the stamp.
+func inspectSkill(path, dirName string) skillInfo {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return skillInfo{}
 	}
 	content := string(data)
-	if name, ok := frontmatterName(content); !ok || !strings.EqualFold(name, dirName) {
-		return false
-	}
+	var info skillInfo
+	name, ok := frontmatterName(content)
+	nameMatches := ok && strings.EqualFold(name, dirName)
 	fingerprinted := false
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
-		if stamped, ok := parseOwnerLine(line); ok && !anyOwner && stamped != owner {
-			return false
+		if stamped, ok := parseOwnerLine(line); ok && !info.stamped {
+			info.stamp, info.stamped = stamped, true
 		}
 		if line == GeneratedMarker {
 			fingerprinted = true
@@ -417,7 +423,15 @@ func isGeneratedSkill(path, dirName, owner string, anyOwner bool) bool {
 			}
 		}
 	}
-	return fingerprinted
+	info.generated = nameMatches && fingerprinted
+	return info
+}
+
+// isGeneratedSkill reports whether the SKILL.md at path was generated for
+// dirName and, unless anyOwner is set, is stamped for owner or unstamped.
+func isGeneratedSkill(path, dirName, owner string, anyOwner bool) bool {
+	info := inspectSkill(path, dirName)
+	return info.generated && (anyOwner || !info.stamped || info.stamp == owner)
 }
 
 func writeSkillFile(domain string, rules []state.Rule, globs []string, skillsDir string, override string, watermark int, owner string, opts Options) error {
@@ -981,12 +995,32 @@ func validDomain(domain string) bool {
 			return false
 		}
 	}
-	return !strings.ContainsAny(domain, `/\<>:"|?*`)
+	if strings.ContainsAny(domain, `/\<>:"|?*`) {
+		return false
+	}
+	// Windows: a trailing dot or space is stripped by the filesystem, and
+	// the legacy device names are reserved whatever extension follows.
+	if strings.HasSuffix(domain, ".") || strings.HasSuffix(domain, " ") {
+		return false
+	}
+	base := strings.ToLower(domain)
+	if dot := strings.Index(base, "."); dot >= 0 {
+		base = base[:dot]
+	}
+	return !windowsReservedNames[base]
 }
 
 // maxDomainBytes is the file-name length limit common to the major
 // filesystems (255 bytes), which a directory segment must respect.
 const maxDomainBytes = 255
+
+var windowsReservedNames = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
 
 // yamlQuote renders s as a YAML double-quoted scalar. It is strconv.Quote:
 // every escape Go emits (\a \b \f \n \r \t \v \\ \" \xNN \uNNNN \UNNNNNNNN)

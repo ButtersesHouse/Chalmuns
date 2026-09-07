@@ -600,7 +600,10 @@ This writes:
     universal `conventions` skill has a fixed name, so two repos with universal rules
     can only share a skills directory by giving each its own; and a run with no repo
     identity (no `--repo`, empty `state.repo`, no git remote) can neither overwrite
-    nor prune any stamped skill there.
+    nor prune any stamped skill there. Skills written into a shared directory by a
+    pre-0.3.0 build carry no stamp and are never pruned by any repo (they cannot be
+    attributed); each repo's next run re-stamps the ones it still owns, and any left
+    over must be removed by hand.
   - **Globs must not contain commas.** `paths` is one comma-separated string, so
     `write-outputs` expands brace groups (`src/{a,b}/**` → two globs) and refuses
     the run for any glob that still contains a comma (e.g. a `[a,b]` character
@@ -608,8 +611,9 @@ This writes:
   - **Domain names must be single directory segments.** `write-outputs` refuses the
     whole run, writing nothing, if any approved rule's `target.location` contains a
     path separator, is `.`/`..`, exceeds 255 bytes, contains control characters or
-    any of `< > : " | ? *`, or differs from another domain only by letter case.
-    Re-target those rules in state and rerun.
+    any of `< > : " | ? *`, ends in a dot or space, is a Windows reserved device name
+    (`con`, `aux`, `nul`, `com1`…), or differs from another domain only by letter
+    case. Re-target those rules in state and rerun.
   - When `--rag-hints` is set, each rule (wherever its body lands) includes a
     `cursor-agent` command for retrieving live codebase examples at skill-use time.
 

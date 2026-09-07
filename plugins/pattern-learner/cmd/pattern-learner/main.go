@@ -384,13 +384,15 @@ func anchorExamples(s *state.State, outputDir string) {
 // subagents to emit (e.g. "src/api/**/*.go") — and brace groups, expanded
 // the same way the skill frontmatter expands them.
 func globFiles(root, glob string) []string {
-	if expanded := output.ExpandBraces(glob); len(expanded) > 1 || expanded[0] != glob {
-		var out []string
-		for _, g := range expanded {
-			out = append(out, globFiles(root, g)...)
-		}
-		return out
+	var out []string
+	for _, g := range output.ExpandBraces(glob) {
+		out = append(out, globFilesPlain(root, g)...)
 	}
+	return out
+}
+
+// globFilesPlain matches one brace-free glob.
+func globFilesPlain(root, glob string) []string {
 	if !strings.Contains(glob, "**") {
 		matches, _ := filepath.Glob(filepath.Join(root, glob))
 		return matches
