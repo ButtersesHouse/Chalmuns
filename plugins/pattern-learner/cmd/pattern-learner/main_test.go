@@ -632,3 +632,43 @@ func mustEval(t *testing.T, p string) string {
 	}
 	return r
 }
+
+// A flag given in equals form must be honoured, and an unknown or
+// misspelled flag must be an error rather than a silent write to the
+// default location.
+func TestFlagParsingIsStrict(t *testing.T) {
+	if got := flagValue([]string{"--skills-dir=custom"}, "--skills-dir", "def"); got != "custom" {
+		t.Errorf("equals form: got %q", got)
+	}
+	if got := flagValue([]string{"--skills-dir", "custom"}, "--skills-dir", "def"); got != "custom" {
+		t.Errorf("space form: got %q", got)
+	}
+	if got := flagValue([]string{"--other", "x"}, "--skills-dir", "def"); got != "def" {
+		t.Errorf("absent: got %q", got)
+	}
+	// A value that itself looks like a flag is not mistaken for one.
+	if err := checkFlags([]string{"--state", "--weird-name"}, []string{"--state"}, nil); err != nil {
+		t.Errorf("a flag-shaped value should be consumed, got %v", err)
+	}
+	for _, args := range [][]string{
+		{"--skils-dir", "foo"},          // typo
+		{"--skills-dirr=foo"},           // typo, equals form
+		{"--state", "s.json", "--nope"}, // unknown bool
+	} {
+		if err := checkFlags(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err == nil {
+			t.Errorf("%v: expected an unknown-flag error", args)
+		}
+	}
+	for _, args := range [][]string{
+		{"--state", "s.json", "--skills-dir", "d", "--create"},
+		{"--state=s.json", "--skills-dir=d", "--create"},
+		{},
+	} {
+		if err := checkFlags(args, []string{"--state", "--skills-dir"}, []string{"--create"}); err != nil {
+			t.Errorf("%v: expected acceptance, got %v", args, err)
+		}
+	}
+	if err := checkFlags([]string{"--state"}, []string{"--state"}, nil); err == nil {
+		t.Error("a value flag with no value should error")
+	}
+}

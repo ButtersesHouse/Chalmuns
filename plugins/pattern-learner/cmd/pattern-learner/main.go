@@ -81,6 +81,9 @@ func runDetectRepo() error {
 }
 
 func runStateRead(args []string) error {
+	if err := checkFlags(args, []string{"--state"}, nil); err != nil {
+		return err
+	}
 	path := flagValue(args, "--state", "")
 	if path == "" {
 		return fmt.Errorf("--state required")
@@ -95,6 +98,9 @@ func runStateRead(args []string) error {
 }
 
 func runStateWrite(args []string) error {
+	if err := checkFlags(args, []string{"--state"}, nil); err != nil {
+		return err
+	}
 	path := flagValue(args, "--state", "")
 	if path == "" {
 		return fmt.Errorf("--state required")
@@ -112,6 +118,11 @@ func runStateWrite(args []string) error {
 }
 
 func runWriteOutputs(args []string) error {
+	if err := checkFlags(args,
+		[]string{"--state", "--output-dir", "--skills-dir", "--repo"},
+		[]string{"--rag", "--rag-hints"}); err != nil {
+		return err
+	}
 	statePath := flagValue(args, "--state", "")
 	if statePath == "" {
 		return fmt.Errorf("--state required")
@@ -265,6 +276,11 @@ func resolveOwner(flag string, s state.State, repoRoot string) (string, error) {
 //
 //	[--skills-dir D] [--create]
 func runPromote(args []string) error {
+	if err := checkFlags(args,
+		[]string{"--state", "--output-dir", "--skills-dir", "--agents-md", "--claude-md"},
+		[]string{"--create"}); err != nil {
+		return err
+	}
 	statePath := flagValue(args, "--state", "")
 	if statePath == "" {
 		return fmt.Errorf("--state required")
@@ -695,14 +711,62 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-// flagValue extracts --flag value from an args slice.
+// flagValue extracts a flag's value from args, accepting both "--flag value"
+// and "--flag=value". Both forms are read because a caller who writes the
+// equals form and is not understood would otherwise have the flag silently
+// ignored and the run write somewhere else entirely.
 func flagValue(args []string, flag, def string) string {
+	prefix := flag + "="
 	for i, a := range args {
 		if a == flag && i+1 < len(args) {
 			return args[i+1]
 		}
+		if strings.HasPrefix(a, prefix) {
+			return strings.TrimPrefix(a, prefix)
+		}
 	}
 	return def
+}
+
+// checkFlags rejects any argument that looks like a flag this subcommand
+// does not know. Silently ignoring a typo means writing generated skills to
+// the default location while the user believes they went somewhere else, so
+// an unrecognised flag is an error rather than a no-op. valueFlags take a
+// following value; boolFlags stand alone.
+func checkFlags(args []string, valueFlags, boolFlags []string) error {
+	known := map[string]bool{}
+	takesValue := map[string]bool{}
+	for _, f := range valueFlags {
+		known[f], takesValue[f] = true, true
+	}
+	for _, f := range boolFlags {
+		known[f] = true
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			continue // a positional argument, or a value consumed below
+		}
+		name := a
+		inline := false
+		if eq := strings.Index(a, "="); eq >= 0 {
+			name, inline = a[:eq], true
+		}
+		if !known[name] {
+			return fmt.Errorf("unknown flag %q; this subcommand accepts %s", name,
+				strings.Join(append(append([]string{}, valueFlags...), boolFlags...), ", "))
+		}
+		if takesValue[name] {
+			if inline {
+				continue
+			}
+			if i+1 >= len(args) {
+				return fmt.Errorf("flag %s needs a value", name)
+			}
+			i++ // skip the value so it is not read as a flag
+		}
+	}
+	return nil
 }
 
 func dirOf(path string) string {
