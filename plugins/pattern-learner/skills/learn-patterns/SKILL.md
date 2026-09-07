@@ -555,10 +555,9 @@ $BIN write-outputs \
   [--rag-hints] [--rag]
 ```
 
-`write-outputs` holds an exclusive lock file, `<skills-dir>/.pattern-learner.lock`,
-while it writes, so two runs cannot interleave in one skills directory. If it refuses
-with "another pattern-learner run is writing", another run is in progress: wait for
-it. A lock older than ten minutes belongs to a dead run and is broken automatically.
+Do not run `write-outputs` twice at once against one skills directory: there is no
+lock, and two runs can swap a domain out from under each other. The single-agent
+pipeline these steps describe never does this.
 
 If the command prints `warning:` lines on stderr (it succeeded, but found something
 it could not resolve on its own, such as a leftover copy of a skill in a shared

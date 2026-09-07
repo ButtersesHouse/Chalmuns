@@ -2191,35 +2191,26 @@ func TestEscapesRoot(t *testing.T) {
 	}
 }
 
-// A fresh lock means another run is writing; a stale one is broken.
-func TestSkillsDirLock(t *testing.T) {
+// A run leaves no bookkeeping file of its own in the skills directory:
+// Claude Code reads that directory, and an earlier exclusive-lock file was
+// removed because its own release could delete a successor's lock.
+func TestNoBookkeepingFilesLeftInSkillsDir(t *testing.T) {
 	dir := t.TempDir()
 	skills := filepath.Join(dir, ".claude", "skills")
-	release, err := lockSkillsDir(skills)
+	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(skills)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err == nil || !strings.Contains(err.Error(), "another pattern-learner run") {
-		t.Errorf("a held lock should refuse the run, got %v", err)
-	}
-	release()
-	if err := Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{}); err != nil {
-		t.Fatalf("released lock should allow the run: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(skills, lockName)); !os.IsNotExist(err) {
-		t.Error("the lock should be released after the run")
-	}
-	// A stale lock from a dead run is broken.
-	lock := filepath.Join(skills, lockName)
-	if err := os.WriteFile(lock, []byte("pid 1\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * abandonedAfter)
-	if err := os.Chtimes(lock, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if err := Write(stateWith(approvedRule("Rule", "again", "api", "stated", 1)), dir, Options{}); err != nil {
-		t.Fatalf("a stale lock should be broken: %v", err)
+	for _, e := range entries {
+		if !e.IsDir() {
+			t.Errorf("unexpected file left in the skills directory: %s", e.Name())
+		}
+		if strings.HasPrefix(e.Name(), ".") {
+			t.Errorf("unexpected dotfile left in the skills directory: %s", e.Name())
+		}
 	}
 }
 
