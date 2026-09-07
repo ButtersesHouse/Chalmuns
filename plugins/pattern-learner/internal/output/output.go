@@ -76,11 +76,11 @@ type Options struct {
 // history, so publishing to it is an explicit, user-initiated step — see
 // Promote.
 func Write(s state.State, outputDir string, opts Options) error {
-	prepared, err := Validate(s, outputDir, opts)
+	prepared, err := Validate(&s, outputDir, opts)
 	if err != nil {
 		return err
 	}
-	return prepared.Write(s)
+	return prepared.Write()
 }
 
 // isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
@@ -159,13 +159,16 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// Prepared is a run that has passed every pre-write check. Validate
-// produces it and its Write method performs the run, so the name and glob
-// checks run once and the tree written is the one that passed.
+// Prepared is a run that has passed every pre-write check at the time
+// Validate ran. It keeps the state by pointer so the caller can enrich it
+// in place between validation and Write (example anchoring adds file
+// references); Write checks the state again as it stands at that point.
 type Prepared struct {
-	plan     *plan
-	opts     Options
-	warnings []string
+	state     *state.State
+	skillsDir string
+	shared    bool
+	opts      Options
+	warnings  []string
 }
 
 // Validate runs every check a run performs before it touches the skills
@@ -173,37 +176,28 @@ type Prepared struct {
 // already on disk) and returns the first failure, writing nothing. The CLI
 // calls it before the expensive example-anchoring step so a run that
 // would be refused does not walk the repository first.
-func Validate(s state.State, outputDir string, opts Options) (*Prepared, error) {
+func Validate(s *state.State, outputDir string, opts Options) (*Prepared, error) {
 	skillsDir, shared := resolveDirs(outputDir, opts)
-	p := buildPlan(s, skillsDir, shared, opts)
-	if err := p.validate(); err != nil {
+	if err := buildPlan(*s, skillsDir, shared, opts).validate(); err != nil {
 		return nil, err
 	}
-	return &Prepared{plan: p, opts: opts}, nil
+	return &Prepared{state: s, skillsDir: skillsDir, shared: shared, opts: opts}, nil
 }
 
-// Write performs the validated run. s is the state Validate saw, possibly
-// enriched since (example anchoring adds file references); its set of
-// approved domains must be unchanged, since those are what was checked.
-// The on-disk checks are repeated first, because the anchoring step can
-// take long enough for the skills tree to change underneath the run.
-func (pr *Prepared) Write(s state.State) error {
-	validated := pr.plan
-	p := buildPlan(s, validated.skillsDir, validated.shared, pr.opts)
-	if len(p.byDomain) != len(validated.byDomain) {
-		return fmt.Errorf("state changed since validation (domain set differs); rerun")
+// Write performs the run on the state as it now stands. The checks are
+// repeated: the pure ones because the state may have been enriched since
+// Validate, the on-disk ones because the anchoring step can take long
+// enough for the skills tree to change underneath the run.
+func (pr *Prepared) Write() error {
+	s := *pr.state
+	p := buildPlan(s, pr.skillsDir, pr.shared, pr.opts)
+	if err := p.validateRules(); err != nil {
+		return err
 	}
-	for domain, rules := range p.byDomain {
-		if _, ok := validated.byDomain[domain]; !ok {
-			return fmt.Errorf("state changed since validation: domain %q was not validated; rerun", domain)
-		}
-		sortRules(rules)
-	}
-	p.globs = validated.globs
 
 	// Repair whatever an interrupted earlier run left (a domain mid-swap,
-	// a stale staging tree) before writing, then re-check the tree as it
-	// now stands.
+	// a stale staging tree) before judging the tree, so the checks see
+	// every domain in its settled place.
 	warnings, err := recoverTransients(p.skillsDir, p.owner, !p.shared)
 	pr.warnings = append(pr.warnings, warnings...)
 	if err != nil {
@@ -290,9 +284,18 @@ func buildPlan(s state.State, skillsDir string, shared bool, opts Options) *plan
 
 // validate checks every domain before anything is written, so a bad name or
 // a collision fails the run with nothing written rather than after a
-// map-ordered subset. It also sorts each domain's rules into rendering
-// order and records the expanded globs.
+// map-ordered subset: first the pure checks on the state, then the tree.
 func (p *plan) validate() error {
+	if err := p.validateRules(); err != nil {
+		return err
+	}
+	return p.validateDisk()
+}
+
+// validateRules checks what depends on the state alone (domain names,
+// case collisions, globs), sorts each domain's rules into rendering order,
+// and records the expanded globs. It touches no files.
+func (p *plan) validateRules() error {
 	byFold := map[string]string{}
 	for domain, rules := range p.byDomain {
 		if !validDomain(domain) {
@@ -320,7 +323,7 @@ func (p *plan) validate() error {
 			p.globs[domain] = globs
 		}
 	}
-	return p.validateDisk()
+	return nil
 }
 
 // validateDisk checks each domain's slot in the skills tree: nothing that
@@ -562,16 +565,17 @@ func recoverTransients(skillsDir, owner string, anyOwner bool) (warnings []strin
 				continue
 			}
 			// The live slot is taken. Our retired copy is folded into it
-			// only when what is there is a generated skill we may
-			// regenerate anyway: inside the repo's tree any generated
-			// skill, in a shared directory one stamped for us. Anything
+			// only when what is there is a generated skill this run may
+			// regenerate anyway, by the same rule validateDisk applies:
+			// inside the repo's tree any generated skill, in a shared
+			// directory one stamped for us or not stamped at all. Anything
 			// else (a hand-written skill, another repository's) must not
 			// receive our files, so the copy is left and the user told.
 			liveInfo := inspectSkill(filepath.Join(live, "SKILL.md"), liveName)
-			ours := liveInfo.generated && (anyOwner || (liveInfo.stamped && liveInfo.stamp == owner))
+			ours := liveInfo.generated && (anyOwner || !liveInfo.stamped || liveInfo.stamp == owner)
 			if !ours {
 				holder := "was not written by pattern-learner"
-				if liveInfo.stamped && liveInfo.stamp != owner {
+				if liveInfo.generated {
 					holder = fmt.Sprintf("now belongs to repository %q", liveInfo.stamp)
 				}
 				warnings = append(warnings, fmt.Sprintf("%s holds this repository's previous %q skill (and any files kept beside it) from an interrupted run, but %s %s; move anything you want out of the leftover and delete it", dir, liveName, live, holder))

@@ -9,6 +9,11 @@ import (
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
 
+// globFiles resolves one glob through a matcher built for it alone.
+func globFiles(root, glob string) []string {
+	return newGlobMatcher(root, []string{glob}).files(glob)
+}
+
 // writeTree creates files (with contents) under root, making parent dirs.
 func writeTree(t *testing.T, root string, files map[string]string) {
 	t.Helper()

@@ -1344,36 +1344,38 @@ func TestInterruptedSwapIsRecovered(t *testing.T) {
 // the Prepared it returns writes the run it validated.
 func TestValidateReportsWithoutWriting(t *testing.T) {
 	dir := t.TempDir()
-	_, err := Validate(stateWith(
+	bad := stateWith(
 		approvedRule("Good", "do it", "api", "stated", 1),
 		approvedRule("Bad", "do it", "api/v2", "stated", 2),
-	), dir, Options{})
-	if err == nil {
+	)
+	if _, err := Validate(&bad, dir, Options{}); err == nil {
 		t.Fatal("expected a validation error")
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".claude")); !os.IsNotExist(err) {
 		t.Error("Validate must not create anything")
 	}
 	good := stateWith(approvedRule("Good", "do it", "api", "stated", 1))
-	prepared, err := Validate(good, dir, Options{})
+	prepared, err := Validate(&good, dir, Options{})
 	if err != nil {
 		t.Fatalf("valid state should pass: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".claude")); !os.IsNotExist(err) {
 		t.Error("Validate must not create anything")
 	}
-	// Enrichment after validation (what anchoring does) is fine ...
+	// Enrichment after validation (what anchoring does) is seen by Write
+	// through the pointer ...
 	good.Rules[0].DoExamples = []state.Example{{Code: "x()", Language: "go", FileRef: "a.go:L1"}}
-	if err := prepared.Write(good); err != nil {
+	if err := prepared.Write(); err != nil {
 		t.Fatalf("prepared write: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "api", "SKILL.md")); err != nil {
-		t.Error("prepared write should have written the skill")
+	if got := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "examples", "good.md")); !strings.Contains(got, "a.go:L1") {
+		t.Error("enrichment made after Validate should be written")
 	}
-	// ... but a different domain set is refused.
-	changed := stateWith(approvedRule("Other", "do it", "ui", "stated", 1))
-	if err := prepared.Write(changed); err == nil || !strings.Contains(err.Error(), "changed since validation") {
-		t.Errorf("a changed domain set must be refused, got %v", err)
+	// ... and so is a change that would have failed validation: Write
+	// re-checks rather than rendering a stale, never-validated gate.
+	good.Rules[0].Target.FileGlob = []string{"src/{a,b"}
+	if err := prepared.Write(); err == nil || !strings.Contains(err.Error(), "unbalanced brace") {
+		t.Errorf("a glob changed after validation must be re-checked, got %v", err)
 	}
 }
 
@@ -1745,7 +1747,8 @@ func TestPruneKeepsUserFiles(t *testing.T) {
 // anchoring window) is still refused.
 func TestPreparedWriteRechecksDisk(t *testing.T) {
 	dir := t.TempDir()
-	prepared, err := Validate(stateWith(approvedRule("Rule", "do it", "api", "stated", 1)), dir, Options{})
+	s := stateWith(approvedRule("Rule", "do it", "api", "stated", 1))
+	prepared, err := Validate(&s, dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1756,7 +1759,7 @@ func TestPreparedWriteRechecksDisk(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mine, "SKILL.md"), []byte("---\nname: api\ndescription: mine\n---\n\nMine.\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.Write(stateWith(approvedRule("Rule", "do it", "api", "stated", 1))); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+	if err := prepared.Write(); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
 		t.Errorf("expected the disk re-check to refuse, got %v", err)
 	}
 }
@@ -1809,11 +1812,11 @@ func TestSharedDirLeftoverIsWarned(t *testing.T) {
 	}
 	a := state.Empty()
 	a.Repo = state.RepoInfo{Owner: "a", Repo: "one"}
-	prepared, err := Validate(a, t.TempDir(), Options{SkillsDir: shared})
+	prepared, err := Validate(&a, t.TempDir(), Options{SkillsDir: shared})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.Write(a); err != nil {
+	if err := prepared.Write(); err != nil {
 		t.Fatal(err)
 	}
 	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], filepath.Base(retired)) {
@@ -1916,11 +1919,12 @@ func TestRetiredCopyNotFoldedIntoHandWrittenSkill(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mine, "SKILL.md"), []byte(handWritten), 0644); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := Validate(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{})
+	next := stateWith(approvedRule("Rule", "x", "ui", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1))); err != nil {
+	if err := prepared.Write(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(mine, "notes.md")); !os.IsNotExist(err) {
@@ -1952,11 +1956,12 @@ func TestRetiredCopyLeavesUserFileAtSlot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skills, "api"), []byte("a note"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := Validate(stateWith(approvedRule("Rule", "x", "ui", "stated", 1)), dir, Options{})
+	next := stateWith(approvedRule("Rule", "x", "ui", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := prepared.Write(stateWith(approvedRule("Rule", "x", "ui", "stated", 1))); err != nil {
+	if err := prepared.Write(); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, filepath.Join(skills, "api")); got != "a note" {

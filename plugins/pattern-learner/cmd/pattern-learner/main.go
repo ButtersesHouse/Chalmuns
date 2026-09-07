@@ -145,18 +145,20 @@ func runWriteOutputs(args []string) error {
 		Owner:     owner,
 		RepoRoot:  repoRoot(statePath, outputDir),
 	}
-	prepared, err := output.Validate(s, outputDir, opts)
+	prepared, err := output.Validate(&s, outputDir, opts)
 	if err != nil {
 		return err
 	}
 
+	// Anchoring enriches s in place; Write reads it through the pointer
+	// Validate holds.
 	if ragAnchor {
 		anchorExamplesRAG(&s, outputDir)
 	} else {
 		anchorExamples(&s, outputDir)
 	}
 
-	err = prepared.Write(s)
+	err = prepared.Write()
 	for _, w := range prepared.Warnings() {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
@@ -434,7 +436,10 @@ func anchorExamples(s *state.State, outputDir string) {
 // globMatcher resolves the files matching each of a fixed set of globs
 // with a single walk of the tree, however many rules share a glob or how
 // many "**" globs there are; the previous per-rule, per-glob walks grew
-// linearly with the rule count.
+// linearly with the rule count. Unlike filepath.Glob it supports "**" for
+// any number of directories — the form SKILL.md instructs subagents to emit
+// (e.g. "src/api/**/*.go") — and brace groups, expanded the same way the
+// skill frontmatter expands them.
 type globMatcher struct {
 	root    string
 	globs   []string
@@ -492,6 +497,8 @@ func (m *globMatcher) walkAll() {
 	if len(walkPatterns) == 0 {
 		return
 	}
+	lastMatched := map[string]int{}
+	generation := 0
 	filepath.WalkDir(m.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -507,26 +514,20 @@ func (m *globMatcher) walkAll() {
 			return nil
 		}
 		segs := strings.Split(filepath.ToSlash(rel), "/")
-		matchedGlob := map[string]bool{}
+		// A glob with several "**" alternatives must list a file once;
+		// the generation counter dedups without allocating per file.
+		generation++
 		for _, wp := range walkPatterns {
-			if matchedGlob[wp.glob] {
+			if lastMatched[wp.glob] == generation {
 				continue
 			}
 			if matchSegments(wp.segs, segs) {
 				m.matches[wp.glob] = append(m.matches[wp.glob], p)
-				matchedGlob[wp.glob] = true
+				lastMatched[wp.glob] = generation
 			}
 		}
 		return nil
 	})
-}
-
-// globFiles returns files under root matching glob. Unlike filepath.Glob it
-// supports "**" for any number of directories — the form SKILL.md instructs
-// subagents to emit (e.g. "src/api/**/*.go") — and brace groups, expanded
-// the same way the skill frontmatter expands them.
-func globFiles(root, glob string) []string {
-	return newGlobMatcher(root, []string{glob}).files(glob)
 }
 
 // matchSegments matches path segments against pattern segments where "**"
