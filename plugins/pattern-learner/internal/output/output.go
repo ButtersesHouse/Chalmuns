@@ -255,7 +255,14 @@ func (pr *Prepared) Warnings() []string {
 // resolveDirs applies the Options defaults for the skills directory and
 // decides whether it is shared.
 func resolveDirs(outputDir string, opts Options) (skillsDir string, shared bool) {
-	skillsDir = ResolveSkillsDir(opts.SkillsDir, outputDir)
+	// Options.SkillsDir is the explicit destination, used as given; only
+	// an empty value takes the default. Resolving a relative value here
+	// would apply ResolveSkillsDir a second time to what the CLI already
+	// resolved and double the path.
+	skillsDir = opts.SkillsDir
+	if skillsDir == "" {
+		skillsDir = ResolveSkillsDir("", outputDir)
+	}
 	repoRoot := opts.RepoRoot
 	if repoRoot == "" {
 		repoRoot = outputDir
@@ -825,7 +832,10 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 		if !anyOwner && (!info.stamped || info.stamp != owner) {
 			continue
 		}
-		if anyOwner && info.stamped && info.stamp != owner {
+		// A run with no identity of its own cannot tell a foreign stamp
+		// from its former one; inside its own tree it owns every generated
+		// skill, as the overwrite guard already holds.
+		if anyOwner && owner != "" && info.stamped && info.stamp != owner {
 			warnings = append(warnings, fmt.Sprintf("%s is a generated skill stamped for repository %q with no approved rules in this state; it was left in place because it may have been copied in on purpose — delete it if it is a leftover from before this repository was forked or renamed", dir, info.stamp))
 			continue
 		}

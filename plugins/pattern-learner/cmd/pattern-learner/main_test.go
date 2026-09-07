@@ -516,3 +516,54 @@ func TestRepoRootOutsideGitUsesStateProject(t *testing.T) {
 		t.Errorf("repoRoot outside git = %q, want the project %q", root, want)
 	}
 }
+
+// A relative explicit target lands in the output directory, like the
+// default target does, wherever the command was run from.
+func TestRunPromote_relativeTargetJoinsOutputDir(t *testing.T) {
+	dir := t.TempDir()
+	statePath := promoteState(t, dir)
+	if err := runPromote([]string{"--state", statePath, "--output-dir", dir, "--claude-md", "docs/CLAUDE.md", "--create"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "docs", "CLAUDE.md")); err != nil {
+		t.Errorf("relative target should be created under the output dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("docs", "CLAUDE.md")); err == nil {
+		t.Error("nothing should be written under the current directory")
+	}
+}
+
+// A relative --output-dir is not doubled into the skills path.
+func TestWriteOutputsRelativeOutputDir(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	if err := os.Chdir(base); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	if err := os.MkdirAll(filepath.Join("proj", ".claude", "pattern-learner"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		ID: "r1", Title: "Rule", Rule: "Do it.", Status: "approved", Confidence: "stated",
+		Target:  state.Target{Location: "api", FileGlob: []string{"src/**/*.go"}},
+		Sources: []state.Signal{{PRNumber: 1, Reviewer: "a", Snippet: "q", Strength: "explicit"}},
+	}}
+	statePath := filepath.Join("proj", ".claude", "pattern-learner", "state.json")
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWriteOutputs([]string{"--state", statePath, "--output-dir", "proj", "--skills-dir", ".claude/skills"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join("proj", ".claude", "skills", "api", "SKILL.md")); err != nil {
+		t.Errorf("skill should be under proj/.claude/skills: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("proj", "proj")); err == nil {
+		t.Error("the relative output dir must not be doubled")
+	}
+}

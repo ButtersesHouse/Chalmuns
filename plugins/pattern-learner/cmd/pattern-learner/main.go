@@ -274,14 +274,20 @@ func runPromote(args []string) error {
 
 	// Default to AGENTS.md (the cross-agent convention) when no target is
 	// named; agents other than Claude Code have no other entry point.
+	// Relative targets are taken against the output directory, like the
+	// default, so the file lands in the repository wherever the command
+	// was run from.
 	agentsMD := flagValue(args, "--agents-md", "")
 	claudeMD := flagValue(args, "--claude-md", "")
 	var targets []string
-	if agentsMD != "" {
-		targets = append(targets, agentsMD)
-	}
-	if claudeMD != "" {
-		targets = append(targets, claudeMD)
+	for _, t := range []string{agentsMD, claudeMD} {
+		if t == "" {
+			continue
+		}
+		if !filepath.IsAbs(t) {
+			t = filepath.Join(outputDir, t)
+		}
+		targets = append(targets, t)
 	}
 	if len(targets) == 0 {
 		targets = append(targets, filepath.Join(outputDir, "AGENTS.md"))

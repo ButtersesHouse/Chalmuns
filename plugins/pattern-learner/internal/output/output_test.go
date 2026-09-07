@@ -2108,6 +2108,37 @@ func TestCarryOverCollisionIsReported(t *testing.T) {
 	}
 }
 
+// A relative skills dir the CLI already resolved is used as given; only an
+// empty value takes the default, so a relative output dir is not doubled.
+func TestResolveDirsUsesSkillsDirAsGiven(t *testing.T) {
+	got, _ := resolveDirs("proj", Options{SkillsDir: filepath.Join("proj", ".claude", "skills")})
+	if got != filepath.Join("proj", ".claude", "skills") {
+		t.Errorf("explicit skills dir should be used as given, got %q", got)
+	}
+	got, _ = resolveDirs("proj", Options{})
+	if got != filepath.Join("proj", ".claude", "skills") {
+		t.Errorf("default skills dir = %q", got)
+	}
+}
+
+// A run with no identity of its own prunes every stale generated skill
+// inside its tree, as it may also overwrite them.
+func TestUnidentifiedRunPrunesStampedSkillInTree(t *testing.T) {
+	dir := t.TempDir()
+	skills := filepath.Join(dir, ".claude", "skills")
+	a := stateWith(approvedRule("Rule", "do it", "api", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	if err := Write(a, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(stateWith(approvedRule("Rule", "do it", "http", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skills, "api")); !os.IsNotExist(err) {
+		t.Error("an unidentified run should prune the stale stamped skill in its own tree")
+	}
+}
+
 func TestBuildDescriptionWhitespaceOverride(t *testing.T) {
 	if got := buildDescription("api", []string{"src/**"}, false, "  \n \t"); got == "" || !strings.Contains(got, "api") {
 		t.Errorf("whitespace-only override should fall back to the generated description, got %q", got)
