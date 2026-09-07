@@ -13,7 +13,7 @@ Extracts coding conventions and developer preferences from merged PR review comm
 Every deterministic step in this pipeline is implemented as a subcommand of the
 `pattern-learner` binary (`$BIN`): `detect-repo`, `state-read`, `state-write`,
 `write-outputs`, `extract-lean`, `verify-grounding`, `classify`, `triage`,
-`audit-format`, `promote`. **These subcommands are the only sanctioned
+`audit-format`, `promote`, `version`. **These subcommands are the only sanctioned
 implementations of their logic.**
 
 - **Do NOT** write or run ad-hoc scripts (Python, Node, Ruby, Perl, shell scripts, etc.)
@@ -92,7 +92,7 @@ If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
 
-**Binary self-check**: run `$BIN` with no arguments and confirm the usage output lists every expected subcommand: `extract-lean`, `verify-grounding`, `classify`, `triage`, `audit-format`, `promote`, `guard` (in addition to `detect-repo`, `state-read`, `state-write`, `write-outputs`). If any are missing, the binary is stale — delete it and rebuild from Step 2. If they are still missing after a clean rebuild, STOP and report it. Do not proceed with a binary that lacks the pipeline subcommands.
+**Binary self-check**: run `$BIN version` and confirm it prints exactly `0.3.0`. If the command errors (an older binary reports `unknown subcommand: version`) or prints any other value, the binary was built from older source and its output format differs from what these steps describe — delete it and rebuild from Step 2, then re-run the check. If it still does not print `0.3.0` after a clean rebuild, STOP and report it: the plugin source found in step 1 is not the version this skill file belongs to. Do not proceed with a mismatched binary.
 
 **Create the run-lock** (enables the off-script guard for the duration of this run):
 ```
@@ -109,7 +109,9 @@ Run:
 $BIN detect-repo
 ```
 
-Save the JSON output: `{"owner": "...", "repo": "...", "stack": [...]}`.
+Save the JSON output: `{"owner": "...", "repo": "...", "stack": [...]}`. It is written
+into the state's `repo` field in Step 11 and identifies this repo in every generated
+skill file, so carry it through unchanged on every run.
 
 ---
 
@@ -494,7 +496,12 @@ Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
 - `reviewed_snapshot` and `conflicted` per rule: both fields are part of the `Rule` struct and round-trip through `state-write` automatically. `reviewed_snapshot` is set by the `s` action and cleared on approve/reject (not on edit). `conflicted` is set by Step 8A-cross and cleared when the user resolves the conflict during review.
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review`.
-- Updated `last_run`, `repo`, `stats`
+- Updated `last_run` and `stats`
+- `repo`: **always** set to the Step 3 `detect-repo` output (`{owner, repo, stack}`),
+  on every run and in every mode — never leave it empty or copy it from memory.
+  `write-outputs` stamps `owner/repo` into each generated skill and uses it to tell
+  this repo's skills from another repo's in a shared skills directory; a value that
+  changes between runs leaves stale skills unpruned.
 - `updated_at` per rule: `state-write` stamps only rules whose `updated_at` is **empty**.
   Clear the field on every rule you created or modified this run so it gets a fresh
   timestamp; leave untouched rules' existing values in place (that is their change history).
@@ -535,7 +542,10 @@ top-level instruction file is hand-maintained and lives in the user's git
 history. Publishing there is a separate, explicitly-requested step (Step 12.6).
 
 Use `--skills-dir` to target a non-default skills directory; when omitted,
-`--output-dir` provides the base (`<dir>/.claude/skills`).
+`--output-dir` provides the base (`<dir>/.claude/skills`). A relative `--skills-dir`
+is resolved against `--output-dir`, and `--output-dir` itself defaults to the root of
+the repository the state file lives in — never the shell's current directory — so the
+invocation below behaves the same from any directory.
 
 **Typical invocation:**
 ```
@@ -545,6 +555,15 @@ $BIN write-outputs \
   [--rag-hints] [--rag]
 ```
 
+Do not run `write-outputs` twice at once against one skills directory: there is no
+lock, and two runs can swap a domain out from under each other. The single-agent
+pipeline these steps describe never does this.
+
+If the command prints `warning:` lines on stderr (it succeeded, but found something
+it could not resolve on its own, such as a leftover copy of a skill in a shared
+directory whose slot another repo now holds), relay each warning to the user
+verbatim in the Step 13 summary.
+
 This writes:
 - `<skills-dir>/<domain>/SKILL.md` — one skill per domain, generated with progressive
   disclosure so the always-loaded body stays lean (skill bodies are a recurring token
@@ -553,15 +572,81 @@ This writes:
     examples gets `<domain>/examples/<slug>.md` (all do/don't pairs, real-instance
     refs, context) and the SKILL.md rule entry links it — the consuming agent reads
     it at its discretion when it wants the code.
-  - **Very large skills are chunked** (when the rendered SKILL.md would exceed the
-    ~450-line threshold, honoring the documented "keep SKILL.md under 500 lines"
-    limit): SKILL.md becomes a **rule index** (title + globs, grouped by confidence,
+  - **Each rule states its own scope when the domain's rules differ.** The
+    `paths:` gate is the union of every rule's `file_glob`, so a skill loaded
+    for one file can carry rules scoped to others. When the domain's rules do
+    not all share one scope, each rule entry carries an `**Applies to:**` line
+    naming its own globs (a repo-wide rule says so in words). When they do all
+    share one scope the frontmatter already states it and no per-rule lines are
+    emitted.
+  - **Very large skills are chunked** (when the rendered body would reach the
+    400-line warn threshold `audit-format` applies, honoring the documented
+    "keep SKILL.md under 500 lines" limit): SKILL.md becomes a **rule index** (title + globs, grouped by confidence,
     each entry linking `<domain>/rules/<slug>.md`), and each rule file carries the
     full rule with its examples inline. The index also tells the agent it can
     `grep -ril "<keyword>" rules/` for full-text lookup.
-  - `examples/` and `rules/` are **generator-owned**: `write-outputs` wipes and
-    regenerates them each run, so never hand-edit files there (edit rules via the
-    pipeline instead).
+  - `SKILL.md`, `examples/` and `rules/` are **generator-owned**: `write-outputs`
+    renders the whole domain directory afresh each run (into a staging sibling that is
+    swapped into place, so the directory is only ever complete or absent), so never
+    hand-edit those (edit rules via the pipeline instead). Any other file or directory
+    a user keeps at the top level of a generated domain directory is carried over
+    unchanged.
+  - **Frontmatter is emitted as quoted YAML** (`name`, `description`, and the
+    comma-separated `paths` string are all double-quoted), so descriptions
+    containing `: ` and globs starting with `*` load correctly. Do not strip the
+    quotes.
+  - **Stale skills are pruned.** Every generated SKILL.md starts with a
+    `<!-- Generated by pattern-learner (write-outputs). ... -->` marker line plus a
+    `<!-- pattern-learner:repo=<owner>/<repo> -->` stamp naming the repo that wrote
+    it. After every skill has been written, `write-outputs` removes any
+    `<skills-dir>/<domain>/` whose SKILL.md carries that marker (or the fixed header
+    sentence older versions of the generator wrote) but whose domain no longer has
+    approved rules (renamed, merged, or all rejected), so an outdated skill cannot
+    keep auto-loading. Only the generated entries (`SKILL.md`, `examples/`, `rules/`)
+    are removed; any other file a user kept in that directory stays, and the
+    directory is removed only once it is empty. Inside the repo's own tree, unstamped
+    generated skills and those stamped for this repo are pruned; one stamped for a
+    *different* repo (a leftover from before a fork or rename, or a skill the user
+    copied in from another repo on purpose) is left in place with a `warning:` line
+    naming it, since the two cases cannot be told apart — except when the run has no
+    identity of its own (no `--repo`, empty `state.repo`, no git remote), in which case
+    it cannot tell a foreign stamp from its former one and prunes every stale generated
+    skill in its tree. In a skills directory **outside** the repo, only skills carrying
+    this repo's stamp are pruned. Skills the generator did not write (hand-written ones sharing the
+    directory) and skills another repo generated into a shared skills directory are
+    never touched. A skill directory written by a very
+    old build (no marker, none of the generator's fixed body sentences) carries no
+    fingerprint and is left alone too; if the Step 13 file list no longer names a
+    `<skills-dir>/<domain>/` that still exists, tell the user it is a leftover from
+    an older version and can be deleted.
+  - **`write-outputs` never overwrites a skill it did not write.** If
+    `<skills-dir>/<domain>/SKILL.md` already exists without the generator's marker
+    (a hand-written skill whose name collides with a domain, or one generated by a
+    very old build), the whole run is refused with nothing written. Ask the user
+    whether to re-target the domain in state or move/delete that directory, then
+    rerun. Inside the repo's own tree a generated skill is regenerated whichever repo
+    stamp it carries (a fork or renamed repo re-stamps it). In a skills directory
+    **outside** the repo (one shared by several repos), a domain stamped by another
+    repo is refused instead — two repos cannot share one domain name there; ask the
+    user to rename the domain in one of them or use separate skills directories. The
+    universal `conventions` skill has a fixed name, so two repos with universal rules
+    can only share a skills directory by giving each its own; and a run with no repo
+    identity (no `--repo`, empty `state.repo`, no git remote) can neither overwrite
+    nor prune any stamped skill there. Skills written into a shared directory by a
+    pre-0.3.0 build carry no stamp and are never pruned by any repo (they cannot be
+    attributed); each repo's next run re-stamps the ones it still owns, and any left
+    over must be removed by hand.
+  - **Globs must not contain commas.** `paths` is one comma-separated string, so
+    `write-outputs` expands brace groups (`src/{a,b}/**` → two globs) and refuses
+    the run for any glob that still contains a comma (e.g. a `[a,b]` character
+    class). Rewrite the offending `target.file_glob` in state and rerun.
+  - **Domain names must be single directory segments.** `write-outputs` refuses the
+    whole run, writing nothing, if any approved rule's `target.location` contains a
+    path separator, is `.`/`..`, exceeds 222 bytes (255 minus the staging-directory
+    suffix and tail), contains control characters or
+    any of `< > : " | ? *`, ends in a dot or space, is a Windows reserved device name
+    (`con`, `aux`, `nul`, `com1`…), or differs from another domain only by letter
+    case. Re-target those rules in state and rerun.
   - When `--rag-hints` is set, each rule (wherever its body lands) includes a
     `cursor-agent` command for retrieving live codebase examples at skill-use time.
 
@@ -570,16 +655,19 @@ This writes:
 ### Step 12.5: Format check
 
 `write-outputs` already keeps generated skills inside the documented body-line
-budget itself (inline rules while the render fits under ~450 lines, otherwise
-the chunked `rules/` index described in Step 12). So this step is **not** a
+budget itself (inline rules while the body fits under the 400-line warn
+threshold, otherwise the chunked `rules/` index described in Step 12). So this step is **not** a
 size-management step — it verifies the one thing the generator does not check:
 that the **frontmatter it emitted is valid**. The domain name is written to
 `name:` verbatim and the description comes from your `domain_descriptions`
-entry; neither is validated or sanitized by the generator.
+entry; neither is validated or sanitized by the generator. `audit-format`
+parses the block as real YAML (the way Claude Code loads it) and then checks
+the documented field rules, so a file that would fail to load is reported as
+`frontmatter is not valid YAML` rather than passing silently.
 
-If this run touched **zero** domains (e.g. a `--review` or `--add` run whose only approved/written rules targeted `CLAUDE.md`), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
+If this run wrote **zero** skill files (e.g. a `--review` run that approved nothing), skip this step entirely — do not invoke `audit-format` with no paths. `audit-format` requires at least one path and its usage error is not a sign the subcommand is broken; there is simply nothing to check this run.
 
-Otherwise, run it against every **domain** skill file this run wrote or touched (skip `CLAUDE.md` — it doesn't carry SKILL.md frontmatter, so the check doesn't apply to it):
+Otherwise, run it against every skill file this run wrote or touched. That includes `<skills-dir>/conventions/SKILL.md` when any universal (`CLAUDE.md`-sentinel) rule was approved — it is a real skill with frontmatter like every other domain:
 
 ```
 $BIN audit-format <skills-dir>/<domain1>/SKILL.md <skills-dir>/<domain2>/SKILL.md ...
@@ -592,21 +680,24 @@ rubric (`references/rubric.md` there carries the citations).
 
 For each result:
 
-- **`frontmatter_issues` non-empty — act on this.** The domain name or its
-  generated description violates a documented frontmatter rule (e.g. Step
-  8B/A3 canonicalized a domain to `Legacy_API`, which breaks the
-  lowercase/digits/hyphens charset rule, or `domain_descriptions[domain]`
-  grew past 1024 chars). A skill whose `name` breaks the charset rule may
-  fail to register, so this is worth fixing.
+- **`frontmatter_issues` non-empty — act on this.** The domain name violates
+  a documented frontmatter rule (e.g. Step 8B/A3 canonicalized a domain to
+  `Legacy_API`, which breaks the lowercase/digits/hyphens charset rule). A
+  skill whose `name` breaks the charset rule may fail to register, so this
+  is worth fixing. A `not valid YAML` finding, or any finding about the
+  *description*, on a file `write-outputs` just wrote is a generator bug (it
+  quotes every value it emits, and it truncates every description — your
+  `domain_descriptions` override included — well under the length limit, so
+  a length finding cannot come from state) — STOP and report it, as with
+  `over_budget` below.
 
   Fix it at the **state** level, never by hand-editing the generated file —
   `write-outputs` rewrites that file wholesale from state on every run, so a
   hand-edit is silently discarded next run. Propose to the user a corrected
-  domain name (valid charset) or a shortened `domain_descriptions[domain]`
-  entry. On approval, re-target the affected rules' `target.location` and/or
-  update the description, then re-run **Step 11** (state-write) and **Step
-  12** (write-outputs), and re-run this check to confirm it comes back
-  clean. On decline, note it in the Step 13 summary and continue.
+  domain name (valid charset). On approval, re-target the affected rules'
+  `target.location`, then re-run **Step 11** (state-write) and **Step 12**
+  (write-outputs), and re-run this check to confirm it comes back clean. On
+  decline, note it in the Step 13 summary and continue.
 
 - **`over_budget` / `approaching_budget` — this is a generator bug, not
   something to fix by hand.** Step 12's chunking is supposed to make this
@@ -616,6 +707,13 @@ For each result:
   Per the Tooling policy, **STOP and report it** — do not re-split the
   domain by hand and do not edit the emitted file. Include the domain name
   and the reported `body_lines` so the generator can be fixed.
+
+- **A non-zero exit — a path was not audited.** `audit-format` fails when it
+  cannot read one of the paths you gave it, and names them. That is a
+  mistake in the path list, not a finding about the skill: the file was
+  never opened, so its empty `frontmatter_issues` means nothing. Re-check
+  the paths against what Step 12 reported it wrote and run it again. Do not
+  report the run's skills as format-clean until every path audited.
 
 This step never edits a file or state on its own.
 

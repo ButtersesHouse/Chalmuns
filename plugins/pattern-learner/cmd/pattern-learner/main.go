@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -20,17 +21,28 @@ import (
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
 
+// Version identifies the binary's output contract. SKILL.md Step 2 compares
+// it against the version it expects and rebuilds on mismatch, so a binary
+// built from older source cannot silently keep producing the old output
+// (the usage listing alone cannot tell two builds apart when the subcommand
+// set is unchanged). Bump it whenever generated output or a subcommand's
+// behaviour changes, and update the expected value in SKILL.md and the
+// plugin manifest to match.
+const Version = "0.3.0"
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
 		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
-		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard")
+		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard, version")
 		os.Exit(1)
 	}
 
 	var err error
 	switch os.Args[1] {
+	case "version":
+		fmt.Println(Version)
 	case "detect-repo":
 		err = runDetectRepo()
 	case "state-read":
@@ -69,6 +81,9 @@ func runDetectRepo() error {
 }
 
 func runStateRead(args []string) error {
+	if err := checkFlags(args, []string{"--state"}, nil); err != nil {
+		return err
+	}
 	path := flagValue(args, "--state", "")
 	if path == "" {
 		return fmt.Errorf("--state required")
@@ -83,6 +98,9 @@ func runStateRead(args []string) error {
 }
 
 func runStateWrite(args []string) error {
+	if err := checkFlags(args, []string{"--state"}, nil); err != nil {
+		return err
+	}
 	path := flagValue(args, "--state", "")
 	if path == "" {
 		return fmt.Errorf("--state required")
@@ -100,10 +118,38 @@ func runStateWrite(args []string) error {
 }
 
 func runWriteOutputs(args []string) error {
+	if err := checkFlags(args,
+		[]string{"--state", "--output-dir", "--skills-dir", "--repo"},
+		[]string{"--rag", "--rag-hints"}); err != nil {
+		return err
+	}
 	statePath := flagValue(args, "--state", "")
-	outputDir := flagValue(args, "--output-dir", ".")
 	if statePath == "" {
 		return fmt.Errorf("--state required")
+	}
+	// state.Read treats a missing file as an empty state, which is right for
+	// a first run of the pipeline but not here: write-outputs prunes every
+	// generated skill absent from state, so a mistyped --state would delete
+	// them all. Require the file to exist, before any other work.
+	if _, err := os.Stat(statePath); err != nil {
+		return fmt.Errorf("--state %s: %w (write-outputs needs an existing state file; a missing one would prune every generated skill)", statePath, err)
+	}
+	// The output directory (default skills location, anchoring root) is
+	// the repository the state belongs to, not wherever the command was
+	// run from; an explicit --output-dir overrides it. The repository root
+	// is resolved once and reused for the shared-directory judgement.
+	// The output directory is the project the state belongs to (the
+	// directory above its .claude/), which in a monorepo is not the git
+	// top level; the top level only decides whether a skills directory is
+	// the repository's own or shared.
+	outputDir := flagValue(args, "--output-dir", "")
+	if outputDir == "" {
+		outputDir = projectDir(statePath)
+	}
+	root, inGit := repoRoot(statePath)
+	if !inGit {
+		// No git top level: the output dir is the best root.
+		root = outputDir
 	}
 	ragHints := hasFlag(args, "--rag-hints")
 	ragAnchor := hasFlag(args, "--rag")
@@ -113,17 +159,111 @@ func runWriteOutputs(args []string) error {
 		return err
 	}
 
-	if ragAnchor {
-		anchorExamplesRAG(&s, outputDir)
-	} else {
-		anchorExamples(&s, outputDir)
+	// Every cheap, deterministic check first: a bad flag, domain name,
+	// glob, or a skill directory the run would refuse to overwrite. The
+	// anchoring below walks the repository (or calls cursor-agent per
+	// rule) and should not run for a state the write would then reject.
+	owner, err := resolveOwner(flagValue(args, "--repo", ""), s, root)
+	if err != nil {
+		return err
 	}
-
 	opts := output.Options{
 		RAGHints:  ragHints,
-		SkillsDir: flagValue(args, "--skills-dir", ""),
+		SkillsDir: output.ResolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir),
+		Owner:     owner,
+		RepoRoot:  root,
 	}
-	return output.Write(s, outputDir, opts)
+	prepared, err := output.Validate(&s, outputDir, opts)
+	if err != nil {
+		return err
+	}
+
+	// Anchoring enriches s in place; Write reads it through the pointer
+	// Validate holds.
+	if ragAnchor {
+		anchorExamplesRAG(&s, outputDir, opts.SkillsDir)
+	} else {
+		anchorExamples(&s, outputDir, opts.SkillsDir)
+	}
+
+	err = prepared.Write()
+	for _, w := range prepared.Warnings() {
+		fmt.Fprintln(os.Stderr, "warning:", w)
+	}
+	return err
+}
+
+// repoRoot finds the root of the repository a run writes for, which decides
+// whether the skills directory is the repo's own or a shared one. The state
+// file lives inside the repository, so its git top level is authoritative;
+// when the state is not under git, fall back to outputDir. Using the
+// current directory alone would misclassify a user-level skills directory
+// as repo-owned whenever the command is run from one of its ancestors.
+func repoRoot(statePath string) (root string, inGit bool) {
+	// Ask git from the state's logical location, not through whatever the
+	// path resolves to physically: a .claude/ that is a symlink into a
+	// dotfiles repository would otherwise name that repository.
+	project := projectDir(statePath)
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = project
+	if out, err := cmd.Output(); err == nil {
+		if top := strings.TrimSpace(string(out)); top != "" {
+			return top, true
+		}
+	}
+	// Not under git: the project directory is still the repository this
+	// run is for, never the process cwd.
+	return project, false
+}
+
+// projectDir is the directory a state file belongs to: by convention the
+// state lives at <project>/.claude/pattern-learner/state.json, so the
+// directory above .claude/; any other layout means the state's own
+// directory. It is absolute so later joins do not depend on the cwd.
+func projectDir(statePath string) string {
+	dir := filepath.Dir(statePath)
+	if filepath.Base(dir) == "pattern-learner" && filepath.Base(filepath.Dir(dir)) == ".claude" {
+		dir = filepath.Dir(filepath.Dir(dir))
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+// resolveOwner picks the "owner/repo" identity stamped into generated skills,
+// in a fixed order so it cannot flip between runs: an explicit --repo flag,
+// then the state's repo field, then the git remote of the repository root
+// (the same detection detect-repo performs, run where the state lives
+// rather than in the current directory, which may be an unrelated
+// ancestor repository). Every branch produces the value through
+// output.NormalizeOwnerKey so stamps compare equal across runs. Empty when
+// none is available; an unusable value in state or the flag is an error
+// rather than a silent unstamped run, since unstamped skills in a shared
+// directory are never pruned.
+func resolveOwner(flag string, s state.State, repoRoot string) (string, error) {
+	if flag != "" {
+		key := output.NormalizeOwnerKey(flag)
+		if key == "" {
+			return "", fmt.Errorf("--repo must be \"owner/repo\" (got %q)", flag)
+		}
+		return key, nil
+	}
+	if s.Repo.Owner != "" || s.Repo.Repo != "" {
+		key := output.OwnerFromState(s)
+		if key == "" {
+			return "", fmt.Errorf("state.repo {owner: %q, repo: %q} is not a usable owner/repo identity (one segment each, no whitespace); set it from detect-repo's output (Step 11) or pass --repo", s.Repo.Owner, s.Repo.Repo)
+		}
+		return key, nil
+	}
+	if r, err := detect.Detect(repoRoot); err == nil {
+		key := output.OwnerKey(r.Owner, r.Repo)
+		if key == "" {
+			return "", fmt.Errorf("the git remote of %s parses to {owner: %q, repo: %q}, which is not a usable owner/repo identity; pass --repo owner/repo", repoRoot, r.Owner, r.Repo)
+		}
+		return key, nil
+	}
+	return "", nil
 }
 
 // runPromote publishes the conventions into a top-level agent instruction
@@ -136,38 +276,67 @@ func runWriteOutputs(args []string) error {
 //
 //	[--skills-dir D] [--create]
 func runPromote(args []string) error {
+	if err := checkFlags(args,
+		[]string{"--state", "--output-dir", "--skills-dir", "--agents-md", "--claude-md"},
+		[]string{"--create"}); err != nil {
+		return err
+	}
 	statePath := flagValue(args, "--state", "")
 	if statePath == "" {
 		return fmt.Errorf("--state required")
 	}
-	outputDir := flagValue(args, "--output-dir", ".")
+	// Same default as write-outputs: the repository the state lives in.
+	outputDir := flagValue(args, "--output-dir", "")
+	if outputDir == "" {
+		outputDir = projectDir(statePath)
+	}
 
 	s, err := state.Read(statePath)
 	if err != nil {
 		return err
 	}
 
-	skillsDir := flagValue(args, "--skills-dir", "")
-	if skillsDir == "" {
-		skillsDir = filepath.Join(outputDir, ".claude", "skills")
+	skillsDir := output.ResolveSkillsDir(flagValue(args, "--skills-dir", ""), outputDir)
+	promoteRoot, inGit := repoRoot(statePath)
+	if !inGit {
+		promoteRoot = outputDir
 	}
 
 	// Default to AGENTS.md (the cross-agent convention) when no target is
 	// named; agents other than Claude Code have no other entry point.
+	// Relative targets are taken against the output directory, like the
+	// default, so the file lands in the repository wherever the command
+	// was run from.
 	agentsMD := flagValue(args, "--agents-md", "")
 	claudeMD := flagValue(args, "--claude-md", "")
 	var targets []string
-	if agentsMD != "" {
-		targets = append(targets, agentsMD)
-	}
-	if claudeMD != "" {
-		targets = append(targets, claudeMD)
+	for _, t := range []string{agentsMD, claudeMD} {
+		if t == "" {
+			continue
+		}
+		if !filepath.IsAbs(t) {
+			t = filepath.Join(outputDir, t)
+		}
+		targets = append(targets, t)
 	}
 	if len(targets) == 0 {
 		targets = append(targets, filepath.Join(outputDir, "AGENTS.md"))
 	}
 
-	opts := output.PromoteOptions{SkillsDir: skillsDir, Create: hasFlag(args, "--create")}
+	opts := output.PromoteOptions{
+		SkillsDir: skillsDir,
+		Create:    hasFlag(args, "--create"),
+		// Inside the repository a link must hold on every checkout, so it
+		// is written relative to the target file. The judgement is made
+		// against the git top level, exactly as write-outputs makes it
+		// (repoRoot, and Options.RepoRoot's doc on why outputDir alone is
+		// not safe): outputDir is the project the state belongs to, which
+		// in a monorepo service — or under any --output-dir below the root
+		// — is not the root, so a skills directory write-outputs correctly
+		// calls the repository's own was called shared here and promoted
+		// with absolute, machine-local links.
+		RelativeLinks: output.IsInside(skillsDir, promoteRoot),
+	}
 	results := make([]output.PromoteResult, 0, len(targets))
 	for _, t := range targets {
 		res, err := output.Promote(s, t, opts)
@@ -185,12 +354,13 @@ func runPromote(args []string) error {
 // anchorExamplesRAG uses cursor-agent to semantically find real codebase instances
 // of each approved rule's pattern and sets FileRef when found. Falls back to
 // grep-based anchorExamples if cursor-agent is unavailable or returns no result.
-func anchorExamplesRAG(s *state.State, outputDir string) {
+func anchorExamplesRAG(s *state.State, outputDir, skillsDir string) {
 	if !isCursorAgentAvailable() {
-		anchorExamples(s, outputDir)
+		anchorExamples(s, outputDir, skillsDir)
 		return
 	}
 
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s), skillsDir)
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 {
@@ -211,7 +381,7 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 		out, err := runCursorAgent(prompt)
 		if err != nil || strings.TrimSpace(out) == "" {
 			// Fall back to grep for this rule.
-			anchorSingleRule(r, outputDir)
+			anchorSingleRule(r, outputDir, matcher)
 			continue
 		}
 
@@ -222,9 +392,21 @@ func anchorExamplesRAG(s *state.State, outputDir string) {
 		if ref != "" && refExists(ref, outputDir) {
 			r.DoExamples[0].FileRef = ref
 		} else {
-			anchorSingleRule(r, outputDir)
+			anchorSingleRule(r, outputDir, matcher)
 		}
 	}
+}
+
+// approvedGlobs collects every file glob an approved rule carries, so one
+// matcher can resolve them all in a single walk.
+func approvedGlobs(s *state.State) []string {
+	var globs []string
+	for _, r := range s.Rules {
+		if r.Status == "approved" {
+			globs = append(globs, r.Target.FileGlob...)
+		}
+	}
+	return globs
 }
 
 // isCursorAgentAvailable checks whether cursor-agent is on PATH.
@@ -256,7 +438,7 @@ func refExists(ref, root string) bool {
 		return false
 	}
 	rel := filepath.Clean(ref[:idx])
-	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if filepath.IsAbs(rel) || output.IsOutsideRel(rel) {
 		return false
 	}
 	f, err := os.Open(filepath.Join(root, rel))
@@ -300,7 +482,7 @@ func extractFileRef(text string) string {
 }
 
 // anchorSingleRule is the grep fallback for one rule.
-func anchorSingleRule(r *state.Rule, outputDir string) {
+func anchorSingleRule(r *state.Rule, outputDir string, matcher *globMatcher) {
 	if len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
 		return
 	}
@@ -309,7 +491,7 @@ func anchorSingleRule(r *state.Rule, outputDir string) {
 		return
 	}
 	for _, glob := range r.Target.FileGlob {
-		for _, file := range globFiles(outputDir, glob) {
+		for _, file := range matcher.files(glob) {
 			lineNum, ok := findInFile(file, token)
 			if !ok {
 				continue
@@ -327,7 +509,8 @@ func anchorSingleRule(r *state.Rule, outputDir string) {
 // anchorExamples does a best-effort grep search for real codebase instances of
 // each approved rule's first do_example and sets FileRef when found. Errors are
 // silently ignored — this is advisory metadata only.
-func anchorExamples(s *state.State, outputDir string) {
+func anchorExamples(s *state.State, outputDir, skillsDir string) {
+	matcher := newGlobMatcher(outputDir, approvedGlobs(s), skillsDir)
 	for i := range s.Rules {
 		r := &s.Rules[i]
 		if r.Status != "approved" || len(r.DoExamples) == 0 || len(r.Target.FileGlob) == 0 {
@@ -336,40 +519,202 @@ func anchorExamples(s *state.State, outputDir string) {
 		if r.DoExamples[0].FileRef != "" {
 			continue
 		}
-		anchorSingleRule(&s.Rules[i], outputDir)
+		anchorSingleRule(&s.Rules[i], outputDir, matcher)
 	}
 }
 
-// globFiles returns files under root matching glob. Unlike filepath.Glob it
-// supports "**" for any number of directories — the form SKILL.md instructs
-// subagents to emit (e.g. "src/api/**/*.go").
-func globFiles(root, glob string) []string {
-	if !strings.Contains(glob, "**") {
-		matches, _ := filepath.Glob(filepath.Join(root, glob))
-		return matches
+// globMatcher resolves the files matching each of a fixed set of globs
+// with a single walk of the tree, however many rules share a glob or how
+// many "**" globs there are; the previous per-rule, per-glob walks grew
+// linearly with the rule count. Unlike filepath.Glob it supports "**" for
+// any number of directories — the form SKILL.md instructs subagents to emit
+// (e.g. "src/api/**/*.go") — and brace groups, expanded the same way the
+// skill frontmatter expands them.
+type globMatcher struct {
+	root    string
+	globs   []string
+	matches map[string][]string
+	walked  bool
+	// skipDirs are absolute directories the walk does not descend into,
+	// beyond the fixed skipNames below.
+	skipDirs map[string]bool
+}
+
+// skipNames are directories whose contents are never a real instance of the
+// team's own convention: version-control metadata, and the two conventional
+// dependency trees. Anchoring a rule to third-party code would put someone
+// else's file under "Real instance" and in "Exemplary Files", which tells
+// the reader to imitate it.
+var skipNames = map[string]bool{".git": true, "node_modules": true, "vendor": true}
+
+func newGlobMatcher(root string, globs []string, skip ...string) *globMatcher {
+	skipped := map[string]bool{}
+	for _, dir := range skip {
+		if dir == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(dir); err == nil {
+			skipped[abs] = true
+		}
 	}
-	pat := strings.Split(path.Clean(filepath.ToSlash(glob)), "/")
-	var out []string
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	return &globMatcher{root: root, globs: globs, skipDirs: skipped}
+}
+
+// files returns the files under root matching glob. The walk happens on
+// the first call and covers every glob the matcher was built with.
+func (m *globMatcher) files(glob string) []string {
+	if !m.walked {
+		m.walkAll()
+	}
+	// Every caller registers all its globs up front; an unregistered one
+	// simply has no matches rather than costing a walk of its own.
+	return m.matches[glob]
+}
+
+// walkAll resolves every registered glob: plain globs through
+// filepath.Glob, "**" globs together in one traversal of the tree.
+func (m *globMatcher) walkAll() {
+	m.walked = true
+	m.matches = map[string][]string{}
+	type walkPattern struct {
+		glob string
+		segs []string
+	}
+	var walkPatterns []walkPattern
+	for _, glob := range m.globs {
+		if _, seen := m.matches[glob]; seen {
+			continue
+		}
+		m.matches[glob] = nil
+		expanded, err := output.ExpandBraces(glob)
+		if err != nil {
+			// A malformed glob is refused by write-outputs itself;
+			// anchoring is advisory and simply finds nothing for it.
+			continue
+		}
+		for _, g := range expanded {
+			// Globs are repository-relative; a leading "/" or "./" the
+			// model sometimes emits means the same thing.
+			cleaned := strings.TrimPrefix(path.Clean(filepath.ToSlash(g)), "/")
+			if output.EscapesRoot(g) {
+				// A glob that climbs out of the repository anchors nothing:
+				// a reference outside the repo is refused on the RAG path
+				// (refExists) and would be no use to a reader here either.
+				continue
+			}
+			if !strings.Contains(cleaned, "**") {
+				// A plain glob is a few directory listings; only "**"
+				// needs the tree walk. The root is escaped so that glob
+				// metacharacters in the repository path ("proj[1]") are
+				// not read as a pattern.
+				found, _ := filepath.Glob(filepath.Join(escapeGlobMeta(m.root), filepath.FromSlash(cleaned)))
+				m.matches[glob] = append(m.matches[glob], found...)
+				continue
+			}
+			walkPatterns = append(walkPatterns, walkPattern{glob, strings.Split(cleaned, "/")})
+		}
+	}
+	defer m.dedupMatches()
+	if len(walkPatterns) == 0 {
+		return
+	}
+	filepath.WalkDir(m.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == "node_modules" {
+			if skipNames[d.Name()] || m.skipDirs[p] {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		rel, err := filepath.Rel(root, p)
+		rel, err := filepath.Rel(m.root, p)
 		if err != nil {
 			return nil
 		}
-		if matchSegments(pat, strings.Split(filepath.ToSlash(rel), "/")) {
-			out = append(out, p)
+		segs := strings.Split(filepath.ToSlash(rel), "/")
+		// A file matched by several alternatives of one glob is listed
+		// once by the deferred dedupMatches.
+		for _, wp := range walkPatterns {
+			if matchSegments(wp.segs, segs) {
+				m.matches[wp.glob] = append(m.matches[wp.glob], p)
+			}
 		}
 		return nil
 	})
-	return out
+}
+
+// dedupMatches lists each file once per glob: a group with both a plain
+// and a "**" alternative can find the same file by both routes.
+func (m *globMatcher) dedupMatches() {
+	for glob, files := range m.matches {
+		kept := files[:0]
+		for _, f := range files {
+			if !m.skipped(f) {
+				kept = append(kept, f)
+			}
+		}
+		m.matches[glob] = output.DedupeStrings(kept)
+	}
+}
+
+// skipped reports whether a matched file lies under a directory anchoring
+// must not cite. The tree walk already prunes those, but the plain-glob
+// route goes through filepath.Glob, which does no walking and would still
+// return e.g. `.claude/skills/api/examples/x.md` for "**"-free patterns.
+func (m *globMatcher) skipped(file string) bool {
+	rel, err := filepath.Rel(m.root, file)
+	if err != nil {
+		return false
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if skipNames[seg] {
+			return true
+		}
+	}
+	if len(m.skipDirs) == 0 {
+		return false
+	}
+	// skipDirs holds absolute paths, so compare on absolute ones: root (and
+	// therefore every match built from it) may be relative.
+	abs, err := filepath.Abs(file)
+	if err != nil {
+		return false
+	}
+	for d := filepath.Dir(abs); ; {
+		if m.skipDirs[d] {
+			return true
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return false
+		}
+		d = parent
+	}
+}
+
+// escapeGlobMeta quotes the glob metacharacters in a literal path so it can
+// be joined with a pattern for filepath.Glob. Outside Windows a backslash
+// escape quotes every metacharacter, the backslash itself included (a
+// bracket class cannot hold one: "[\]" reads as an escaped "]"). On
+// Windows the backslash is the separator and no escape character exists,
+// so the three remaining metacharacters go in bracket classes.
+func escapeGlobMeta(p string) string {
+	var b strings.Builder
+	for _, r := range p {
+		switch {
+		case runtime.GOOS != "windows" && (r == '*' || r == '?' || r == '[' || r == '\\'):
+			b.WriteRune('\\')
+			b.WriteRune(r)
+		case runtime.GOOS == "windows" && (r == '*' || r == '?' || r == '['):
+			b.WriteRune('[')
+			b.WriteRune(r)
+			b.WriteRune(']')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // matchSegments matches path segments against pattern segments where "**"
@@ -435,14 +780,62 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-// flagValue extracts --flag value from an args slice.
+// flagValue extracts a flag's value from args, accepting both "--flag value"
+// and "--flag=value". Both forms are read because a caller who writes the
+// equals form and is not understood would otherwise have the flag silently
+// ignored and the run write somewhere else entirely.
 func flagValue(args []string, flag, def string) string {
+	prefix := flag + "="
 	for i, a := range args {
 		if a == flag && i+1 < len(args) {
 			return args[i+1]
 		}
+		if strings.HasPrefix(a, prefix) {
+			return strings.TrimPrefix(a, prefix)
+		}
 	}
 	return def
+}
+
+// checkFlags rejects any argument that looks like a flag this subcommand
+// does not know. Silently ignoring a typo means writing generated skills to
+// the default location while the user believes they went somewhere else, so
+// an unrecognised flag is an error rather than a no-op. valueFlags take a
+// following value; boolFlags stand alone.
+func checkFlags(args []string, valueFlags, boolFlags []string) error {
+	known := map[string]bool{}
+	takesValue := map[string]bool{}
+	for _, f := range valueFlags {
+		known[f], takesValue[f] = true, true
+	}
+	for _, f := range boolFlags {
+		known[f] = true
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			continue // a positional argument, or a value consumed below
+		}
+		name := a
+		inline := false
+		if eq := strings.Index(a, "="); eq >= 0 {
+			name, inline = a[:eq], true
+		}
+		if !known[name] {
+			return fmt.Errorf("unknown flag %q; this subcommand accepts %s", name,
+				strings.Join(append(append([]string{}, valueFlags...), boolFlags...), ", "))
+		}
+		if takesValue[name] {
+			if inline {
+				continue
+			}
+			if i+1 >= len(args) {
+				return fmt.Errorf("flag %s needs a value", name)
+			}
+			i++ // skip the value so it is not read as a flag
+		}
+	}
+	return nil
 }
 
 func dirOf(path string) string {

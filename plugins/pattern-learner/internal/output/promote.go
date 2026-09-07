@@ -65,6 +65,11 @@ type PromoteOptions struct {
 	// it, a missing file is skipped rather than created, so `promote` can
 	// never introduce a repo-root file the user did not ask for.
 	Create bool
+	// RelativeLinks makes the block link the skill files relative to the
+	// target's directory even when SkillsDir is absolute. The CLI sets it
+	// when the skills directory lies inside the repository, where an
+	// absolute path would only hold on one machine.
+	RelativeLinks bool
 }
 
 // Promote writes the managed block into path. It never modifies content
@@ -77,7 +82,7 @@ func Promote(s state.State, path string, opts PromoteOptions) (PromoteResult, er
 		skillsDir = filepath.Join(filepath.Dir(path), ".claude", "skills")
 	}
 
-	block := renderPromotedBlock(s, path, skillsDir)
+	block := renderPromotedBlock(s, path, skillsDir, opts.RelativeLinks)
 	if block == "" {
 		res.Outcome, res.Reason = PromoteSkipped, "no approved rules to promote"
 		return res, nil
@@ -156,10 +161,41 @@ func spliceBlock(doc, block string) (string, PromoteOutcome, error) {
 //
 // The index is the point of this block for Claude Code (which auto-loads
 // .claude/skills itself) and the whole point for agents that do not.
-func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
+func renderPromotedBlock(s state.State, targetPath, skillsDir string, relativeLinks bool) string {
 	universal := approvedRules(s, UniversalLocation)
+	omitted := 0
 	if len(universal) > maxCLAUDERules {
+		omitted = len(universal) - maxCLAUDERules
 		universal = universal[:maxCLAUDERules]
+	}
+
+	// Paths in the block are written relative to the target file's directory
+	// where possible, so the file reads the same from any checkout location.
+	// Links are relative to the target file's directory whenever that is
+	// meaningful: a skills directory given relatively (or flagged as
+	// inside the repository by relativeLinks) is linked relatively even
+	// when the target sits below the repo root and the link must climb
+	// out ("../.claude/..."), and so is the default skills directory under
+	// the target's own tree. An absolute skills directory elsewhere is a
+	// fixed location the user chose, and a relative path to it would only
+	// hold from one checkout, so it is linked as given.
+	relRef := func(parts ...string) string {
+		ref := filepath.Join(append([]string{skillsDir}, parts...)...)
+		// Compare absolute forms so a relative skills dir and an absolute
+		// target (or the reverse) still yield a correct relative link.
+		absRef, err1 := filepath.Abs(ref)
+		absTargetDir, err2 := filepath.Abs(filepath.Dir(targetPath))
+		if err1 != nil || err2 != nil {
+			return ref
+		}
+		rel, err := filepath.Rel(absTargetDir, absRef)
+		if err != nil {
+			return ref
+		}
+		if relativeLinks || !filepath.IsAbs(ref) || !IsOutsideRel(rel) {
+			return rel
+		}
+		return ref
 	}
 
 	byDomain := map[string][]string{}
@@ -192,8 +228,12 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 		b.WriteString("These apply to every file in the repository.")
 		b.WriteString(fmt.Sprintf(" They are also generated as `%s`, which Claude Code auto-loads;"+
 			" they are inlined here for agents that do not read that directory.\n\n",
-			filepath.Join(skillsDir, UniversalSkillName, "SKILL.md")))
+			relRef(UniversalSkillName, "SKILL.md")))
 		renderUniversalRules(&b, universal, "###")
+		if omitted > 0 {
+			b.WriteString(fmt.Sprintf("_%d more universal rule(s) are not inlined here (this block shows the first %d by confidence); read `%s` for the full set._\n\n",
+				omitted, maxCLAUDERules, relRef(UniversalSkillName, "SKILL.md")))
+		}
 	}
 
 	if len(domains) > 0 {
@@ -201,12 +241,9 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string) string {
 		b.WriteString("Rules scoped to parts of the codebase live in per-domain files (plain markdown).")
 		b.WriteString(" Before editing files matching a domain's globs, read that domain's file and follow its links to the `examples/` or `rules/` companion files for code samples.\n\n")
 		for _, name := range domains {
-			ref := filepath.Join(skillsDir, name, "SKILL.md")
-			if rel, err := filepath.Rel(filepath.Dir(targetPath), ref); err == nil && !strings.HasPrefix(rel, "..") {
-				ref = rel
-			}
+			ref := relRef(name, "SKILL.md")
 			scope := name
-			if globs := dedupeStrings(byDomain[name]); len(globs) > 0 {
+			if globs := DedupeStrings(byDomain[name]); len(globs) > 0 {
 				scope = "`" + strings.Join(globs, "`, `") + "`"
 			}
 			b.WriteString(fmt.Sprintf("- %s → `%s`\n", scope, ref))
