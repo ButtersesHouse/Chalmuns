@@ -153,12 +153,19 @@ func ParseFrontmatter(text string) (fields map[string]string, body string, issue
 			}
 		case yaml.SequenceNode:
 			parts := make([]string, 0, len(node.Content))
+			nested := false
 			for _, item := range node.Content {
 				if item.Kind != yaml.ScalarNode {
-					issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+					nested = true
 					break
 				}
 				parts = append(parts, item.Value)
+			}
+			if nested {
+				// Report the nested item only; storing a partial join would
+				// trigger a second, spurious empty-glob finding.
+				issues = append(issues, fmt.Sprintf("frontmatter field '%s' has a nested value; expected a string", k))
+				continue
 			}
 			fields[k] = strings.Join(parts, ",")
 		default:

@@ -991,6 +991,43 @@ func TestCollectGlobsExpandsBracesAndDropsEmpties(t *testing.T) {
 	if err := Write(stateWith(bad), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "contains a comma") {
 		t.Errorf("expected a comma-glob refusal, got %v", err)
 	}
+	// An empty brace alternative yields an empty path segment; refuse too.
+	for _, g := range []string{"src/{a,}/**/*.go", "{,src}/**/*.go", "src/{}/x.go"} {
+		empty := approvedRule("R", "do it", "api", "stated", 1)
+		empty.Target.FileGlob = []string{g}
+		if err := Write(stateWith(empty), t.TempDir(), Options{}); err == nil || !strings.Contains(err.Error(), "empty path segment") {
+			t.Errorf("%s: expected an empty-segment refusal, got %v", g, err)
+		}
+	}
+}
+
+// RepoRoot, not outputDir, decides whether the skills directory is shared.
+func TestRepoRootDecidesSharing(t *testing.T) {
+	home := t.TempDir()
+	repo := filepath.Join(home, "work", "repo")
+	shared := filepath.Join(home, ".claude", "skills")
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Another repo's stamped skill in the user-level directory.
+	other := filepath.Join(shared, "api")
+	if err := os.MkdirAll(other, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stamped := "---\nname: \"api\"\ndescription: \"x\"\n---\n\n" + GeneratedMarker + "\n" + ownerLine("acme/other") + "\n\nbody\n"
+	if err := os.WriteFile(filepath.Join(other, "SKILL.md"), []byte(stamped), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a := stateWith(approvedRule("Rule", "do it", "ui", "stated", 1))
+	a.Repo = state.RepoInfo{Owner: "acme", Repo: "alpha"}
+	// outputDir is $HOME (the command was run from there), which contains
+	// the shared directory; RepoRoot says the repo is elsewhere.
+	if err := Write(a, home, Options{SkillsDir: shared, RepoRoot: repo}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "SKILL.md")); err != nil {
+		t.Error("another repo's skill in the user-level directory was pruned")
+	}
 }
 
 // A fork or renamed repo changes the stamp, not the fact that the skill was

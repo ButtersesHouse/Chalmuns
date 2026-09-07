@@ -578,11 +578,14 @@ This writes:
     `<!-- pattern-learner:repo=<owner>/<repo> -->` stamp naming the repo that wrote
     it. After every skill has been written, `write-outputs` removes any
     `<skills-dir>/<domain>/` whose SKILL.md carries that marker (or the fixed header
-    sentence older versions of the generator wrote) and this repo's stamp, but whose
-    domain no longer has approved rules (renamed, merged, or all rejected), so an
-    outdated skill cannot keep auto-loading. Skills the generator did not write
-    (hand-written ones sharing the directory) and skills another repo generated into
-    a shared skills directory are never touched. A skill directory written by a very
+    sentence older versions of the generator wrote) but whose domain no longer has
+    approved rules (renamed, merged, or all rejected), so an outdated skill cannot
+    keep auto-loading. Inside the repo's own tree the stamp is ignored for this (a
+    fork or renamed repo still prunes skills stamped with its old identity); in a
+    skills directory **outside** the repo, only skills carrying this repo's stamp are
+    pruned. Skills the generator did not write (hand-written ones sharing the
+    directory) and skills another repo generated into a shared skills directory are
+    never touched. A skill directory written by a very
     old build (no marker, none of the generator's fixed body sentences) carries no
     fingerprint and is left alone too; if the Step 13 file list no longer names a
     `<skills-dir>/<domain>/` that still exists, tell the user it is a leftover from

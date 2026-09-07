@@ -120,6 +120,7 @@ func TestAuditFile_yamlValidity(t *testing.T) {
 		{"paths as list", "name: ui\ndescription: x.\npaths:\n  - \"*.tsx\"\n  - \"src/**/*.ts\"", ""},
 		{"empty glob", "name: ui\ndescription: x.\npaths: \"*.tsx,,src/**/*.ts\"", "empty glob"},
 		{"nested value", "name: ui\ndescription:\n  text: x\n", "nested value"},
+		{"nested list item", "name: ui\ndescription: x\npaths:\n  - [a]\n  - b\n", "nested value"},
 		{"bare scalar", "just a note", "must be a key/value mapping"},
 		{"list", "- a\n- b", "must be a key/value mapping"},
 	}

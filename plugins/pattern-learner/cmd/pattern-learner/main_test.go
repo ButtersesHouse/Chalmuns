@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -191,9 +192,45 @@ func TestResolveOwner(t *testing.T) {
 	if got, err := resolveOwner("", s, t.TempDir()); err != nil || got != "acme/beta" {
 		t.Errorf("state: got %q, %v", got, err)
 	}
-	// No flag, no state repo, no git remote: unowned, not an error.
-	if got, err := resolveOwner("", state.Empty(), t.TempDir()); err != nil || got != "" {
+	// No flag, no state repo, no git remote: unowned, not an error. The
+	// directory is its own git repository (with no origin) so the git
+	// fallback cannot walk up into whatever checkout TMPDIR happens to be
+	// under.
+	noRemote := t.TempDir()
+	if out, err := exec.Command("git", "-C", noRemote, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	if got, err := resolveOwner("", state.Empty(), noRemote); err != nil || got != "" {
 		t.Errorf("fallback: got %q, %v", got, err)
+	}
+}
+
+// repoRoot judges by the state file's git top level, not the current
+// directory, so a run from an ancestor of a user-level skills directory
+// cannot mistake that directory for the repo's own.
+func TestRepoRoot(t *testing.T) {
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable: %v: %s", err, out)
+	}
+	stateDir := filepath.Join(repo, ".claude", "pattern-learner")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	got := repoRoot(filepath.Join(stateDir, "state.json"), "/elsewhere")
+	want, _ := filepath.EvalSymlinks(repo)
+	if gotResolved, _ := filepath.EvalSymlinks(got); gotResolved != want {
+		t.Errorf("repoRoot = %q, want %q", got, want)
+	}
+	// State outside any git repo: fall back to outputDir. The directory is
+	// its own repo-less location only if TMPDIR is not inside a checkout, so
+	// pin it with a nested git repo whose parent is the state dir.
+	if root := repoRoot(filepath.Join(t.TempDir(), "state.json"), "/fallback"); root != "/fallback" {
+		// Inside a checkout this legitimately resolves to that checkout;
+		// only assert the fallback when git found nothing.
+		if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+			t.Errorf("repoRoot fallback = %q, want /fallback", root)
+		}
 	}
 }
 

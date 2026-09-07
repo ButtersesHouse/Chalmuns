@@ -55,6 +55,13 @@ type Options struct {
 	// empty, the state's repo field is used, and when that is empty too the
 	// skills are written unstamped.
 	Owner string
+	// RepoRoot is the root of the repository this run writes for. A skills
+	// directory inside it belongs to that repository alone; one outside it
+	// is treated as shared. When empty, outputDir is used, which is only
+	// safe when outputDir really is the repository root (the CLI resolves
+	// the git top level so that a run from an ancestor directory cannot
+	// mistake a user-level skills directory for the repo's own).
+	RepoRoot string
 }
 
 // Write generates the per-domain skill files under opts.SkillsDir (default
@@ -70,7 +77,11 @@ func Write(s state.State, outputDir string, opts Options) error {
 	if skillsDir == "" {
 		skillsDir = filepath.Join(outputDir, ".claude", "skills")
 	}
-	return writeSkillFiles(s, skillsDir, isSharedSkillsDir(skillsDir, outputDir), opts)
+	repoRoot := opts.RepoRoot
+	if repoRoot == "" {
+		repoRoot = outputDir
+	}
+	return writeSkillFiles(s, skillsDir, isSharedSkillsDir(skillsDir, repoRoot), opts)
 }
 
 // isSharedSkillsDir reports whether skillsDir lies outside outputDir (the
@@ -294,16 +305,18 @@ func parseOwnerLine(line string) (string, bool) {
 }
 
 // isEmptyShell reports whether dir holds nothing but what an interrupted
-// first write of ours could leave: no entries, or only the SKILL.md.tmp of
-// an atomicWrite that never reached its rename. (SKILL.md is written before
-// the companion files, so a run that got any further left the marker.)
+// first write of ours could leave: no entries, or only the temp file of a
+// SKILL.md atomicWrite that never reached its rename. (SKILL.md is written
+// before the companion files, so a run that got any further left the
+// marker.)
 func isEmptyShell(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
+	leftover := filepath.Base(tmpPath(filepath.Join(dir, "SKILL.md")))
 	for _, e := range entries {
-		if e.Name() != "SKILL.md.tmp" {
+		if e.Name() != leftover {
 			return false
 		}
 	}
@@ -375,18 +388,25 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 	return nil
 }
 
-// generatedBodyLines are fixed sentences the generator writes into a skill
-// body. They identify a skill from a build that predates GeneratedMarker
-// (the first two since the progressive-disclosure layout, the third for
-// longer), which is the population pruning was added to clean up. Each is
-// long and exact, so a hand-written skill cannot match by accident. A skill
-// from a build older than all three carries no fingerprint and must be
-// removed by hand; SKILL.md says so.
-var generatedBodyLines = []string{
-	"Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.",
-	"This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.",
-	"Read one of these before writing new code in this domain — they best represent the team's style:",
-}
+// The fixed explanatory sentences the generator writes into a skill body.
+// Besides being rendered, they double as fingerprints (generatedBodyLines)
+// for skills written by builds that predate GeneratedMarker. If one is ever
+// reworded, keep the old wording in generatedBodyLines as well: files
+// carrying it are still out there.
+const (
+	inlineRulesIntro    = "Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers."
+	chunkedIndexIntro   = "This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`."
+	exemplaryFilesIntro = "Read one of these before writing new code in this domain — they best represent the team's style:"
+)
+
+// generatedBodyLines are whole lines that identify a skill written by a
+// build that predates GeneratedMarker (the first two since the
+// progressive-disclosure layout, the third for longer), which is the
+// population pruning was added to clean up. Each is long and exact, so a
+// hand-written skill cannot match by accident. A skill from a build older
+// than all three carries no fingerprint and must be removed by hand;
+// SKILL.md says so.
+var generatedBodyLines = []string{inlineRulesIntro, chunkedIndexIntro, exemplaryFilesIntro}
 
 // frontmatterName reads a SKILL.md's name field through the module's one
 // frontmatter reader. A block that is not valid YAML (every skill this
@@ -549,7 +569,7 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule, 
 
 	if exemplary := exemplaryFiles(rules); len(exemplary) > 0 {
 		b.WriteString("## Exemplary Files\n\n")
-		b.WriteString("Read one of these before writing new code in this domain — they best represent the team's style:\n\n")
+		b.WriteString(exemplaryFilesIntro + "\n\n")
 		for _, f := range exemplary {
 			b.WriteString(fmt.Sprintf("- `%s`\n", f))
 		}
@@ -561,7 +581,7 @@ func renderSkillHeader(domain, desc string, globs []string, rules []state.Rule, 
 func renderInlineRules(rules []state.Rule, slugs []string, watermark int, opts Options) string {
 	var b strings.Builder
 	b.WriteString("## Rules\n\n")
-	b.WriteString("Rules with examples link a file under `examples/` — read it at your discretion for do/don't code and real instances before writing code the rule covers.\n\n")
+	b.WriteString(inlineRulesIntro + "\n\n")
 	for i, r := range rules {
 		b.WriteString(fmt.Sprintf("### %s\n\n", r.Title))
 		b.WriteString(r.Rule + "\n\n")
@@ -615,7 +635,7 @@ func writeRuleChunks(skillDir string, rules []state.Rule, slugs []string, waterm
 
 func renderRuleIndex(rules []state.Rule, slugs []string) string {
 	var b strings.Builder
-	b.WriteString("This skill is chunked to keep SKILL.md small: each rule lives in its own file under `rules/`, examples included. Find matching rules in the index below (by title or glob) and read only those files. For a full-text lookup, grep the `rules/` directory next to this file, e.g. `grep -ril \"<keyword>\" rules/`.\n\n")
+	b.WriteString(chunkedIndexIntro + "\n\n")
 	b.WriteString("## Rule Index\n\n")
 	last := ""
 	for i, r := range rules {
@@ -900,9 +920,18 @@ func collectGlobs(rules []state.Rule) ([]string, error) {
 	var all []string
 	for _, r := range rules {
 		for _, g := range r.Target.FileGlob {
+			if g == "" {
+				continue
+			}
 			for _, expanded := range ExpandBraces(g) {
 				if strings.Contains(expanded, ",") {
 					return nil, fmt.Errorf("file glob %q contains a comma, which the skill's comma-separated paths field cannot carry; rewrite the glob without it (brace groups such as {a,b} are expanded automatically) and rerun", g)
+				}
+				// An empty brace alternative ("src/{a,}/**") yields a path
+				// with an empty segment that a matcher never satisfies; the
+				// shell idiom has no equivalent in a paths gate.
+				if expanded == "" || strings.HasPrefix(expanded, "/") || strings.HasSuffix(expanded, "/") || strings.Contains(expanded, "//") {
+					return nil, fmt.Errorf("file glob %q expands to %q, which has an empty path segment (an empty brace alternative); list the alternatives explicitly and rerun", g, expanded)
 				}
 				all = append(all, expanded)
 			}
@@ -1093,11 +1122,18 @@ func headingTitle(domain string) string {
 	return strings.Join(words, " ")
 }
 
+// tmpPath is the temp file atomicWrite stages path's content in. It is a
+// helper rather than an inline literal because isEmptyShell must recognise
+// the leftover of an interrupted write by the same name.
+func tmpPath(path string) string {
+	return path + ".tmp"
+}
+
 func atomicWrite(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
+	tmp := tmpPath(path)
 	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
 		return err
 	}

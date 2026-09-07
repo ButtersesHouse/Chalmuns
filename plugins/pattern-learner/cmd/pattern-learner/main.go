@@ -138,8 +138,26 @@ func runWriteOutputs(args []string) error {
 		RAGHints:  ragHints,
 		SkillsDir: flagValue(args, "--skills-dir", ""),
 		Owner:     owner,
+		RepoRoot:  repoRoot(statePath, outputDir),
 	}
 	return output.Write(s, outputDir, opts)
+}
+
+// repoRoot finds the root of the repository a run writes for, which decides
+// whether the skills directory is the repo's own or a shared one. The state
+// file lives inside the repository, so its git top level is authoritative;
+// when the state is not under git, fall back to outputDir. Using the
+// current directory alone would misclassify a user-level skills directory
+// as repo-owned whenever the command is run from one of its ancestors.
+func repoRoot(statePath, outputDir string) string {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = filepath.Dir(statePath)
+	if out, err := cmd.Output(); err == nil {
+		if top := strings.TrimSpace(string(out)); top != "" {
+			return top
+		}
+	}
+	return outputDir
 }
 
 // resolveOwner picks the "owner/repo" identity stamped into generated skills,
