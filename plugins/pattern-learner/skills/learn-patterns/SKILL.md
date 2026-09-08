@@ -72,7 +72,7 @@ Follow all steps in order. Do not skip steps unless the mode explicitly says to.
 Parse `$ARGUMENTS`:
 - `--refresh` → incremental mode: only fetch PRs newer than last run
 - `--review` → approval-only mode: skip all fetching, go straight to Step 10
-- `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. Supersessions, conflicts, and single-implicit singletons are auto-deferred for human review. `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
+- `--auto` → unattended mode: run the full pipeline (or combine with `--refresh` for incremental) and auto-approve rules at Step 10 without any interactive prompts. Supersessions, conflicts, conventions seen in only one review, and single-implicit singletons are auto-deferred for human review (the last two are waived by `--auto-threshold`; the first two never are). `--auto` + `--review` is invalid — abort with: "Error: --auto and --review are incompatible. --review requires human approval; --auto skips it."
 - `--auto-threshold` → modifier for `--auto` only: also auto-approve single-implicit singletons that would normally be deferred. Has no effect without `--auto`.
 - `--all` → modifier for `--review` only: force-show all proposed emerging rules in the approval loop, including ones the user previously skipped that have not received new signals since. Has no effect without `--review`.
 - `--discover [domain ...]` → codebase-discovery mode: use cursor-agent to find patterns directly from code, skip PR fetching. Optional domain names after `--discover` target specific domains (e.g. `--discover api auth`). If no domains given, discover for all domains that already have approved rules.
@@ -511,8 +511,18 @@ Auto-approve mode:
   Auto-approved:              <N>
   Deferred (supersessions):   <N>  ← run /learn-patterns --review to decide
   Deferred (conflicts):       <N>  ← run /learn-patterns --review to decide
+  Deferred (single review):   <N>  ← run /learn-patterns --review to decide
+  Deferred (singletons):      <N>  ← run /learn-patterns --review to decide
 ─────────────────────────────────────────────────────
 ```
+
+`triage --mode auto` defers on four predicates, not two, and every deferral leaves a rule
+sitting at `status: "proposed"` that nobody has been told about. Report all four: a rule
+held back for corroboration and a rule nobody mentioned look identical from the outside.
+`triage` returns the rules with their statuses patched, so count the deferred ones by the
+same predicate order it uses — `supersedes` first, then `conflicted`, then all-review with
+at most one distinct `review_id`, then `signal_count == 1` with every source implicit. The
+last two are absent when `--auto-threshold` is set, because it approves them instead.
 
 **Release the run-lock**: after the summary is printed, remove the guard lock so normal tooling is unrestricted again:
 ```
