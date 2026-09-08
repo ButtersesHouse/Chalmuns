@@ -486,6 +486,17 @@ func redactSecrets(text string) string {
 	if !reSecretHint.MatchString(text) {
 		return text
 	}
+	// A JSON document answers the question the patterns below have to guess
+	// at. See redactJSON.
+	if out, ok := redactJSON(text); ok {
+		return out
+	}
+	return redactText(text)
+}
+
+// redactText is the pattern pass: what runs on text that is not a JSON
+// document, and on the individual string values inside one.
+func redactText(text string) string {
 	// Each pass writes a sentinel the value classes cannot match, so a later
 	// pattern cannot consume part of an earlier replacement: `--token=x` was
 	// rewritten by the assignment rule and then again by the flag rule, which
@@ -505,6 +516,91 @@ const (
 	redactedSentinel = "\x00redacted\x00"
 	redactedMarker   = "[redacted]"
 )
+
+// redactJSON redacts a response that is a JSON document, and reports whether
+// it was one.
+//
+// Inside a document the ambiguity the patterns below spend four heuristics on
+// does not exist. A `password` *key's* value is a credential because the key
+// says so; a `message` key's value is the reviewer's prose because that key
+// says so too. Nothing has to be inferred from where the text sits on a line.
+//
+// What is left ambiguous is a config line a tool echoed into a string —
+// semgrep's `extra.lines` — and that is where the patterns still run. They run
+// per string value rather than over the document, which is what stops a match
+// from crossing out of one finding into the next, from consuming the quote
+// that ends a string, and from leaving the document unparseable. Every one of
+// those was a defect this file has carried.
+//
+// A truncated or non-JSON response — which is common, and is why the patterns
+// exist at all — is reported as not-JSON and falls through to them.
+func redactJSON(text string) (string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return "", false
+	}
+	var doc interface{}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	// Numbers keep the spelling the tool wrote: a line number past 2^53
+	// re-encoded through float64 came back changed, in text this package
+	// documents as byte-for-byte.
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return "", false
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// Without this a reviewer's `a < b && c > d` comes back as escape
+	// sequences, and a signal quoting it fails grounding.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(redactValue(doc, "", 0)); err != nil {
+		return "", false
+	}
+	return strings.TrimRight(buf.String(), "\n"), true
+}
+
+// redactValue rewrites one decoded value. key is the field it was found under,
+// which is what decides whether a string is a credential or the review.
+func redactValue(v interface{}, key string, depth int) interface{} {
+	if depth > 64 {
+		return v
+	}
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			out[k] = redactValue(val, k, depth+1)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			// An array element keeps its field's name: the values of an
+			// `argv` are the command line, whichever slot they sit in.
+			out[i] = redactValue(e, key, depth+1)
+		}
+		return out
+	case string:
+		if reSecretKey.MatchString(key) {
+			return redactedMarker
+		}
+		return redactSecretsInValue(t)
+	}
+	return v
+}
+
+// reSecretKey matches a field name that says its value is a credential.
+var reSecretKey = regexp.MustCompile(`(?i)^["']?[A-Za-z0-9_.-]*(?:` + secretName +
+	`|authorization|auth)[A-Za-z0-9_.-]*["']?$`)
+
+// redactSecretsInValue runs the text patterns over one string value, where a
+// match cannot reach anything outside it.
+func redactSecretsInValue(text string) string {
+	if !reSecretHint.MatchString(text) {
+		return text
+	}
+	return redactText(text)
+}
 
 // secretName is the part of a field name that says what the field holds. auth
 // is here only for the `=` form, where the syntax leaves no doubt; as a bare
@@ -583,10 +679,16 @@ var secretPatterns = []*regexp.Regexp{
 // end of the review whenever the next character was a newline, taking every
 // finding after it; one that swallowed a trailing `\` ate the escape of the
 // `\"` that ended the enclosing JSON string and left the document invalid.
+// bareValue is an unquoted value. It stops at a markdown delimiter as well as
+// at shell and JSON punctuation: replacing a span that had swallowed the
+// closing backtick of “ `api_key: abcdef` “ left the rest of the write-up
+// rendering as code.
+const bareValue = "([^\\s\"'`*,;)\\]}\\\\]+)"
+
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')([^'\n]*)(')`),
-	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*)([^\s"',;)\]}\\]+)()`),
+	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*)` + bareValue + `()`),
 }
 
 // redactColonForm decides each `name: value` from three things: what precedes
@@ -636,6 +738,7 @@ func redactColonForm(text string) string {
 // value.
 func isAssignedCredential(text string, loc []int) bool {
 	value := text[loc[4]:loc[5]]
+	rest := text[loc[1]:]
 	if len([]rune(strings.TrimSpace(value))) < 6 {
 		// `token: yes` is a sentence.
 		return false
@@ -645,17 +748,20 @@ func isAssignedCredential(text string, loc []int) bool {
 		// file that does not exist, in the text grounding checks against.
 		return false
 	}
-	if followedByWords(text[loc[1]:]) {
-		// `apiKey:process.env.API_KEY is read at startup` — an assignment's
-		// line ends at its value; a sentence carries on.
-		return false
-	}
 	if beginsItsUnit(text, loc[0]) {
-		return true
+		// An assignment. What follows is an annotation — `# rotate this`,
+		// `(line 4)`, the punctuation closing a field — unless it is a word,
+		// which means the line was a sentence that happened to start with a
+		// secret-ish name.
+		return !startsWithWord(rest)
 	}
-	// A name with words before it is prose unless the value could be nothing
-	// else: one token, no spaces.
-	return !strings.ContainsAny(value, " \t\n")
+	// A name with words before it is prose. Only a value that could be
+	// nothing else is taken from it: one token, carrying a digit — an
+	// identifier the reviewer named (`sessionToken`, `change_me_now`) does
+	// not — and with nothing but punctuation after it on the line.
+	return !strings.ContainsAny(value, " \t\n") &&
+		strings.ContainsAny(value, "0123456789") &&
+		!followedByWords(rest)
 }
 
 // beginsItsUnit reports whether the match at i starts its line or its string,
@@ -665,13 +771,18 @@ func isAssignedCredential(text string, loc []int) bool {
 // and the whole report arrives as one line of JSON.
 func beginsItsUnit(text string, i int) bool {
 	start := strings.LastIndexAny(text[:i], "\n\"'")
-	return strings.TrimLeft(text[start+1:i], " \t-*>|{,[#") == ""
+	prefix := strings.TrimLeft(text[start+1:i], " \t-*+>|{,[#`")
+	// An ordered list item — `1. password: …` — is a bullet too.
+	return prefix == "" || reOrderedItem.MatchString(prefix)
 }
 
-// followedByWords reports whether prose continues after the value. A comment
-// does not count — `password: x  # rotate this` is still an assignment — and
-// neither does the punctuation that closes a field.
-func followedByWords(rest string) bool {
+var reOrderedItem = regexp.MustCompile(`^[0-9]+[.)][ \t]*$`)
+
+// startsWithWord reports whether the first thing after the value is a word. A
+// comment is not — `password: x  # rotate this` is still an assignment — and
+// neither is an annotation the value is followed by: `(line 4)`, a comma, the
+// quote that closes a field.
+func startsWithWord(rest string) bool {
 	rest = strings.TrimLeft(rest, " \t")
 	if strings.HasPrefix(rest, "#") || strings.HasPrefix(rest, "//") {
 		return false
@@ -682,10 +793,36 @@ func followedByWords(rest string) bool {
 	return false
 }
 
+// followedByWords reports whether prose continues anywhere after the value on
+// its line. The stricter test, for a name that did not begin its line: there
+// the surroundings have already said "sentence", so anything word-shaped after
+// the value confirms it.
+func followedByWords(rest string) bool {
+	// Bounded to the value's own line or string: past that is another field or
+	// another finding, and what is written there says nothing about this one.
+	if i := strings.IndexAny(rest, "\n\""); i >= 0 {
+		rest = rest[:i]
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	if strings.HasPrefix(rest, "#") || strings.HasPrefix(rest, "//") {
+		return false
+	}
+	// The whole remainder, not just its first character. Stopping at the first
+	// rune made a comma or a period read as "the line ended here", so
+	// `- The api_key: abcdefghij, hardcoded in config.go` was rewritten.
+	for _, r := range rest {
+		if unicode.IsLetter(r) {
+			return true
+		}
+	}
+	return false
+}
+
 // isFileReference reports whether a value reads as a path the reviewer cited
-// rather than as a credential. A dotted extension says so — except on a long
-// unbroken run with no separator in it, which is a JWT segment rather than a
-// filename.
+// rather than as a credential: a path separator and a dotted extension, both.
+// Either alone is too much — `hunter2.key` is a password with a suffix, and a
+// base64 run is full of slashes — and requiring both is what the corpus note
+// and this comment have always described.
 //
 // Known limitation: a value that both holds a path separator and ends in a
 // short dotted extension is read as a path, so a base64 secret shaped that way
@@ -695,7 +832,7 @@ func isFileReference(value string) bool {
 	if !reFileRef.MatchString(value) {
 		return false
 	}
-	return strings.Contains(value, "/") || len([]rune(value)) < 24
+	return strings.Contains(value, "/") && len([]rune(value)) < 64
 }
 
 var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)

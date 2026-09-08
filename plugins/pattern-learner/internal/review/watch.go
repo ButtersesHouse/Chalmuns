@@ -180,7 +180,6 @@ var commandWrappers = map[string]bool{
 	"npx": true, "bunx": true, "uvx": true, "pnpm": true, "yarn": true,
 	"npm": true, "bun": true, "poetry": true, "uv": true, "run": true,
 	"command": true, "builtin": true, "timeout": true, "xargs": true,
-	"tool": true,
 }
 
 // commandBase reduces an invocation token to the program's name: quotes off,

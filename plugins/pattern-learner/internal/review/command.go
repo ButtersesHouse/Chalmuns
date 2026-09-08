@@ -127,7 +127,7 @@ func calledProgram(call *syntax.CallExpr) []string {
 			case valueFlags[wrapper][word]:
 				i++
 				continue
-			case strings.HasPrefix(word, "-"), reAssignArg.MatchString(word):
+			case strings.HasPrefix(word, "-"), isAssignment(wrapper, word):
 				continue
 			case operands > 0:
 				// `timeout 60s semgrep .` — the duration is the wrapper's, not
@@ -138,7 +138,7 @@ func calledProgram(call *syntax.CallExpr) []string {
 		}
 		out = append(out, word)
 		base := strings.ToLower(commandBase(word))
-		if !commandWrappers[base] {
+		if !commandWrappers[base] && !subWrappers[wrapper][base] {
 			return out
 		}
 		wrapper, operands = base, wrapperOperands[base]
@@ -160,11 +160,15 @@ var (
 			"--user": true, "--group": true, "--prompt": true, "--chdir": true,
 			"--close-from": true, "--host": true, "--role": true, "--type": true,
 			"-D": true, "-R": true, "-T": true, "--chroot": true,
-			"--command-timeout": true},
+			"--command-timeout": true, "-r": true, "-t": true, "-U": true,
+			"--other-user": true},
 		"env":     {"-u": true, "-C": true, "--unset": true, "--chdir": true},
 		"timeout": {"-s": true, "-k": true, "--signal": true, "--kill-after": true},
 		"nice":    {"-n": true, "--adjustment": true},
 		"exec":    {"-a": true},
+		// /usr/bin/time, not the shell keyword — the parser gives the keyword
+		// its own node, so what reaches here is the program.
+		"time": {"-f": true, "-o": true, "--format": true, "--output": true},
 		// Only the flags GNU xargs requires an argument for. `-i`, `-l`,
 		// `--replace` and `--eof` take an *optional* one, which xargs never
 		// reads as a separate word, so listing them swallowed the program:
@@ -172,7 +176,7 @@ var (
 		"xargs": {"-a": true, "-I": true, "-n": true, "-P": true,
 			"-d": true, "-s": true, "-L": true, "-E": true,
 			"--max-args": true, "--max-procs": true, "--max-chars": true,
-			"--max-lines": true, "--arg-file": true, "--delimiter": true},
+			"--arg-file": true, "--delimiter": true},
 		"yarn": {"--cwd": true},
 		// A subcommand's own flags. `wrapper` follows the chain, so `uv run
 		// --with x semgrep .` consults this rather than uv's table, and an
@@ -192,10 +196,29 @@ var (
 	inquiryFlags = map[string]map[string]bool{
 		"command": {"-v": true, "-V": true},
 		"builtin": {"-v": true, "-V": true},
+		// sudo -l lists what is permitted, -v refreshes the timestamp, -e
+		// opens an editor. None of them runs the program named after.
+		"sudo": {"-l": true, "-v": true, "-e": true,
+			"--list": true, "--validate": true, "--edit": true},
 	}
 	// Operands the wrapper itself takes before the program.
 	wrapperOperands = map[string]int{"timeout": 1}
+	// Subcommands that are wrappers only where they are reached from. Making
+	// `tool` a wrapper outright let `npm run tool semgrep` — an npm script
+	// named tool, taking semgrep as an argument — report a run of semgrep.
+	subWrappers = map[string]map[string]bool{"uv": {"tool": true}}
 )
+
+// isAssignment reports whether a wrapper's argument sets a variable rather
+// than naming the program. `env` passes any `NAME=VALUE` string to putenv and
+// does not require a shell-legal identifier, so `env a.b=c semgrep .` is still
+// a run of semgrep.
+func isAssignment(wrapper, word string) bool {
+	if reAssignArg.MatchString(word) {
+		return true
+	}
+	return wrapper == "env" && strings.Contains(word, "=") && !strings.HasPrefix(word, "=")
+}
 
 var reAssignArg = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 

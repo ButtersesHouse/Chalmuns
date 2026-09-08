@@ -653,6 +653,15 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"a sudo command timeout", `sudo -T 60 semgrep .`, true},
 		{"a subcommand short flag", `uv run -p 3.12 semgrep .`, true},
 		{"a two-word subcommand", `uv tool run semgrep .`, true},
+		// `tool` is a wrapper only after `uv`: as a global one, an npm script
+		// named tool taking the tool's name as an argument reported a run.
+		{"an npm script named tool", `npm run tool semgrep`, false},
+		// sudo -l lists, -v refreshes, -e edits. None runs what follows.
+		{"sudo listing a command", `sudo -l semgrep .`, false},
+		{"a sudo role flag", `sudo -r sysadm_r semgrep .`, true},
+		{"an xargs optional long flag", `xargs --max-lines semgrep`, true},
+		{"env with a name a shell would refuse", `env a.b=c semgrep .`, true},
+		{"the time program's format flag", `/usr/bin/time -f %e semgrep .`, true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},

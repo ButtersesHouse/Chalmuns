@@ -80,14 +80,30 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a word before the name", `Using api_key: abcdef123456`, "abcdef123456", "Using api_key"},
 	{"a heading before the name", `### 1. Hardcoded password: "hunter2trustno1"`, "hunter2trustno1", "Hardcoded password"},
 	{"two credentials on one line", `password: hunter2trustno1, token: swordfish123`, "swordfish123", "token"},
+	// A dotted tail is not a path unless a separator says so, and a bullet is
+	// a bullet whichever character the reviewer used.
+	{"a value with a dotted tail", `password: hunter2.key`, "hunter2.key", "password"},
+	{"a plus bullet", `+ password: "p@ss w0rd"`, "p@ss w0rd", "password"},
+	{"an ordered list item", `1. password: "p@ss w0rd"`, "p@ss w0rd", "password"},
+	// A markdown delimiter is not part of the value; swallowing the closing
+	// one rendered the rest of the write-up as code.
+	{"a value in a code span", "`api_key: abcdefghijkl`", "abcdefghijkl", "api_key"},
+	{"a value in bold", `**secret: hunter2trustno1**`, "hunter2trustno1", "secret"},
 }
 
-// Known limitation, recorded rather than asserted: a value that both holds a
-// path separator and ends in a short dotted extension —
-// `secret: wJalrX/K7MDENG/bPxRfiCYEXAMPLE.key` — reads as a path and survives.
-// A path and a base64 run of that shape are not separable by shape alone, and
-// of the two errors, reading a cited path as a credential is the one that
-// corrupts the corpus this feature builds. See isFileReference.
+// knownLimitations are the shapes this pattern set deliberately does not
+// catch, asserted so the trade-off cannot drift without CI noticing. A comment
+// alone let one of them be stated more narrowly than the code implemented.
+var knownLimitations = []struct{ name, in, survives string }{
+	// A path separator and a dotted extension together read as a path. The
+	// two are not separable by shape, and of the errors available, reading a
+	// cited path as a credential is the one that corrupts the corpus this
+	// feature builds. See isFileReference.
+	{"a slashed value with a dotted tail", `secret: wJalrX/K7MDENG/bPxRfiCYEXAMPLE.key`, "wJalrX"},
+	// A name with words before it needs a value that could be nothing else,
+	// and "could be nothing else" is spelled "carries a digit".
+	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
+}
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
 // rewritten by some version of these patterns.
@@ -126,6 +142,13 @@ var proseCorpus = []struct{ name, in string }{
 	{"a struct field in prose", "- The struct sets Token:tokenValue without validation"},
 	{"a section name after a colon", "Note the password:overview section"},
 	{"a code fragment with prose after it", "apiKey:process.env.API_KEY is read at startup"},
+	// A name with words before it is a sentence. Only a value that could be
+	// nothing else — one token carrying a digit — is taken from one, so an
+	// identifier the reviewer named is left as written whatever punctuation
+	// follows it.
+	{"a value followed by a clause", "- The api_key: abcdefghij, hardcoded in config.go, must move to env"},
+	{"an identifier ending a sentence", "- Rename the token: sessionToken."},
+	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
 	{"a heading ending in a colon", "## Findings\n\n### 1. Hardcoded credential:\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nThe endpoint is unbounded.\n"},
@@ -179,6 +202,18 @@ func TestRedactSecrets_leavesTheReviewAlone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := redactSecrets(tc.in); got != tc.in {
 				t.Errorf("the reviewer's own words were rewritten:\n  in:  %q\n  out: %q", tc.in, got)
+			}
+		})
+	}
+}
+
+// The trade-offs, pinned. A change that starts catching one of these is
+// welcome — and has to say so here rather than passing silently.
+func TestRedactSecrets_knownLimitations(t *testing.T) {
+	for _, tc := range knownLimitations {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactSecrets(tc.in); !strings.Contains(got, tc.survives) {
+				t.Errorf("this is now caught — update knownLimitations:\n  in:  %q\n  out: %q", tc.in, got)
 			}
 		})
 	}
