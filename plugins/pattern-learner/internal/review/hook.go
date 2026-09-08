@@ -3,7 +3,6 @@ package review
 import (
 	"bytes"
 	"encoding/json"
-	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -131,7 +130,7 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	}
 
 	art, err := Capture(Input{
-		Data:   []byte(text),
+		Data:   []byte(scrubJSON(text)),
 		Source: matched.Name,
 		Format: matched.Format,
 		Label:  hookLabel(matched.Name, toolName, skill),
@@ -313,7 +312,8 @@ func valueText(v interface{}, depth int) string {
 		// Scrubbed like a map is: eslint's native shape is an array, so a
 		// response that decodes to one reached the artifact unscrubbed and a
 		// credential in it was written straight into the repository.
-		return marshalText(scrub(v, 0))
+		scrubbed, _ := scrub(v, 0)
+		return marshalText(scrubbed)
 	case map[string]interface{}:
 		// One pass over everything in this map that could be the review, then
 		// the best of it, in a fixed order of preference. Returning the first
@@ -440,8 +440,9 @@ func marshalText(v interface{}) string {
 // prose out as review text, and carrying it in the payload instead would put a
 // crash message into the grounding corpus by the back door.
 var invocationKeys = map[string]bool{
-	"command": true, "cmd": true, "argv": true, "args": true,
-	"env": true, "environment": true, "tool_input": true, "stderr": true,
+	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
+	"env": true, "environment": true, "cwd": true, "tool_input": true,
+	"stderr": true,
 }
 
 // envelopeKeys are what a tool runner wraps a result in: where it ran and how
@@ -450,9 +451,9 @@ var invocationKeys = map[string]bool{
 // Snyk, Grype and Checkov findings, and `file_path` is a finding's location.
 // Stripping them everywhere deleted the reviewer's own prose from the corpus.
 var envelopeKeys = map[string]bool{
-	"cwd": true, "file_path": true, "description": true, "input": true,
-	"tool_name": true, "tool_use_id": true, "is_error": true,
-	"interrupted": true, "exit_code": true, "exitCode": true, "sandbox": true,
+	"file_path": true, "description": true, "tool_name": true,
+	"tool_use_id": true, "is_error": true, "interrupted": true,
+	"exit_code": true, "exitCode": true, "sandbox": true,
 }
 
 // reportPayload renders a decoded response as a candidate review: the map with
@@ -474,72 +475,102 @@ func reportPayload(t map[string]interface{}) string {
 		if envelopeKeys[key] || invocationKeys[key] || isResponseTextKey(key) {
 			continue
 		}
-		rest[key] = scrub(val, 0)
+		rest[key], _ = scrub(val, 0)
 	}
 	return marshalText(rest)
 }
 
-// scrub removes the invocation fields from a decoded value at every level,
-// returning the value itself when there was nothing to remove — which is the
-// overwhelmingly common case, and rebuilding every container regardless meant
-// a second full copy of a document that can be megabytes, on a path that runs
-// after every matching tool call.
+// scrub removes the invocation fields from a decoded value at every level. It
+// reports whether it removed anything, and returns the value itself when it
+// did not — which is the overwhelmingly common case, and rebuilding every
+// container regardless meant a second full copy of a document that can be
+// megabytes, on a path that runs after every matching tool call.
 //
-// depth only stops a runaway. Past it the value is passed through unchanged
-// rather than dropped: a bound that nils out what it cannot reach corrupted
-// ordinary reports — a SARIF result's location and snippet sit deeper than a
-// small bound allows — and handed the corruption on as the grounding corpus.
-func scrub(v interface{}, depth int) interface{} {
+// Past the depth bound the value is dropped rather than passed through. The
+// bound is set where no report reaches — a SARIF result's location and snippet
+// sit around ten levels down, and a bound tight enough to cut those corrupted
+// ordinary reports — so anything below it is a document shaped to get past the
+// scrub, and emitting it raw would be the leak this function exists to stop.
+func scrub(v interface{}, depth int) (interface{}, bool) {
 	if depth > 64 {
-		return v
+		return nil, true
 	}
 	switch t := v.(type) {
 	case map[string]interface{}:
-		out := make(map[string]interface{}, len(t))
-		changed := false
+		var out map[string]interface{}
 		for key, val := range t {
+			scrubbed, changed := interface{}(nil), false
 			if invocationKeys[key] {
 				changed = true
+			} else {
+				scrubbed, changed = scrub(val, depth+1)
+			}
+			if changed && out == nil {
+				// First removal: copy what has been passed over so far.
+				out = make(map[string]interface{}, len(t))
+				for k, v := range t {
+					out[k] = v
+				}
+			}
+			if out == nil {
 				continue
 			}
-			scrubbed := scrub(val, depth+1)
-			// Compared by identity, not by value: a container scrub left alone
-			// comes back as the same reference.
-			if !sameValue(scrubbed, val) {
-				changed = true
+			if invocationKeys[key] {
+				delete(out, key)
+			} else {
+				out[key] = scrubbed
 			}
-			out[key] = scrubbed
 		}
-		if !changed {
-			return v
+		if out == nil {
+			return v, false
 		}
-		return out
+		return out, true
 	case []interface{}:
-		out := make([]interface{}, len(t))
-		changed := false
+		var out []interface{}
 		for i, e := range t {
-			out[i] = scrub(e, depth+1)
-			if !sameValue(out[i], e) {
-				changed = true
+			scrubbed, changed := scrub(e, depth+1)
+			if changed && out == nil {
+				out = make([]interface{}, len(t))
+				copy(out, t)
+			}
+			if out != nil {
+				out[i] = scrubbed
 			}
 		}
-		if !changed {
-			return v
+		if out == nil {
+			return v, false
 		}
-		return out
+		return out, true
 	}
-	return v
+	return v, false
 }
 
-// sameValue reports whether scrub returned its argument untouched. Only the
-// container cases can return something new, and for those a pointer comparison
-// through reflect is exact; everything else is returned as-is by definition.
-func sameValue(scrubbed, original interface{}) bool {
-	switch original.(type) {
-	case map[string]interface{}, []interface{}:
-		return reflect.ValueOf(scrubbed).Pointer() == reflect.ValueOf(original).Pointer()
+// scrubJSON is scrub for review text that arrived as a string. It is the path
+// that matters most: a Bash hook payload delivers a linter's JSON as
+// `tool_response.stdout`, a string, so nothing in the decoded tree was ever a
+// container and every invocation field in it — `{"results":[…],"command":
+// "SEMGREP_APP_TOKEN=… semgrep"}` — went into the artifact verbatim.
+//
+// The original bytes are returned untouched unless something was actually
+// removed, because they are the grounding corpus and re-marshalling reorders
+// keys and drops the tool's own formatting for no reason.
+func scrubJSON(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return text
 	}
-	return true
+	var doc interface{}
+	if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
+		return text
+	}
+	scrubbed, changed := scrub(doc, 0)
+	if !changed {
+		return text
+	}
+	if out := marshalText(scrubbed); out != "" {
+		return out
+	}
+	return text
 }
 
 func isResponseTextKey(key string) bool {

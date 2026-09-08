@@ -533,6 +533,17 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		// A shell keyword introduces a command without being one.
 		{"run after then", "if ((x > 1)); then semgrep .; fi", true},
 		{"run after do", "for f in *; do semgrep $f; done", true},
+		// Gating a build on a linter's exit status is the idiomatic
+		// conditional invocation, so the condition keywords count too.
+		{"run as an if condition", "if semgrep .; then echo ok; fi", true},
+		{"run as a while condition", "while semgrep .; do break; done", true},
+		// Quotes nest inside a substitution however the text around it is
+		// quoted. The inner quote used to end the span, losing a real run and
+		// spilling the tail out as unquoted shell.
+		{"nested quotes in a substitution", `out="$(semgrep --config "p/ci" .)"`, true},
+		{"nested quotes around a variable", `out="$(semgrep --json "$dir")"`, true},
+		{"nested quoted data is not a run", `sudo "$(x "semgrep ." y)"`, false},
+		{"a separator in a nested quoted format string", `echo "$(git log --format="%s; semgrep noise")"`, false},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -807,6 +818,16 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		{"a finding's file_path survives", `{"findings":[{"file_path":"a.go","summary":"Use the shared client.","failure_scenario":"boom"}]}`, true, "", "a.go"},
 		// A SARIF result's location sits deeper than a small recursion bound,
 		// and a bound that nils out what it cannot reach corrupted the report.
+		// The Bash hook delivers a linter's JSON as a *string* under stdout,
+		// so nothing in the decoded tree is a container and the scrub of the
+		// tree never sees it. This is the primary path in production.
+		{"a command in JSON delivered as a string is stripped", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}","stderr":"","interrupted":false}`, true, "sk-secret", "check_id"},
+		{"an env in JSON delivered as a string is stripped", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, true, "sk-secret", "check_id"},
+		// An `input` and a `cwd` are what was run and where, wherever they sit.
+		{"a nested input is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"input":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}}`, true, "sk-secret", "check_id"},
+		{"a nested cwd is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"cwd":"/home/secret-project"}}`, true, "secret-project", "check_id"},
+		// Prose is never re-marshalled: it is the grounding corpus verbatim.
+		{"prose is left exactly as written", `{"stdout":"## Review\n\nUse the shared client, the command was fine."}`, true, "", "the command was fine"},
 		{"a deep SARIF report survives intact", `{"runs":[{"tool":{"driver":{"rules":[{"id":"R1","fullDescription":{"text":"Use the shared client."}}]}},"results":[{"ruleId":"R1","message":{"text":"raw requests are banned"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a.py"},"region":{"startLine":42,"snippet":{"text":"requests.get()"}}}}]}]}]}`, true, "", "requests.get()"},
 		// A linter exits non-zero exactly when it has findings, so a report
 		// beside an exit code is the ordinary shape, not the exception.

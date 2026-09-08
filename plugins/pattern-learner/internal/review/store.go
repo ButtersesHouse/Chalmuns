@@ -333,11 +333,18 @@ func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since strin
 	if len(ids) == 0 {
 		// A stamp that still does not parse means the repair could not run —
 		// the file went away between the read and the stat. Select drops such
-		// an artifact from every watermark run, so it is a real loss and is
-		// named rather than left to a stderr line the run never relays.
-		for _, m := range meta {
-			if capturedTime(m.CapturedAt).IsZero() {
-				unreadable = append(unreadable, m.ReviewID)
+		// an artifact from a watermark run, so it is a real loss and is named
+		// rather than left to a stderr line the run never relays.
+		//
+		// Only the ones this run actually dropped: reporting every bad stamp
+		// in the cache announced a loss for an artifact the same run had just
+		// delivered (a run with no watermark selects everything, bad stamps
+		// included), and named it again on every run after that.
+		if since != "" {
+			for _, m := range meta {
+				if capturedTime(m.CapturedAt).IsZero() {
+					unreadable = append(unreadable, m.ReviewID)
+				}
 			}
 		}
 		// The newest artifact considered, not the newest one read. Taking it

@@ -861,7 +861,10 @@ func TestExtractLean_anUnparseableStampIsRepaired(t *testing.T) {
 		t.Fatalf("watermark %q does not parse: %v", watermark, parseErr)
 	}
 
-	// Which means the next run is quiet: mined once, not offered again.
+	// Which means the next run is quiet: mined once, not offered again, and
+	// not reported lost — a run with no watermark selects everything, bad
+	// stamps included, so announcing a loss for one it had just delivered was
+	// both wrong and repeated on every run after.
 	lean, _, unreadable, err = ExtractLean(dir, nil, watermark)
 	if err != nil {
 		t.Fatal(err)

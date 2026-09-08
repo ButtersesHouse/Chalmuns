@@ -192,11 +192,18 @@ var commandWrappers = map[string]bool{
 
 // shellKeywords introduce a command without being one, so `then semgrep .` is
 // a run of semgrep. Without this a designated tool invoked from a conditional
-// or a loop — `if …; then semgrep .; fi`, `for f in *; do semgrep $f; done` —
-// matched nothing at all, which is the silence a designation exists to avoid.
+// or a loop — `if semgrep --error .; then …`, `for f in *; do semgrep $f; done`
+// — matched nothing at all, which is the silence a designation exists to
+// avoid. Gating a build on a linter's exit status is the idiomatic conditional
+// invocation, so the words that introduce a *condition* belong here as much as
+// the ones that introduce a body.
+//
+// Matched case-sensitively, unlike commandWrappers on the same line: these are
+// bash reserved words, and bash does not recognise `Then`.
 var shellKeywords = map[string]bool{
-	"then": true, "do": true, "else": true, "elif": true,
-	"!": true, "{": true, "command": true, "builtin": true,
+	"if": true, "while": true, "until": true, "then": true, "do": true,
+	"else": true, "elif": true, "!": true, "{": true,
+	"command": true, "builtin": true,
 }
 
 // matchesCommand reports whether a command line invokes the watched tool. The
@@ -273,26 +280,12 @@ func sanitize(command string, depth int) string {
 	// commit -m "$MSG"` read as a run of semgrep, and git's output was filed
 	// as semgrep's review. Blanking every span instead lost the quoted program
 	// name, which is silence, so neither extreme will do.
-	closeSpan := func(closed bool, q rune) {
+	closeSpan := func(closed bool) {
 		switch {
 		case closed && isBareWord(span):
 			b.WriteString(string(span))
 		default:
-			// `echo "$(semgrep --version)"` runs semgrep, and quoting the
-			// substitution is the *more* usual spelling of the two. Blanking
-			// the span because it holds whitespace lost the run entirely,
-			// while the unquoted form matched — one construct, two answers.
-			// Only the substitution's own text survives; the rest of the span
-			// is still data, and the text that survives is sanitized in its
-			// own right — it is a command line, and copying it through
-			// verbatim let quoted prose inside it manufacture a command
-			// position: `msg="$(git log --pretty=format:'x; semgrep noise')"`
-			// read as a run of semgrep.
-			if inner, ok := substitutionText(span, depth); q == '"' && closed && ok {
-				b.WriteString(inner)
-			} else {
-				b.WriteRune(' ')
-			}
+			b.WriteRune(' ')
 		}
 		span = span[:0]
 	}
@@ -316,6 +309,24 @@ func sanitize(command string, depth int) string {
 		// one argument, and scanning each line from a clean state read its
 		// second line as a command of its own.
 		if quote != 0 {
+			// A command substitution inside double quotes runs commands, and
+			// quotes nest inside it: `out="$(semgrep --config "p/ci" .)"` is
+			// one argument holding one real invocation. Treating the span as
+			// plain text and hunting for substitutions in it afterwards got
+			// both halves wrong — the inner quote ended the span, so a genuine
+			// run was lost, and the tail that escaped read as unquoted shell,
+			// where a `;` in it manufactured a command position.
+			if quote == '"' && r == '$' && i+1 < len(runes) && runes[i+1] == '(' {
+				if end, ok := matchSubstitution(runes, i); ok {
+					// Whatever preceded it in the span is still data.
+					closeSpan(false)
+					b.WriteString(" (")
+					b.WriteString(sanitize(string(runes[i+2:end-1]), depth+1))
+					b.WriteString(") ")
+					i = end - 1
+					continue
+				}
+			}
 			switch {
 			case r == '\\' && quote != '\'':
 				// The character after a backslash is literal, so an escaped
@@ -327,7 +338,7 @@ func sanitize(command string, depth int) string {
 					span = append(span, ' ')
 				}
 			case r == quote:
-				closeSpan(true, quote)
+				closeSpan(true)
 				quote = 0
 				prev = '"'
 			default:
@@ -438,11 +449,8 @@ func sanitize(command string, depth int) string {
 	// An unterminated quote runs to the end of the command. Nothing closed it,
 	// so its content was never a program name.
 	if quote != 0 {
-		// Passed as 0, not as the quote: the substitution branch below keys on
-		// the quote character, and an unterminated span reaching it emitted
-		// everything after a never-closed `$(` as commands — a line bash
-		// refuses outright.
-		closeSpan(false, 0)
+		// Nothing closed it, so its content was never a program name.
+		closeSpan(false)
 	}
 	return b.String()
 }
@@ -675,52 +683,38 @@ func Status(ws []state.Watcher, artifacts []Artifact) []WatcherStatus {
 	return out
 }
 
-// substitutionText renders a double-quoted span as the commands it runs: each
-// `$( … )` keeps its parens and its sanitized text, so the separator split sees
-// a command position, and everything around them is blanked because it is
-// still data. ok is false when the span holds no substitution, which is the
-// common case and the caller's cue to blank the whole span.
-//
-// One scan answers both questions. Asking "is there a substitution here" in a
-// separate pass meant two searches that had to agree about what a substitution
-// is, and they already disagreed about where one may start.
-func substitutionText(span []rune, depth int) (string, bool) {
-	if depth > 4 {
-		return "", false
-	}
-	var b strings.Builder
-	b.Grow(len(span))
-	found := false
-	for i := 0; i < len(span); i++ {
-		if span[i] != '$' || i+1 >= len(span) || span[i+1] != '(' {
-			b.WriteRune(' ')
+// matchSubstitution returns the index just past the `)` closing the command
+// substitution that starts at i, and whether one was found. It carries its own
+// quote state, because quotes nest inside a substitution however the text
+// around it is quoted, and an unbalanced one means bash would reject the line
+// rather than run anything in it.
+func matchSubstitution(runes []rune, i int) (int, bool) {
+	depth := 0
+	var quote rune
+	for j := i + 1; j < len(runes); j++ {
+		r := runes[j]
+		if quote != 0 {
+			switch {
+			case r == '\\' && quote != '\'':
+				j++
+			case r == quote:
+				quote = 0
+			}
 			continue
 		}
-		// Find the matching close, then hand the contents back through the
-		// scanner: they are a command line like any other.
-		nest := 1
-		j := i + 2
-		for ; j < len(span) && nest > 0; j++ {
-			switch span[j] {
-			case '(':
-				nest++
-			case ')':
-				nest--
+		switch r {
+		case '\'', '"':
+			quote = r
+		case '\\':
+			j++
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j + 1, true
 			}
 		}
-		end := j
-		if nest > 0 {
-			// Never closed. bash would reject the line; blank the rest.
-			for ; i < len(span); i++ {
-				b.WriteRune(' ')
-			}
-			break
-		}
-		found = true
-		b.WriteString(" (")
-		b.WriteString(sanitize(string(span[i+2:end-1]), depth+1))
-		b.WriteString(") ")
-		i = end - 1
 	}
-	return b.String(), found
+	return 0, false
 }
