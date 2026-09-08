@@ -140,14 +140,16 @@ func ListArtifactMeta(cacheDir string) ([]Artifact, error) {
 			// modification time is a position — it is when the artifact
 			// appeared — so the stamp is repaired here and the rest of the
 			// path never has to know.
-			repaired := "?"
 			if fi, statErr := os.Stat(path); statErr == nil {
-				repaired = fi.ModTime().UTC().Format(time.RFC3339Nano)
-				captured = repaired
+				captured = fi.ModTime().UTC().Format(time.RFC3339Nano)
+				fmt.Fprintf(os.Stderr,
+					"warn: %s has an unreadable captured_at (%q); using the file's timestamp (%s)\n",
+					meta.ReviewID, meta.CapturedAt, captured)
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"warn: %s has an unreadable captured_at (%q) and its file could not be dated: %v\n",
+					meta.ReviewID, meta.CapturedAt, statErr)
 			}
-			fmt.Fprintf(os.Stderr,
-				"warn: %s has an unreadable captured_at (%q); using the file's timestamp (%s)\n",
-				meta.ReviewID, meta.CapturedAt, repaired)
 		}
 		out = append(out, Artifact{ReviewID: meta.ReviewID, Source: meta.Source, CapturedAt: captured})
 	}
@@ -302,10 +304,11 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 // and the run says once what it could not read, so the file can be repaired or
 // deleted.
 //
-// An artifact whose captured_at does not parse is not reported here, because
-// it is not lost: ListArtifactMeta repairs the stamp from the file's timestamp
-// and warns, so the artifact is mined once like any other and the watermark
-// moves past it.
+// An artifact whose captured_at does not parse is normally not reported here,
+// because it is not lost: ListArtifactMeta repairs the stamp from the file's
+// timestamp and warns, so the artifact is mined once like any other and the
+// watermark moves past it. One that reaches here still unparseable is a
+// repair that could not run, and that one is a loss like any other.
 func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))
@@ -316,12 +319,27 @@ func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since strin
 			unreadable = append(unreadable, m.ReviewID)
 			continue
 		}
+		// The metadata stamp is authoritative: ListArtifactMeta may have
+		// repaired one the file could not supply, and the lean view is what
+		// the subagent orders contradictions by and what the approval line
+		// prints. Leaving the file's own value here meant the one artifact the
+		// repair exists for was still unorderable everywhere it was used.
+		a.CapturedAt = m.CapturedAt
 		full = append(full, a)
 	}
 
 	// An explicit id list never advances the watermark: stepping past reviews
 	// the run skipped on purpose would make them unmineable for good.
 	if len(ids) == 0 {
+		// A stamp that still does not parse means the repair could not run —
+		// the file went away between the read and the stat. Select drops such
+		// an artifact from every watermark run, so it is a real loss and is
+		// named rather than left to a stderr line the run never relays.
+		for _, m := range meta {
+			if capturedTime(m.CapturedAt).IsZero() {
+				unreadable = append(unreadable, m.ReviewID)
+			}
+		}
 		// The newest artifact considered, not the newest one read. Taking it
 		// from what was read left an unreadable *newest* artifact on the wrong
 		// side of the watermark, so it was re-selected and re-reported on every

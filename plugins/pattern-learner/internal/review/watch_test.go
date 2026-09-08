@@ -522,6 +522,17 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"quoted substitution", `echo "$(semgrep --version)"`, true},
 		{"quoted substitution inside a sentence", `echo "pre $(semgrep .) post"`, true},
 		{"a dollar in quoted prose is not a substitution", `echo "cost is $5; semgrep noise"`, false},
+		// A substitution's contents are a command line and are sanitized in
+		// their own right; copying them through let quoted prose one level
+		// down manufacture a command position.
+		{"quoted prose inside a substitution", `msg="$(git log -1 --pretty=format:'chore; semgrep noise')"`, false},
+		{"heredoc inside a substitution", "echo \"$(cat <<EOF\nsemgrep .\nEOF\n)\"", false},
+		{"nested quoted substitutions", `echo "$(echo "$(semgrep .)")"`, true},
+		// An unterminated quote closed nothing, so nothing in it ran.
+		{"unterminated quote holding a substitution", `echo "$(git log --oneline; semgrep .`, false},
+		// A shell keyword introduces a command without being one.
+		{"run after then", "if ((x > 1)); then semgrep .; fi", true},
+		{"run after do", "for f in *; do semgrep $f; done", true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -783,6 +794,20 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		{"a nested command with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"metadata":{"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}}`, true, "sk-secret", "check_id"},
 		{"a nested env with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"env":{"SEMGREP_APP_TOKEN":"sk-secret-abc123"}}}`, true, "sk-secret", "check_id"},
 		{"an argv with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"argv":["semgrep","--token","sk-secret-abc123"]}`, true, "sk-secret", "check_id"},
+		// eslint's native shape is an array. A response that decoded to one
+		// bypassed the scrub entirely and wrote the credential out verbatim.
+		{"an array response is scrubbed too", `[{"filePath":"/repo/a.js","messages":[{"ruleId":"no-console","severity":2,"message":"Use the shared logger.","line":9}],"command":"TOKEN=sk-secret-abc123 eslint ."}]`, true, "sk-secret", "no-console"},
+		// stderr prose one level down is still a crash message, and valueText
+		// spends a whole branch ruling that out as review text.
+		{"nested stderr is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"metadata":{"stderr":"Traceback: token sk-secret-abc123 rejected"}}`, true, "sk-secret", "check_id"},
+		// But `description` and `file_path` are report content one level down —
+		// the advisory text in Snyk, Grype and Checkov, and a finding's
+		// location — so stripping them everywhere deleted the convention.
+		{"a finding's description survives", `{"findings":[{"id":"SNYK-JS-1","title":"Prototype pollution","description":"Use the shared client rather than raw requests.","severity":"high"}]}`, true, "", "shared client"},
+		{"a finding's file_path survives", `{"findings":[{"file_path":"a.go","summary":"Use the shared client.","failure_scenario":"boom"}]}`, true, "", "a.go"},
+		// A SARIF result's location sits deeper than a small recursion bound,
+		// and a bound that nils out what it cannot reach corrupted the report.
+		{"a deep SARIF report survives intact", `{"runs":[{"tool":{"driver":{"rules":[{"id":"R1","fullDescription":{"text":"Use the shared client."}}]}},"results":[{"ruleId":"R1","message":{"text":"raw requests are banned"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a.py"},"region":{"startLine":42,"snippet":{"text":"requests.get()"}}}}]}]}]}`, true, "", "requests.get()"},
 		// A linter exits non-zero exactly when it has findings, so a report
 		// beside an exit code is the ordinary shape, not the exception.
 		{"report beside an exit code", `{"results":[{"check_id":"py.no-requests","path":"a.py","extra":{"message":"Use the shared client."}}],"exit_code":1}`, true, "", "py.no-requests"},

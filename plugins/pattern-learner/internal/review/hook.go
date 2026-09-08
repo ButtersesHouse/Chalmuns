@@ -3,6 +3,7 @@ package review
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -309,7 +310,10 @@ func valueText(v interface{}, depth int) string {
 		if blocks && len(parts) > 0 {
 			return strings.Join(parts, "\n")
 		}
-		return marshalText(v)
+		// Scrubbed like a map is: eslint's native shape is an array, so a
+		// response that decodes to one reached the artifact unscrubbed and a
+		// credential in it was written straight into the repository.
+		return marshalText(scrub(v, 0))
 	case map[string]interface{}:
 		// One pass over everything in this map that could be the review, then
 		// the best of it, in a fixed order of preference. Returning the first
@@ -427,16 +431,28 @@ func marshalText(v interface{}) string {
 	return ""
 }
 
-// envelopeKeys are the fields a tool runner adds around a result: what was
-// invoked, where, and how it ended. They are never part of a report, and
-// several of them routinely carry a command line — which is where credentials
-// live, and why hookLabel refuses to record one.
+// invocationKeys carry what was run and with what — a command line, an
+// argument vector, an environment. They are stripped at every level, because
+// that is where credentials live and one level is not where nesting stops:
+// `{"results":[…],"metadata":{"command":"SEMGREP_APP_TOKEN=… semgrep"}}` put a
+// token into an artifact inside the repository just as surely as a top-level
+// `command` did. stderr is here for a different reason: valueText rules stderr
+// prose out as review text, and carrying it in the payload instead would put a
+// crash message into the grounding corpus by the back door.
+var invocationKeys = map[string]bool{
+	"command": true, "cmd": true, "argv": true, "args": true,
+	"env": true, "environment": true, "tool_input": true, "stderr": true,
+}
+
+// envelopeKeys are what a tool runner wraps a result in: where it ran and how
+// it ended. They are stripped only at the top level, because the same words
+// are report content one level down — `description` is the advisory text in
+// Snyk, Grype and Checkov findings, and `file_path` is a finding's location.
+// Stripping them everywhere deleted the reviewer's own prose from the corpus.
 var envelopeKeys = map[string]bool{
-	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
-	"env": true, "environment": true, "cwd": true, "file_path": true,
-	"description": true, "tool_name": true, "tool_input": true,
-	"tool_use_id": true, "is_error": true, "interrupted": true,
-	"exit_code": true, "exitCode": true, "sandbox": true,
+	"cwd": true, "file_path": true, "description": true, "input": true,
+	"tool_name": true, "tool_use_id": true, "is_error": true,
+	"interrupted": true, "exit_code": true, "exitCode": true, "sandbox": true,
 }
 
 // reportPayload renders a decoded response as a candidate review: the map with
@@ -455,7 +471,7 @@ var envelopeKeys = map[string]bool{
 func reportPayload(t map[string]interface{}) string {
 	rest := make(map[string]interface{}, len(t))
 	for key, val := range t {
-		if envelopeKeys[key] || isResponseTextKey(key) {
+		if envelopeKeys[key] || invocationKeys[key] || isResponseTextKey(key) {
 			continue
 		}
 		rest[key] = scrub(val, 0)
@@ -463,32 +479,67 @@ func reportPayload(t map[string]interface{}) string {
 	return marshalText(rest)
 }
 
-// scrub removes bookkeeping fields from a decoded value at every level. depth
-// bounds it the way valueText is bounded, so a deeply nested document cannot
-// spin; below the bound the value is dropped rather than passed through
-// unscrubbed, because a credential does not become safe by being deep.
+// scrub removes the invocation fields from a decoded value at every level,
+// returning the value itself when there was nothing to remove — which is the
+// overwhelmingly common case, and rebuilding every container regardless meant
+// a second full copy of a document that can be megabytes, on a path that runs
+// after every matching tool call.
+//
+// depth only stops a runaway. Past it the value is passed through unchanged
+// rather than dropped: a bound that nils out what it cannot reach corrupted
+// ordinary reports — a SARIF result's location and snippet sit deeper than a
+// small bound allows — and handed the corruption on as the grounding corpus.
 func scrub(v interface{}, depth int) interface{} {
-	if depth > 6 {
-		return nil
+	if depth > 64 {
+		return v
 	}
 	switch t := v.(type) {
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(t))
+		changed := false
 		for key, val := range t {
-			if envelopeKeys[key] {
+			if invocationKeys[key] {
+				changed = true
 				continue
 			}
-			out[key] = scrub(val, depth+1)
+			scrubbed := scrub(val, depth+1)
+			// Compared by identity, not by value: a container scrub left alone
+			// comes back as the same reference.
+			if !sameValue(scrubbed, val) {
+				changed = true
+			}
+			out[key] = scrubbed
+		}
+		if !changed {
+			return v
 		}
 		return out
 	case []interface{}:
-		out := make([]interface{}, 0, len(t))
-		for _, e := range t {
-			out = append(out, scrub(e, depth+1))
+		out := make([]interface{}, len(t))
+		changed := false
+		for i, e := range t {
+			out[i] = scrub(e, depth+1)
+			if !sameValue(out[i], e) {
+				changed = true
+			}
+		}
+		if !changed {
+			return v
 		}
 		return out
 	}
 	return v
+}
+
+// sameValue reports whether scrub returned its argument untouched. Only the
+// container cases can return something new, and for those a pointer comparison
+// through reflect is exact; everything else is returned as-is by definition.
+func sameValue(scrubbed, original interface{}) bool {
+	switch original.(type) {
+	case map[string]interface{}, []interface{}:
+		return reflect.ValueOf(scrubbed).Pointer() == reflect.ValueOf(original).Pointer()
+	}
+	return true
 }
 
 func isResponseTextKey(key string) bool {

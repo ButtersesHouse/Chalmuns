@@ -190,6 +190,15 @@ var commandWrappers = map[string]bool{
 	"npm": true, "bun": true, "poetry": true, "uv": true, "run": true,
 }
 
+// shellKeywords introduce a command without being one, so `then semgrep .` is
+// a run of semgrep. Without this a designated tool invoked from a conditional
+// or a loop — `if …; then semgrep .; fi`, `for f in *; do semgrep $f; done` —
+// matched nothing at all, which is the silence a designation exists to avoid.
+var shellKeywords = map[string]bool{
+	"then": true, "do": true, "else": true, "elif": true,
+	"!": true, "{": true, "command": true, "builtin": true,
+}
+
 // matchesCommand reports whether a command line invokes the watched tool. The
 // name must be in command position — the first word of the line or of a
 // pipeline stage, after any environment assignments and wrappers — so a tool
@@ -203,7 +212,8 @@ func matchesCommand(name, command string) bool {
 	for _, segment := range reCmdSeparator.Split(sanitizeCommand(command), -1) {
 		fields := strings.Fields(segment)
 		i := 0
-		for i < len(fields) && (reEnvAssign.MatchString(fields[i]) || commandWrappers[strings.ToLower(fields[i])]) {
+		for i < len(fields) && (reEnvAssign.MatchString(fields[i]) ||
+			commandWrappers[strings.ToLower(fields[i])] || shellKeywords[fields[i]]) {
 			i++
 		}
 		if i < len(fields) && strings.EqualFold(commandBase(fields[i]), name) {
@@ -225,6 +235,13 @@ func matchesCommand(name, command string) bool {
 // review. That breaks the invariant this whole path exists to hold: nothing is
 // captured from a tool that was not designated.
 func sanitizeCommand(command string) string {
+	return sanitize(command, 0)
+}
+
+// sanitize is sanitizeCommand with the recursion depth a quoted command
+// substitution needs: its contents are a command line and are sanitized in
+// turn, and a hand-written `"$( "$( … )" )"` must not spin.
+func sanitize(command string, depth int) string {
 	var b strings.Builder
 	b.Grow(len(command))
 	runes := []rune(command)
@@ -260,16 +277,22 @@ func sanitizeCommand(command string) string {
 		switch {
 		case closed && isBareWord(span):
 			b.WriteString(string(span))
-		case q == '"' && hasSubstitution(span):
+		default:
 			// `echo "$(semgrep --version)"` runs semgrep, and quoting the
 			// substitution is the *more* usual spelling of the two. Blanking
 			// the span because it holds whitespace lost the run entirely,
 			// while the unquoted form matched — one construct, two answers.
 			// Only the substitution's own text survives; the rest of the span
-			// is still data.
-			b.WriteString(substitutionText(span))
-		default:
-			b.WriteRune(' ')
+			// is still data, and the text that survives is sanitized in its
+			// own right — it is a command line, and copying it through
+			// verbatim let quoted prose inside it manufacture a command
+			// position: `msg="$(git log --pretty=format:'x; semgrep noise')"`
+			// read as a run of semgrep.
+			if inner, ok := substitutionText(span, depth); q == '"' && closed && ok {
+				b.WriteString(inner)
+			} else {
+				b.WriteRune(' ')
+			}
 		}
 		span = span[:0]
 	}
@@ -415,7 +438,11 @@ func sanitizeCommand(command string) string {
 	// An unterminated quote runs to the end of the command. Nothing closed it,
 	// so its content was never a program name.
 	if quote != 0 {
-		closeSpan(false, quote)
+		// Passed as 0, not as the quote: the substitution branch below keys on
+		// the quote character, and an unterminated span reaching it emitted
+		// everything after a never-closed `$(` as commands — a line bash
+		// refuses outright.
+		closeSpan(false, 0)
 	}
 	return b.String()
 }
@@ -431,6 +458,11 @@ const (
 	parenArithCommand                    // `(( … ))`, a command
 )
 
+// inArithmetic reports whether the scan is inside `$(( ))` or `(( ))`, where
+// `<<` is a left shift rather than a here-document operator. It walks the
+// stack rather than keeping a counter beside it: the stack is never more than
+// a few frames deep, and a counter has to be kept in step by hand at every
+// push and pop, where this cannot disagree with the state it reads.
 func inArithmetic(parens []parenKind) bool {
 	for _, k := range parens {
 		if k == parenArithExpansion || k == parenArithCommand {
@@ -440,6 +472,11 @@ func inArithmetic(parens []parenKind) bool {
 	return false
 }
 
+// midWord is the value prev takes for a character that carries no word-break
+// meaning of its own — an escaped one. It is not a character any command line
+// contains, so it can never collide with a real previous character.
+const midWord rune = '\uFFFF'
+
 // startsWord reports whether a `#` following prev opens a comment.
 //
 // bash starts a comment at the beginning of a word: after whitespace, after a
@@ -448,11 +485,6 @@ func inArithmetic(parens []parenKind) bool {
 // prints `2026#1`, while `(true)#note` really is a comment. Getting either
 // wrong costs a command: the first drops a designated run that followed a
 // `&&`, the second scans comment text for one.
-// midWord is the value prev takes for a character that carries no word-break
-// meaning of its own — an escaped one. It is not a character any command line
-// contains, so it can never collide with a real previous character.
-const midWord rune = '\uFFFF'
-
 func startsWord(prev rune, closedSubshell bool) bool {
 	switch prev {
 	case 0:
@@ -468,17 +500,6 @@ func startsWord(prev rune, closedSubshell bool) bool {
 
 // isBareWord reports whether a quoted span is a single unadorned word — the
 // only shape in which quoting a program name is ordinary.
-// openerIsCRLF reports whether the line carrying the here-document operator at
-// i ends with a carriage return, which is what makes its terminator carry one.
-func openerIsCRLF(runes []rune, i int) bool {
-	for ; i < len(runes); i++ {
-		if runes[i] == '\n' {
-			return i > 0 && runes[i-1] == '\r'
-		}
-	}
-	return false
-}
-
 func isBareWord(span []rune) bool {
 	if len(span) == 0 {
 		return false
@@ -489,6 +510,17 @@ func isBareWord(span []rune) bool {
 		}
 	}
 	return true
+}
+
+// openerIsCRLF reports whether the line carrying the here-document operator at
+// i ends with a carriage return, which is what makes its terminator carry one.
+func openerIsCRLF(runes []rune, i int) bool {
+	for ; i < len(runes); i++ {
+		if runes[i] == '\n' {
+			return i > 0 && runes[i-1] == '\r'
+		}
+	}
+	return false
 }
 
 // heredoc is one pending here-document: the terminator to look for, and
@@ -643,42 +675,52 @@ func Status(ws []state.Watcher, artifacts []Artifact) []WatcherStatus {
 	return out
 }
 
-// hasSubstitution reports whether a double-quoted span contains a command
-// substitution, whose contents are commands however the span is quoted.
-func hasSubstitution(span []rune) bool {
-	for i := 0; i+1 < len(span); i++ {
-		if span[i] == '$' && span[i+1] == '(' {
-			return true
-		}
-	}
-	return false
-}
-
 // substitutionText renders a double-quoted span as the commands it runs: each
-// `$( … )` keeps its parens and its text, so the separator split sees a command
-// position, and everything around them is blanked because it is still data.
-func substitutionText(span []rune) string {
+// `$( … )` keeps its parens and its sanitized text, so the separator split sees
+// a command position, and everything around them is blanked because it is
+// still data. ok is false when the span holds no substitution, which is the
+// common case and the caller's cue to blank the whole span.
+//
+// One scan answers both questions. Asking "is there a substitution here" in a
+// separate pass meant two searches that had to agree about what a substitution
+// is, and they already disagreed about where one may start.
+func substitutionText(span []rune, depth int) (string, bool) {
+	if depth > 4 {
+		return "", false
+	}
 	var b strings.Builder
 	b.Grow(len(span))
-	depth := 0
+	found := false
 	for i := 0; i < len(span); i++ {
-		r := span[i]
-		switch {
-		case depth == 0 && r == '$' && i+1 < len(span) && span[i+1] == '(':
-			depth = 1
-			b.WriteString(" (")
-			i++
-		case depth > 0 && r == '(':
-			depth++
-			b.WriteRune(r)
-		case depth > 0 && r == ')':
-			depth--
-			b.WriteRune(r)
-		case depth > 0:
-			b.WriteRune(r)
-		default:
+		if span[i] != '$' || i+1 >= len(span) || span[i+1] != '(' {
 			b.WriteRune(' ')
+			continue
 		}
+		// Find the matching close, then hand the contents back through the
+		// scanner: they are a command line like any other.
+		nest := 1
+		j := i + 2
+		for ; j < len(span) && nest > 0; j++ {
+			switch span[j] {
+			case '(':
+				nest++
+			case ')':
+				nest--
+			}
+		}
+		end := j
+		if nest > 0 {
+			// Never closed. bash would reject the line; blank the rest.
+			for ; i < len(span); i++ {
+				b.WriteRune(' ')
+			}
+			break
+		}
+		found = true
+		b.WriteString(" (")
+		b.WriteString(sanitize(string(span[i+2:end-1]), depth+1))
+		b.WriteString(") ")
+		i = end - 1
 	}
-	return b.String()
+	return b.String(), found
 }
