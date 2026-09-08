@@ -171,6 +171,13 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a literal ending in a secret-ish word", `password: hunter2trustno1.password`, "hunter2trustno1", "password:"},
 	{"a base64 value ending in a secret-ish word", `{"extra":{"lines":"  api_key: wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY.secret"}}`, "wJalrXUtnFEMI", "extra"},
 	{"scheme-relative userinfo", `{"credentials":["//admin:sup3rS3cret@db.internal"]}`, "sup3rS3cret", "credentials"},
+	// Rows for the leaks the thirty-second review found. A dollar sign in front
+	// of a literal does not make it a variable, and the default in an expansion
+	// is where a compose file keeps the password it hardcoded — which the
+	// `changeme` placeholder pinned above cannot show.
+	{"a camelcase literal behind a dollar", `password: $dbHunter2pass`, "dbHunter2pass", "password"},
+	{"a leetspeak literal behind a dollar", `password: $sup3rS3cret`, "sup3rS3cret", "password"},
+	{"a hardcoded expansion default", `password: ${DB_PASSWORD:-hunter2trustno1}`, "hunter2trustno1", "password"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -200,6 +207,11 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// An array element under a secret-ish name is taken on its own shape, so a
 	// list of rule names survives — and so does a credential shaped like one.
 	{"an array of wordlike credentials", `{"passwords":["correcthorse"]}`, "correcthorse"},
+	// A long unbroken lowercase run with no digits reads as the Go and
+	// Kubernetes file-name convention, so a payload spelled that way survives.
+	// The rate is low — a key is base64 or hex, and both carry digits — and the
+	// alternative rewrote `validatingwebhookconfiguration.go`, a real file.
+	{"a digit-free lowercase payload in a path", `secret: uploads/wjalrxutnfemikmdengbpxrficyexamplekey.key`, "wjalrxutnfemi"},
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
@@ -328,6 +340,13 @@ var proseCorpus = []struct{ name, in string }{
 	// Go and Kubernetes write long file names with no break in them at all;
 	// what that convention does not do is mix digits in.
 	{"an unbroken go file name", "private_key: k8s.io/api/admissionregistration/validatingwebhookconfiguration.go"},
+	// The names real code reaches a credential through are long, and an index
+	// is a piece of the path like any other.
+	{"a long container name", `{"extra":{"lines":"  password: databaseConfig.password"}}`},
+	{"a service account reference", `{"extra":{"lines":"  private_key: serviceAccount.privateKey"}}`},
+	{"a capitalised container name", `{"extra":{"lines":"  password: DatabaseSettings.Password"}}`},
+	{"an indexed reference", `{"extra":{"lines":"  password: creds[0].password"}}`},
+	{"a longer replacement template", `sed -i 's/(a)(b)/$1$2_and_more/' README.md`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.

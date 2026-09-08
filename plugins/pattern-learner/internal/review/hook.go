@@ -817,7 +817,14 @@ var secretPatterns = []*regexp.Regexp{
 // at shell and JSON punctuation: replacing a span that had swallowed the
 // closing backtick of “ `api_key: abcdef` “ left the rest of the write-up
 // rendering as code.
-const bareValue = "([^\\s\"',;)\\]}\\\\]+)"
+//
+// The one closing bracket it does take is an index, `[0]`, because a reference
+// into a collection is one value — `creds[0].password` — and stopping at the
+// bracket left `creds[0` to be judged on its own, which reads as a credential
+// and rewrote the reference into `[redacted]].password`. The index alternative
+// comes first: the engine takes the first branch that lets the whole pattern
+// succeed, and the general class matching a lone `[` was one of them.
+const bareValue = "((?:\\[[0-9]+\\]|[^\\s\"',;)\\]}\\\\])+)"
 
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
@@ -981,6 +988,10 @@ func isContainerPiece(piece string) bool {
 	if piece == "" || len([]rune(piece)) >= maxContainerRunes {
 		return false
 	}
+	// An index into a collection of them: `creds[0].password`.
+	if strings.IndexFunc(piece, func(r rune) bool { return !unicode.IsDigit(r) }) < 0 {
+		return true
+	}
 	return !strings.ContainsAny(piece, "0123456789") || hasWordBreak(piece)
 }
 
@@ -1002,7 +1013,14 @@ func isVarExpansion(value string) bool {
 		name = strings.TrimSuffix(name[1:], "}")
 		// `${VAR:-changeme}` and its relatives: the default belongs to the
 		// expansion, and taking the value up to it left a dangling brace.
+		//
+		// But the default is also where a compose file keeps the password it
+		// hardcoded, so it is only ignorable while it looks like a placeholder.
+		// A digit in it says otherwise: `${DB_PASSWORD:-hunter2trustno1}`.
 		if i := strings.IndexAny(name, ":-+?"); i > 0 {
+			if strings.ContainsAny(name[i:], "0123456789") {
+				return false
+			}
 			name = name[:i]
 		}
 	}
@@ -1029,14 +1047,23 @@ func isVarName(name string) bool {
 	if name == strings.ToUpper(name) || name == strings.ToLower(name) {
 		return true
 	}
-	return unicode.IsLower(first) && isWordPiece(name)
+	// A mixed-case name has to be digit-free as well. Without that the camel
+	// branch excused `$dbHunter2pass`, `$myPassword123` and `$sup3rS3cret` —
+	// the very strings the assignment branch exists to catch, wearing a dollar
+	// sign. A variable named after a number is rare; a password with one in it
+	// is the common case.
+	return unicode.IsLower(first) && isWordPiece(name) &&
+		!strings.ContainsAny(name, "0123456789")
 }
 
 var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
 
 // maxContainerRunes is how long the name of a thing a credential is reached
-// through may run.
-const maxContainerRunes = 13
+// through may run. Twenty rather than something tighter because the names real
+// code uses are long — `databaseConfig`, `serviceAccount`, `connectionSettings`
+// — and the digit rule below is what actually separates a container from a
+// payload.
+const maxContainerRunes = 20
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
 // rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
@@ -1434,7 +1461,7 @@ var reBareSecret = regexp.MustCompile(
 		// name-and-value rules because their unquoted value class stops at a
 		// comma, and an argon2 hash has commas in its parameters — so those
 		// rules redacted the algorithm and left the salt.
-		`|` + cryptPrefix + `[^\s"'\\]{8,}`)
+		`|` + cryptPrefix + `[^\s"'\\]{20,}`)
 
 // cryptPrefix is the `$algorithm$` a crypt-format hash announces itself with.
 // It is also what reSecretHint has to carry, or the rule above is switched off
@@ -1442,8 +1469,9 @@ var reBareSecret = regexp.MustCompile(
 // `hash: $2b$12$…`, or a line of /etc/shadow echoed out of a scanned file.
 //
 // The tail is required to be substantial because `$1$` on its own is also a
-// regex replacement template, and `sed -e 's/(a)(b)/$1$2/'` is a command a
-// review quotes.
+// regex replacement template, and `sed -e 's/(a)(b)/$1$2_and_more/'` is a
+// command a review quotes. Twenty rather than eight: the shortest real crypt
+// tail is md5crypt's, at about thirty.
 const cryptPrefix = `\$(?:[0-9]|2[abxy]?|argon2[a-z0-9]*|scrypt|pbkdf2[a-z0-9-]*|y|gy|7|sha1)\$`
 
 // envelopeKeys are what a tool runner wraps a result in: what tool it was, how
