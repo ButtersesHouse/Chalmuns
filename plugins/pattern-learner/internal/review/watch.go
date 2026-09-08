@@ -282,10 +282,6 @@ func sanitize(command string, depth int) (string, []string) {
 	// `cat <<A <<B`, B's body was scanned as commands, so a body line reading
 	// `note; semgrep now runs on every PR` manufactured a command position.
 	var pending []heredoc
-	// parens records what each open paren was, because `)` means different
-	// things to the rest of the scan: a subshell ends a word, a substitution
-	// does not — and only the first can be followed by a comment.
-	var parens []parenKind
 	// prev is the previous character as the shell sees it — after line
 	// continuations are joined, and never a character inside quotes. Reading
 	// the raw text instead made the `#` in `echo hello\<newline>#1` a comment
@@ -320,9 +316,14 @@ func sanitize(command string, depth int) (string, []string) {
 		nested, more := sanitize(text, depth+1)
 		inner = append(inner, nested)
 		inner = append(inner, more...)
-		for j := i; j < end; j++ {
-			b.WriteRune(' ')
-		}
+		// One placeholder, not a run of spaces. A substitution's output is one
+		// word, and blanking it to whitespace split that word in two: the text
+		// after it became the first field of a segment, so `$(echo echo)
+		// semgrep hello` and `echo $(date) semgrep` read as runs of semgrep.
+		// The placeholder is not whitespace and not a separator, so it holds
+		// the word open — and it is not a path separator either, so
+		// `$(pwd)/bin/semgrep` still reduces to semgrep.
+		b.WriteRune(substituted)
 	}
 
 	// atNewline runs the here-document bodies opened on the line just ended.
@@ -348,7 +349,7 @@ func sanitize(command string, depth int) (string, []string) {
 			// nest inside it: `out="$(semgrep --config "p/ci" .)"` is one
 			// argument holding one real invocation.
 			if quote == '"' {
-				if end, text, _, ok := substitutionAt(runes, i, spanPrev); ok {
+				if end, text, _, ok := substitutionAt(runes, i, spanPrev, depth); ok {
 					take(i, end, text)
 					spanBlank = true
 					i = end - 1
@@ -380,7 +381,7 @@ func sanitize(command string, depth int) (string, []string) {
 			continue
 		}
 
-		if end, text, endsWord, ok := substitutionAt(runes, i, prev); ok {
+		if end, text, endsWord, ok := substitutionAt(runes, i, prev, depth); ok {
 			take(i, end, text)
 			i = end - 1
 			// A substitution's output sits inside a word, so what follows it
@@ -442,6 +443,27 @@ func sanitize(command string, depth int) (string, []string) {
 				}
 				i = end - 1
 			}
+		case r == '(' && prev == '=':
+			// `TOOLS=(semgrep eslint)` is an array literal: its elements are
+			// words, not commands, and reading the first as one filed the
+			// enclosing call's output under the watched tool.
+			end, ok := matchParens(runes, i)
+			if !ok {
+				end = len(runes)
+			}
+			for ; i < end; i++ {
+				b.WriteRune(' ')
+			}
+			i--
+		case r == '(' && i+1 < len(runes) && runes[i+1] == ')':
+			// `f() { … }` defines a function; nothing in the body runs now.
+			// The definition ends at the line's end, which is where the scan
+			// picks up again.
+			for i < len(runes) && runes[i] != '\n' {
+				b.WriteRune(' ')
+				i++
+			}
+			i--
 		case r == '(':
 			if _, ok := matchParens(runes, i); !ok {
 				// Never closed: bash refuses the line outright, so nothing in
@@ -453,12 +475,8 @@ func sanitize(command string, depth int) (string, []string) {
 				}
 				break
 			}
-			parens = append(parens, parenSubshell)
 			b.WriteRune(r)
 		case r == ')':
-			if n := len(parens); n > 0 {
-				parens = parens[:n-1]
-			}
 			closedSubshell = true
 			b.WriteRune(r)
 			prev = ')'
@@ -496,16 +514,20 @@ func sanitize(command string, depth int) (string, []string) {
 // endsWord is true for `((…))`, the arithmetic *command*: it terminates the
 // word it is in, so a `#` after it opens a comment. Every other spelling here
 // is an expansion, whose output sits inside a word.
-func substitutionAt(runes []rune, i int, prev rune) (end int, text string, endsWord, ok bool) {
+func substitutionAt(runes []rune, i int, prev rune, depth int) (end int, text string, endsWord, ok bool) {
 	switch {
 	case runes[i] == '`':
 		if end, ok = matchBacktick(runes, i); ok {
 			return end, string(runes[i+1 : end-1]), false, true
 		}
+		// Never closed: bash refuses the line, so nothing in it runs. Handing
+		// back the rest as data keeps the `;` after it from manufacturing a
+		// command position.
+		return len(runes), "", false, true
 	case runes[i] == '$' && prev != '$' && i+2 < len(runes) &&
 		runes[i+1] == '(' && runes[i+2] == '(':
 		if end, ok = matchParens(runes, i+1); ok {
-			return end, substitutionsOnly(string(runes[i+3 : end-2])), false, true
+			return end, substitutionsOnly(string(runes[i+3:end-2]), depth+1), false, true
 		}
 	case runes[i] == '$' && prev != '$' && i+1 < len(runes) && runes[i+1] == '(':
 		if end, ok = matchParens(runes, i+1); ok {
@@ -515,7 +537,7 @@ func substitutionAt(runes []rune, i int, prev rune) (end int, text string, endsW
 		// `((…))` is an arithmetic command; like the expansion it evaluates
 		// rather than invokes.
 		if end, ok = matchParens(runes, i); ok {
-			return end, substitutionsOnly(string(runes[i+2 : end-2])), true, true
+			return end, substitutionsOnly(string(runes[i+2:end-2]), depth+1), true, true
 		}
 	}
 	return 0, "", false, false
@@ -523,12 +545,15 @@ func substitutionAt(runes []rune, i int, prev rune) (end int, text string, endsW
 
 // substitutionsOnly keeps only the command substitutions inside a stretch of
 // arithmetic, blanking the operands around them.
-func substitutionsOnly(text string) string {
+func substitutionsOnly(text string, depth int) string {
+	if depth > 4 {
+		return strings.Repeat(" ", len([]rune(text)))
+	}
 	runes := []rune(text)
 	var b strings.Builder
 	b.Grow(len(runes))
 	for i := 0; i < len(runes); i++ {
-		if end, inner, _, ok := substitutionAt(runes, i, priorRune(runes, i)); ok {
+		if end, inner, _, ok := substitutionAt(runes, i, priorRune(runes, i), depth); ok {
 			b.WriteString(" ")
 			b.WriteString(inner)
 			b.WriteString(" ")
@@ -590,12 +615,6 @@ func matchBacktick(runes []rune, i int) (int, bool) {
 	return 0, false
 }
 
-// parenKind records what an open paren was. Only subshells reach the stack
-// now: every other paren shape is consumed whole by substitutionAt.
-type parenKind int
-
-const parenSubshell parenKind = 0
-
 // priorRune is the character before i, or 0 at the start of the command.
 func priorRune(runes []rune, i int) rune {
 	if i == 0 {
@@ -609,6 +628,11 @@ func priorRune(runes []rune, i int) rune {
 // character any command line contains, so it can never collide with a real
 // previous character.
 const midWord rune = '￿'
+
+// substituted stands in the outer line for a region consumed as a command
+// substitution. It is not whitespace and not a separator, so it holds open the
+// word the substitution's output belongs to.
+const substituted rune = '￼'
 
 // startsWord reports whether a `#` following prev opens a comment.
 //

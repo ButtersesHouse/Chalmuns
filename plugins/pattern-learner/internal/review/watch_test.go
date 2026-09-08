@@ -587,6 +587,18 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"a word joined across a continuation", "echo $(date +%Y)x\\\nsemgrep .", false},
 		// A paren that never closes is a line bash refuses outright.
 		{"an unbalanced arithmetic command", "((semgrep .", false},
+		{"an unclosed backtick", "echo `bad; semgrep .", false},
+		// A consumed substitution leaves one placeholder, not a run of spaces:
+		// its output is one word, and splitting that word in two promoted the
+		// text beside it into command position.
+		{"a word after a substituted command name", `$(echo echo) semgrep hello`, false},
+		{"a word after a backtick substitution", "`date` semgrep", false},
+		// An array literal's elements are words, and a function body does not
+		// run at definition time.
+		{"an array literal", "TOOLS=(semgrep eslint); echo ok", false},
+		{"an array append", "x=(); x+=(semgrep); echo ok", false},
+		{"a function definition", "f() { semgrep; }", false},
+		{"a run after a function definition", "f() { semgrep; }\nsemgrep .", true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},

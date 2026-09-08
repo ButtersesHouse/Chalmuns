@@ -375,6 +375,23 @@ func valueText(v interface{}, depth int) string {
 				empty = text
 			}
 		}
+		considerMap := func(text string) {
+			if strings.TrimSpace(text) == "" {
+				return
+			}
+			format := Detect([]byte(text))
+			if format != FormatMarkdown {
+				consider(text, false)
+				return
+			}
+			// Prose only as a last resort. A runner key this package does not
+			// know — `{"meta":{"host":"ci-runner-7"}}` — would otherwise
+			// outrank the tool's own empty report and be recorded instead of
+			// it.
+			if aside == "" {
+				aside = text
+			}
+		}
 		for _, key := range responseTextKeys {
 			inner, present := t[key]
 			if !present {
@@ -402,7 +419,7 @@ func valueText(v interface{}, depth int) string {
 			// are dropped is either a report or nothing; nothing marshals to
 			// "" and is not considered, and isOnlyBookkeeping backstops the
 			// rest at the end of FromHook.
-			consider(reportPayload(t), true)
+			considerMap(reportPayload(t))
 		}
 
 		switch {
@@ -474,36 +491,68 @@ func redactSecrets(text string) string {
 	return reBareSecret.ReplaceAllString(text, "[redacted]")
 }
 
-// secretName is the part of a field name that says what the field holds.
+// secretName is the part of a field name that says what the field holds. auth
+// is here only for the `=` form, where the syntax leaves no doubt; as a bare
+// word before a colon it is ordinary English.
 const secretName = `(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential)`
 
 // reSecretHint is the cheap pre-filter: if none of these appears, no pattern
-// below can match.
+// below can match. Each replacement copies the whole text whether or not it
+// changes anything, and this runs after every matching tool call, on output
+// that can be megabytes.
 var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
-	`|authorization|\bsk-|\bghp_|\bgho_|\bgithub_pat_|\bxox|\bAKIA|\bAIza|BEGIN [A-Z ]*PRIVATE KEY`)
+	`|authorization|\bauth=|\bsk-|\bghp_|\bgho_|\bgithub_pat_|\bxox|\bAKIA|\bAIza|BEGIN [A-Z ]*PRIVATE KEY`)
+
+// quotedValue matches a JSON or shell string body, consuming `\"` so a quote
+// escaped inside the value does not end the match early and leave a dangling
+// one behind — which turned the document invalid, and a watcher pinned to a
+// format then lost the whole review.
+const quotedValue = `(?:[^"\\]|\\.)*`
 
 // Each pattern keeps group 1 (the name and the syntax that introduces the
 // value) and group 2 (the closing quote, where there is one), replacing only
-// what lies between them.
+// what lies between them. `[ \t]*` rather than `\s*` throughout: a rule that
+// crossed newlines matched a quoted phrase two lines below a secret-ish word
+// and rewrote the reviewer's finding.
 var secretPatterns = []*regexp.Regexp{
 	// An Authorization header, whose value is the credential itself. First,
 	// because the name rules below would stop at the scheme word and leave the
 	// credential after it. The name may be quoted, as it is in a JSON object.
-	regexp.MustCompile(`(?i)(["']?authorization["']?\s*[:=]\s*")(?:bearer |basic |token )?[^"]*(")`),
+	regexp.MustCompile(`(?i)(["']?authorization["']?[ \t]*[:=][ \t]*")(?:bearer |basic |token )?` + quotedValue + `(")`),
 	// Unquoted, the scheme word is required: without it, `- Authorization: the
 	// middleware is skipped` is a sentence, and redacting its next word
 	// rewrote the reviewer's finding into a different one.
-	regexp.MustCompile(`(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic|token) )[^\s"',;)\]}]+()`),
+	regexp.MustCompile(`(?i)(\bauthorization[ \t]*[:=][ \t]*(?:bearer|basic|token) )[^\s"',;)\]}]+()`),
 	// A quoted value, whose end is its closing quote rather than the first
 	// space: `MY_PASSWORD='p@ss w0rd'` leaked everything after the space.
-	regexp.MustCompile(`(?i)(["']?[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["']?\s*[:=]\s*")[^"]*(")`),
-	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*\s*[:=]\s*')[^']*(')`),
-	// An unquoted shell assignment. The `=` is what marks it as one: a bare
-	// colon in prose is not, and treating it as one rewrote the review.
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*=)[^\s"',;)\]}]+()`),
+	//
+	// Where the name is itself quoted, or joined to the value by `=`, the
+	// syntax is unambiguous and the value is taken as-is. A *bare* name before
+	// a colon is not: `- The credential: "auth.go" is missing` is a sentence,
+	// so there the value has to look like a credential too.
+	regexp.MustCompile(`(?i)(["'][A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["'][ \t]*[:=][ \t]*")` + quotedValue + `(")`),
+	regexp.MustCompile(`(?i)(["'][A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["'][ \t]*[:=][ \t]*')[^']*(')`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*=[ \t]*")` + quotedValue + `(")`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*=[ \t]*')[^']*(')`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*")` + credentialish + `(")`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')` + credentialish + `(')`),
+	// An unquoted shell assignment. The `=` is what marks it as one, so `auth`
+	// is safe to name here.
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*(?:` + secretName + `|auth)[A-Za-z0-9_.-]*=)[^\s"',;)\]}]+()`),
+	// An unquoted `name: value`, which is how YAML, an env dump and a header
+	// dump all spell it. The value has to look like a credential and not like
+	// a word — see credentialish — because a bare colon after a secret-ish
+	// word is also ordinary prose: `- The credential: check is missing`.
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]+)` + credentialish + `()`),
 	// A flag naming the value that follows it.
 	regexp.MustCompile(`(?i)(--?(?:token|password|secret|api[_-]?key|access[_-]?key)[= ])[^\s"',;)\]}]+()`),
 }
+
+// credentialish is a value that reads as a credential rather than as a word: a
+// long unbroken run, or a shorter one carrying a digit or the punctuation keys
+// and tokens use. `hunter2trustno1` and `wJalrXUtnFEMI/K7MDENG` match; `check`
+// and `the` do not.
+const credentialish = `(?:[^\s"',;)\]}]{7,}[0-9_/+=-][^\s"',;)\]}]*|[^\s"',;)\]}]*[0-9_/+=-][^\s"',;)\]}]{7,}|[^\s"',;)\]}]{16,})`
 
 // reBareSecret matches the token shapes that identify themselves without a
 // name beside them — an argv entry, a line of a traceback, a URL — and the
@@ -511,9 +560,11 @@ var secretPatterns = []*regexp.Regexp{
 //
 // Each is anchored on a word boundary: `sk-` with none matched inside
 // `task-scheduler`, rewriting a finding's own file path into one that does not
-// exist.
+// exist. The PEM rule requires its END marker: running to the end of the text
+// instead swallowed the rest of a report that merely quoted the header line.
 var reBareSecret = regexp.MustCompile(
-	`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)` +
+	`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----` +
+		`|-----BEGIN [A-Z ]*PRIVATE KEY-----` +
 		`|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{16,}|\bgho_[A-Za-z0-9]{16,}` +
 		`|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}` +
 		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}`)
@@ -557,7 +608,7 @@ var noiseKeys = map[string]bool{
 func reportPayload(t map[string]interface{}) string {
 	rest := make(map[string]interface{}, len(t))
 	for key, val := range t {
-		if envelopeKeys[key] || isResponseTextKey(key) {
+		if isEnvelopeField(key, val) || isResponseTextKey(key) {
 			continue
 		}
 		rest[key] = pruneNoise(val, 0)
@@ -593,6 +644,23 @@ func pruneNoise(v interface{}, depth int) interface{} {
 	return v
 }
 
+// isEnvelopeField reports whether a top-level field of a response is the
+// runner's account of the call rather than part of the report.
+//
+// `input` is decided by type. As text it is the command line — the thing
+// hookLabel refuses to record for exactly this reason — and as a container it
+// may be the report itself, which a name-only rule deleted whole.
+func isEnvelopeField(key string, val interface{}) bool {
+	if envelopeKeys[key] {
+		return true
+	}
+	if key != "input" {
+		return false
+	}
+	_, isText := val.(string)
+	return isText
+}
+
 func isResponseTextKey(key string) bool {
 	for _, known := range responseTextKeys {
 		if key == known {
@@ -617,7 +685,7 @@ func isOnlyBookkeeping(text string) bool {
 		return false
 	}
 	for key, val := range doc {
-		if envelopeKeys[key] || noiseKeys[key] {
+		if isEnvelopeField(key, val) || noiseKeys[key] {
 			continue
 		}
 		switch t := val.(type) {
@@ -633,6 +701,11 @@ func isOnlyBookkeeping(text string) bool {
 			if len(t) > 0 {
 				return false
 			}
+		default:
+			// A number or a bool under a key this package does not know is
+			// content: `{"errorCount":7,"warningCount":3}` is a linter saying
+			// the run was not clean, which is the one thing worth keeping.
+			return false
 		}
 	}
 	return true
