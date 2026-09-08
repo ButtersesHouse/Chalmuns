@@ -246,3 +246,160 @@ func TestClassify_refreshMode_noCutoff(t *testing.T) {
 		t.Fatal("should be kept when no range to compute cutoff")
 	}
 }
+
+// A candidate whose sources carry no PR number has no point on the PR number
+// line, so the recency downgrade must not touch it. It used to: pr_number 0
+// is below every cutoff, so an implicit candidate mined from a watched code
+// reviewer — or added by --add or --discover — was dropped before it ever
+// reached the approval prompt.
+func TestClassify_noPRSourceIsExemptFromRecency(t *testing.T) {
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {0, "implicit"}})
+
+	got := classifyOne(t, raw, 100, 0)
+	if got == nil {
+		t.Fatal("a candidate with no PR source must not be dropped by the recency downgrade")
+	}
+	if got["confidence"] != "emerging" {
+		t.Errorf("confidence: want emerging, got %v", got["confidence"])
+	}
+	if got["signal_count"] != float64(2) {
+		t.Errorf("signal_count: want 2, got %v", got["signal_count"])
+	}
+}
+
+// The exemption is for candidates with no PR at all; a genuinely stale
+// PR-derived candidate must still be dropped.
+func TestClassify_stalePRCandidateStillDropped(t *testing.T) {
+	raw := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{5, "implicit"}})
+
+	if got := classifyOne(t, raw, 100, 0); got != nil {
+		t.Errorf("an old implicit PR candidate should still be dropped; got %v", got)
+	}
+}
+
+// A candidate mixing review and PR sources is judged on the PR sources it has:
+// the review source contributes no recency information either way.
+func TestClassify_mixedSourcesJudgedOnPRSources(t *testing.T) {
+	stale := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {5, "implicit"}})
+	if got := classifyOne(t, stale, 100, 0); got != nil {
+		t.Errorf("a candidate whose only PR source is stale should be dropped; got %v", got)
+	}
+
+	fresh := makeCandidate(t, []struct {
+		prNum    int
+		strength string
+	}{{0, "implicit"}, {90, "implicit"}})
+	if got := classifyOne(t, fresh, 100, 0); got == nil {
+		t.Error("a candidate with a recent PR source should be kept")
+	}
+}
+
+// Step 8C merges a review signal into an existing PR rule. Judging that merged
+// rule on its one old PR number dropped it outright, despite several reviews
+// having flagged it since — the freshest evidence there is.
+func TestClassify_reviewEvidenceKeepsAnOldPRRuleAlive(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"title": "merged rule",
+		"sources": []src{
+			{PRNumber: 10, Strength: "implicit"},
+			{ReviewID: "rev-00000000000a", Strength: "implicit"},
+			{ReviewID: "rev-00000000000b", Strength: "implicit"},
+		},
+	})
+	if got := classifyOne(t, raw, 100, 0); got == nil {
+		t.Error("a rule two reviews have flagged since is not stale")
+	}
+}
+
+// One review reporting one finding in five files is one piece of evidence, not
+// five. Grading it "established" puts a rule nobody has read into the top tier
+// — which the approval UI then sanctions bulk-approving by tier.
+func TestClassify_reviewEvidenceIsCountedInReviews(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	build := func(ids ...string) json.RawMessage {
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{Strength: "implicit", ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{"title": "r", "sources": ss})
+		return b
+	}
+
+	one := build("rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001")
+	if got := classifyOne(t, one, 0, 0); got["confidence"] != "emerging" {
+		t.Errorf("five findings from one review is one review; got %v", got["confidence"])
+	}
+	five := build("rev-000000000001", "rev-000000000002", "rev-000000000003", "rev-000000000004", "rev-000000000005")
+	if got := classifyOne(t, five, 0, 0); got["confidence"] != "established" {
+		t.Errorf("five separate reviews agreeing is established; got %v", got["confidence"])
+	}
+}
+
+// Evidence that corroborates a rule must never lower its tier. Folding PR
+// sources together once a review source appeared did exactly that: a rule
+// established across six comments in three PRs *dropped* to emerging the
+// moment a watched reviewer confirmed it, and the signal_count shown beside it
+// fell from 7 to 4.
+func TestClassify_reviewEvidenceNeverLowersTheTier(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	prSources := []src{
+		{PRNumber: 90, Strength: "implicit"}, {PRNumber: 90, Strength: "implicit"},
+		{PRNumber: 95, Strength: "implicit"}, {PRNumber: 95, Strength: "implicit"},
+		{PRNumber: 99, Strength: "implicit"}, {PRNumber: 99, Strength: "implicit"},
+	}
+	build := func(sources []src) json.RawMessage {
+		b, _ := json.Marshal(map[string]interface{}{"title": "r", "sources": sources})
+		return b
+	}
+
+	before := classifyOne(t, build(prSources), 100, 0)
+	if before == nil || before["confidence"] != "established" {
+		t.Fatalf("fixture should start established; got %v", before)
+	}
+
+	withReview := classifyOne(t, build(append(append([]src{}, prSources...),
+		src{ReviewID: "rev-000000000001", Strength: "implicit"})), 100, 0)
+	if withReview == nil {
+		t.Fatal("adding review evidence dropped the candidate")
+	}
+	if withReview["confidence"] != "established" {
+		t.Errorf("a reviewer confirming the rule demoted it to %v", withReview["confidence"])
+	}
+	if n, _ := withReview["signal_count"].(float64); n != 7 {
+		t.Errorf("signal_count should have risen to 7; got %v", withReview["signal_count"])
+	}
+
+	// The collapse that does apply: four findings from one review are one
+	// signal, so the same six PR comments plus one review — however many
+	// findings that review held — count the same.
+	repeated := append([]src{}, prSources...)
+	for i := 0; i < 4; i++ {
+		repeated = append(repeated, src{ReviewID: "rev-000000000001", Strength: "implicit"})
+	}
+	got := classifyOne(t, build(repeated), 100, 0)
+	if n, _ := got["signal_count"].(float64); n != 7 {
+		t.Errorf("four findings from one review is one signal; got %v", got["signal_count"])
+	}
+}

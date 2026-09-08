@@ -22,6 +22,20 @@ rules to per-domain skill files under `.claude/skills/` (with an opt-in `promote
 step for a top-level AGENTS.md/CLAUDE.md). Go-based (builds a `pattern-learner`
 binary into the target repo; requires Go 1.21+). Source in `plugins/pattern-learner/`.
 
+It also learns from **code reviewers you designate it to watch** — Claude Code's
+own `/code-review` skill, a linter, an analyzer, a review bot:
+
+```
+/learn-patterns --watch add code-review     # designate; its output is captured from now on
+/learn-patterns --learn-reviews             # mine what was captured into rules
+```
+
+Captured output is parsed deterministically (`findings`, SARIF, ESLint, semgrep,
+or prose), and every rule must quote the review it came from verbatim before it
+can be proposed. Approval stays manual by default. The point is the loop: an
+agent generates, the reviewer flags, the rule lands in a domain skill, and the
+next generation is loaded with it.
+
 ### `skill-right-sizing`
 - **`right-size-skills`** — proposes the cheapest `model:`/`effort:` each skill
   needs (plan-ready report; advisory).

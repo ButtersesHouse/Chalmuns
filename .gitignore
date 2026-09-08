@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .DS_Store
 /pl-check
+
+# Left behind by tools run during review sessions.
+node_modules/
+/package.json
+/package-lock.json

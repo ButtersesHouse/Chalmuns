@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -253,5 +254,146 @@ func TestTriageReviewFilter_sortOrderIndependent(t *testing.T) {
 	result, _ := TriageReviewFilter([]json.RawMessage{raw}, false)
 	if result.Suppressed != 1 {
 		t.Error("PR number comparison should be order-independent (sort both sides)")
+	}
+}
+
+// makeReviewRule builds a proposed rule whose sources are all code-review
+// signals: no PR number, and a review_id naming the artifact.
+func makeReviewRule(t *testing.T, n int, strength string) json.RawMessage {
+	t.Helper()
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	var ss []src
+	for i := 0; i < n; i++ {
+		ss = append(ss, src{Strength: strength, ReviewID: fmt.Sprintf("rev-%012d", i)})
+	}
+	b, _ := json.Marshal(map[string]interface{}{
+		"title": "a review rule", "confidence": "stated",
+		"signal_count": n, "status": "proposed", "sources": ss,
+	})
+	return b
+}
+
+func triageStatus(t *testing.T, raw json.RawMessage, autoThreshold bool) string {
+	t.Helper()
+	out, err := TriageAuto([]json.RawMessage{raw}, autoThreshold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(out[0], &m); err != nil {
+		t.Fatal(err)
+	}
+	return m.Status
+}
+
+// A convention seen in exactly one code review is deferred whatever its
+// strength. Strength cannot carry this judgement on the review path: a finding
+// counts as explicit when it states a rule, and a linter states a rule id on
+// every finding, so one semgrep run would otherwise auto-approve one standing
+// rule per check it tripped with nobody having read any of them.
+func TestTriageAuto_singleReviewIsDeferredEvenWhenExplicit(t *testing.T) {
+	if got := triageStatus(t, makeReviewRule(t, 1, "explicit"), false); got != "proposed" {
+		t.Errorf("one explicit review signal should defer; got %q", got)
+	}
+	if got := triageStatus(t, makeReviewRule(t, 1, "implicit"), false); got != "proposed" {
+		t.Errorf("one implicit review signal should defer; got %q", got)
+	}
+	// Recurrence is what makes a finding a convention, so two reviews agreeing
+	// clears the bar.
+	if got := triageStatus(t, makeReviewRule(t, 2, "explicit"), false); got != "approved" {
+		t.Errorf("two reviews agreeing should approve; got %q", got)
+	}
+	// --auto-threshold is the documented opt-out of exactly this hold-back.
+	if got := triageStatus(t, makeReviewRule(t, 1, "explicit"), true); got != "approved" {
+		t.Errorf("--auto-threshold should approve a single review signal; got %q", got)
+	}
+}
+
+// The hold-back is for review signals only: one explicitly-stated PR
+// preference is still auto-approved, as it always was.
+func TestTriageAuto_singleExplicitPRSignalStillApproves(t *testing.T) {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"title": "a PR rule", "signal_count": 1, "status": "proposed",
+		"sources": []map[string]interface{}{{"pr_number": 42, "strength": "explicit"}},
+	})
+	if got := triageStatus(t, raw, false); got != "approved" {
+		t.Errorf("one explicit PR signal should still approve; got %q", got)
+	}
+}
+
+// The count is of distinct reviews, not signals. One linter run tripping the
+// same check in five files yields five sources and one review; counting
+// signals would wave that through as established on the strength of one run.
+func TestTriageAuto_manySignalsFromOneReviewStillDefers(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	build := func(ids ...string) json.RawMessage {
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{Strength: "explicit", ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{
+			"title": "r", "confidence": "established",
+			"signal_count": len(ss), "status": "proposed", "sources": ss,
+		})
+		return b
+	}
+
+	one := build("rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001")
+	if got := triageStatus(t, one, false); got != "proposed" {
+		t.Errorf("five findings from one review is still one review; got %q", got)
+	}
+	two := build("rev-000000000001", "rev-000000000002")
+	if got := triageStatus(t, two, false); got != "approved" {
+		t.Errorf("two reviews agreeing should approve; got %q", got)
+	}
+}
+
+// Review signals all report pr_number 0, so a rule rebuilt from entirely
+// different reviews has an identical PR list and would be suppressed as
+// "nothing new" — hiding fresh corroboration from the watched reviewer.
+func TestTriageReviewFilter_newReviewsAreNotSuppressed(t *testing.T) {
+	rule := func(ids ...string) json.RawMessage {
+		type src struct {
+			PRNumber int    `json:"pr_number"`
+			ReviewID string `json:"review_id,omitempty"`
+		}
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{
+			"id": "rule_1", "confidence": "emerging", "signal_count": len(ss), "sources": ss,
+			"reviewed_snapshot": map[string]interface{}{
+				"signal_count": 2, "source_pr_numbers": []int{0, 0},
+				"source_review_ids": []string{"rev-00000000000a", "rev-00000000000b"},
+			},
+		})
+		return b
+	}
+
+	unchanged, err := TriageReviewFilter([]json.RawMessage{rule("rev-00000000000a", "rev-00000000000b")}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Suppressed != 1 {
+		t.Errorf("the same two reviews is unchanged; suppressed=%d", unchanged.Suppressed)
+	}
+
+	fresh, err := TriageReviewFilter([]json.RawMessage{rule("rev-00000000000c", "rev-00000000000d")}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Suppressed != 0 {
+		t.Error("two different reviews is new corroboration and must be shown")
 	}
 }

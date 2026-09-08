@@ -3225,3 +3225,169 @@ func containsSubstring(haystack []string, want string) bool {
 	}
 	return false
 }
+
+// A rule mined from a watched code reviewer has no PR sources. It must name
+// the reviewers behind it rather than rendering an empty PR list, and it must
+// be exempt from the PR-watermark staleness warning — that warning measures
+// distance along a number line this rule was never on, so every review rule
+// would carry it from the first run.
+func TestWriteCodeReviewRuleSourceLabel(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_review", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "stated", Origin: "code-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{Reviewer: "code-review", ReviewID: "rev-abc123", Snippet: "this codebase wraps errors with %w", Strength: "explicit"},
+			{Reviewer: "semgrep", ReviewID: "rev-def456", Snippet: "wrap with %w", Strength: "implicit"},
+			{Reviewer: "code-review", ReviewID: "rev-999999", Snippet: "wrap with %w again", Strength: "implicit"},
+		},
+		LastSeenPR: 0,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 5000 // far past the staleness threshold
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	// Distinct reviewers, listed once each, so two tools agreeing is visible.
+	if !strings.Contains(content, "_Source: code review (code-review, semgrep)_") {
+		t.Errorf("want the reviewers named in the source label; got:\n%s", content)
+	}
+	if strings.Contains(content, "PRs #0") {
+		t.Error("a review rule must not render a bogus PR list")
+	}
+	if strings.Contains(content, "verify this convention is still current") {
+		t.Error("the PR-watermark staleness warning must not apply to a rule with no PR")
+	}
+}
+
+// With no reviewer names to list, the label still says where the rule came from.
+func TestWriteCodeReviewRuleSourceLabelWithoutReviewers(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_review2", Title: "Use the shared logger", Rule: "Use the shared logger",
+		Status: "approved", Confidence: "stated", Origin: "code-review",
+		Target:  state.Target{Location: "api"},
+		Sources: []state.Signal{{ReviewID: "rev-abc123", Snippet: "use the shared logger"}},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: code review_") {
+		t.Errorf("want a bare 'code review' label; got:\n%s", content)
+	}
+}
+
+// A PR-origin rule can hold review signals: Step 8C merges an equivalent
+// review candidate into the existing rule and keeps that rule's origin. Those
+// sources carry pr_number 0, which used to render as a citation to "PR #0" —
+// a pull request that does not exist — on exactly the rules the review path
+// is meant to strengthen.
+func TestWriteMergedReviewSignalDoesNotCitePRZero(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_merged", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "pr-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{PRNumber: 480, Reviewer: "bob", Snippet: "we wrap with %w", Strength: "explicit"},
+			{PRNumber: 0, ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+		LastSeenPR: 480,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 500
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "#0") {
+		t.Errorf("a rule must never cite PR #0; got:\n%s", content)
+	}
+	if !strings.Contains(content, "_Source: PRs #480 and code review (code-review)_") {
+		t.Errorf("a mixed-provenance rule should name both; got:\n%s", content)
+	}
+}
+
+// A code-review rule can absorb a PR signal through Step 8C, which keeps the
+// rule's origin. Listing that human's login among the review tools presented
+// them as one, and dropped their PR from the citation entirely — the mirror of
+// the "PRs #0" bug on the default branch.
+func TestWriteCodeReviewRuleThatGainedAPRSignal(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_mixed", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "code-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "explicit"},
+			{PRNumber: 481, Reviewer: "alice", Snippet: "we wrap with %w", Strength: "explicit"},
+		},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: code review (code-review) and PRs #481_") {
+		t.Errorf("want both provenances, neither conflated; got:\n%s", content)
+	}
+	if strings.Contains(content, "alice") {
+		t.Error("a human PR reviewer must not be listed as a review tool")
+	}
+}
+
+// A rule a watched reviewer has flagged since is not stale, whatever its last
+// PR number says — classify exempts exactly this rule from the recency
+// downgrade, so telling the reader to re-verify it would contradict that.
+func TestWriteReviewConfirmedRuleIsNotMarkedStale(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_confirmed", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "pr-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{PRNumber: 480, Reviewer: "alice", Snippet: "wrap with %w", Strength: "explicit"},
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+		LastSeenPR: 480,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 700 // far past staleAfterPRs
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "verify this convention is still current") {
+		t.Errorf("a rule fresh reviews have confirmed is not stale; got:\n%s", content)
+	}
+}
+
+// Review corroboration a rule absorbed through Step 8C is part of its
+// provenance whatever the rule's origin. The manual and discover branches once
+// dropped it entirely, presenting a rule two reviewers had since confirmed as
+// though no reviewer had ever seen it.
+func TestWriteManualRuleKeepsReviewCorroboration(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_manual2", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "stated", Origin: "manual",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{Reviewer: "mryave", Snippet: "always wrap with %w", Strength: "explicit"},
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: manually added and code review (code-review)_") {
+		t.Errorf("want both provenances; got:\n%s", content)
+	}
+}

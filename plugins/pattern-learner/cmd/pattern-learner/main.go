@@ -29,13 +29,14 @@ import (
 // set is unchanged). Bump it whenever generated output or a subcommand's
 // behaviour changes, and update the expected value in SKILL.md and the
 // plugin manifest to match.
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: pattern-learner <subcommand> [flags]")
 		fmt.Fprintln(os.Stderr, "subcommands: detect-repo, state-read, state-write, write-outputs,")
 		fmt.Fprintln(os.Stderr, "             extract-lean, verify-grounding, classify, triage,")
+		fmt.Fprintln(os.Stderr, "             watch, capture-review, extract-review,")
 		fmt.Fprintln(os.Stderr, "             audit-format, promote, guard, version")
 		os.Exit(1)
 	}
@@ -60,6 +61,12 @@ func main() {
 		err = pipeline.RunClassify(os.Args[2:])
 	case "triage":
 		err = pipeline.RunTriage(os.Args[2:])
+	case "watch":
+		err = runWatch(os.Args[2:])
+	case "capture-review":
+		err = runCaptureReview(os.Args[2:])
+	case "extract-review":
+		err = runExtractReview(os.Args[2:])
 	case "audit-format":
 		err = format.RunAuditFormat(os.Args[2:])
 	case "promote":
@@ -112,7 +119,25 @@ func runStateWrite(args []string) error {
 		return fmt.Errorf("decode stdin: %w", err)
 	}
 
-	if err := os.MkdirAll(dirOf(path), 0755); err != nil {
+	// state-write replaces the file wholesale from a payload the model builds
+	// by hand, so anything the model forgets to re-type is erased. Every other
+	// invariant the write cares about is enforced here rather than asked for
+	// in prose — IDs, timestamps, stats — and the watch designations belong in
+	// that set: dropping one silently stops all future capture from that
+	// reviewer, with no error and nothing in the cache to explain why. They
+	// are managed by the `watch` subcommand alone, so a payload that omits
+	// them means "unchanged", never "remove them".
+	prior, err := state.Read(path)
+	if err == nil {
+		if len(s.Watchers) == 0 {
+			s.Watchers = prior.Watchers
+		}
+		if s.LastIngestedReviewAt == "" {
+			s.LastIngestedReviewAt = prior.LastIngestedReviewAt
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 	return state.Write(path, s)
@@ -769,13 +794,4 @@ func findInFile(filename, substring string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			return path[:i]
-		}
-	}
-	return "."
 }

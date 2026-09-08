@@ -1375,7 +1375,11 @@ func confidenceHeading(c string) string {
 }
 
 func writeSourceLine(b *strings.Builder, r state.Rule, watermark int) {
-	prOrigin := r.Origin == "" || r.Origin == "pr-review"
+	// A rule a watched reviewer has flagged since is not stale, whatever its
+	// last PR number says — the same judgement classify makes when it exempts
+	// such a rule from the recency downgrade. Telling the reader to re-verify
+	// a convention two fresh reviews just confirmed would contradict it.
+	prOrigin := (r.Origin == "" || r.Origin == "pr-review") && !hasReviewSource(r.Sources)
 	if prOrigin && watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= staleAfterPRs {
 		b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
 			sourceLabel(r), r.LastSeenPR))
@@ -1577,26 +1581,112 @@ func confidenceRank(c string) int {
 }
 
 // sourceLabel returns the provenance text for a rule's "_Source: …_" line.
-// Manual and discover-origin rules have no PR numbers, so they get a descriptive
-// label instead of an empty PR list.
+// Manual, discover and code-review origin rules have no PR numbers, so they
+// get a descriptive label instead of an empty PR list.
 func sourceLabel(r state.Rule) string {
+	// Whatever a rule's origin, review corroboration it later absorbed through
+	// Step 8C is part of its provenance. Every branch here once dropped it:
+	// pr-review rendered the review signal as "PR #0", code-review dropped the
+	// PRs, and manual and discover said nothing at all — presenting a rule two
+	// reviewers had since confirmed as though no reviewer had ever seen it.
+	reviewed := ""
+	if tools := reviewerNames(reviewSources(r.Sources)); tools != "" {
+		reviewed = " and code review (" + tools + ")"
+	} else if hasReviewSource(r.Sources) {
+		reviewed = " and code review"
+	}
+
 	switch r.Origin {
 	case "manual":
-		return "manually added"
+		return "manually added" + reviewed
 	case "discover":
-		return "discovered from codebase"
-	default:
+		return "discovered from codebase" + reviewed
+	case "code-review":
+		// Name the reviewers: which tool flagged a convention is what tells a
+		// reader whether to trust it, and two different tools agreeing is a
+		// stronger claim than one repeating itself. Only the review sources
+		// are named — a code-review rule can later absorb a PR signal through
+		// Step 8C, and listing that human's login among the tools would
+		// present them as one, while dropping their PR from the citation.
+		label := strings.TrimPrefix(reviewed, " and ")
+		if label == "" {
+			label = "code review"
+		}
 		if prs := prList(r.Sources); prs != "" {
-			return "PRs " + prs
+			label += " and PRs " + prs
+		}
+		return label
+	default:
+		// A PR-origin rule can hold review signals too: Step 8C merges an
+		// equivalent review candidate into the existing rule and keeps that
+		// rule's origin. Those sources carry pr_number 0, which prList used to
+		// render as "PR #0" — a citation to a pull request that does not
+		// exist, on exactly the rules the review path is meant to strengthen.
+		prs := prList(r.Sources)
+		switch {
+		case prs != "":
+			return "PRs " + prs + reviewed
+		case reviewed != "":
+			return strings.TrimPrefix(reviewed, " and ")
 		}
 		return "—"
 	}
 }
 
+// hasReviewSource reports whether any signal was mined from a captured review.
+func hasReviewSource(sources []state.Signal) bool {
+	for _, s := range sources {
+		if s.ReviewID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewSources returns just the signals mined from captured reviews.
+func reviewSources(sources []state.Signal) []state.Signal {
+	var out []state.Signal
+	for _, s := range sources {
+		if s.ReviewID != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// reviewerNames lists the distinct reviewers behind a rule, for the source
+// line of a rule mined from watched code-review output, where the reviewer is
+// the tool's name. Capped so a convention flagged by many tools does not push
+// a source line past a readable length.
+func reviewerNames(sources []state.Signal) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, s := range sources {
+		name := strings.TrimSpace(s.Reviewer)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	const maxNames = 3
+	if len(names) > maxNames {
+		return strings.Join(names[:maxNames], ", ") + ", …"
+	}
+	return strings.Join(names, ", ")
+}
+
+// prList renders the distinct PRs behind a rule. Signals with no PR — a
+// merged review signal, a manual one — contribute nothing rather than a
+// "#0" citation.
 func prList(sources []state.Signal) string {
 	seen := map[int]bool{}
 	var nums []int
 	for _, s := range sources {
+		if s.PRNumber <= 0 {
+			continue
+		}
 		if !seen[s.PRNumber] {
 			seen[s.PRNumber] = true
 			nums = append(nums, s.PRNumber)

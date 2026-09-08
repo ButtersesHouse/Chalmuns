@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/ButtersesHouse/Chalmuns/internal/fsatomic"
 )
 
 const SchemaVersion = "1"
@@ -23,7 +25,45 @@ type State struct {
 	// approval; output.go reads them when present, falls back to a generic
 	// template otherwise. Drives Claude Code's skill auto-loading.
 	DomainDescriptions map[string]string `json:"domain_descriptions,omitempty"`
+	// Watchers are the code-review skills and tools the user designated for
+	// pattern-learner to keep eyes on. Their output is captured into the
+	// review cache and mined for conventions the same way PR review comments
+	// are. Empty means nothing is watched and the capture hook does nothing:
+	// designation is opt-in, so an installed plugin never starts recording a
+	// tool's output on its own.
+	Watchers []Watcher `json:"watchers,omitempty"`
+	// LastIngestedReviewAt is the review-cache watermark: the capture timestamp
+	// of the newest artifact a --learn-reviews run consumed. It is a timestamp
+	// rather than an ID because artifact IDs are content-addressed and so
+	// carry no order. Re-mining an artifact is harmless but not free — capture
+	// is idempotent, so a repeat costs a subagent pass, not a duplicate signal.
+	LastIngestedReviewAt string `json:"last_ingested_review_at,omitempty"`
 }
+
+// Watcher is one designated code-review source. The user adds it once
+// ("keep eyes on /code-review"); from then on the capture hook records that
+// source's output into the review cache, and --learn-reviews mines it.
+type Watcher struct {
+	// ID is the stable slug the CLI addresses this watcher by, derived from
+	// Name. It is what `watch --remove` takes.
+	ID string `json:"id"`
+	// Name is the designated skill or tool as the user names it — "code-review",
+	// "security-review", "semgrep". Matching is on this.
+	Name string `json:"name"`
+	// Kind is how Name is matched against a capture: "skill" (a Claude Code
+	// skill invocation), "tool" (a command line), or "any" (either).
+	Kind string `json:"kind"`
+	// Format names the output shape this source emits, or "auto" to sniff it
+	// per artifact. See internal/review for the recognised values.
+	Format  string `json:"format"`
+	AddedAt string `json:"added_at"`
+}
+
+// A Watcher deliberately carries no capture counters. The capture hook writes
+// artifacts, and having it also write state would put a hook on the same file
+// a pipeline run is rewriting — a race whose loser is the run's rule set. The
+// review cache is the one source of truth for what has been captured, and
+// `watch --list` counts it live.
 
 type RepoInfo struct {
 	Owner string   `json:"owner"`
@@ -60,8 +100,9 @@ type Rule struct {
 	SupersededBy *string   `json:"superseded_by,omitempty"`
 	// Origin records how the rule first entered state: "" or "pr-review" for the
 	// PR ingestion pipeline (default), "discover" for cursor-agent codebase
-	// discovery, "manual" for a rule a developer added directly via --add. Drives
-	// the provenance line in generated output files.
+	// discovery, "manual" for a rule a developer added directly via --add,
+	// "code-review" for a rule mined from the output of a designated code-review
+	// skill or tool. Drives the provenance line in generated output files.
 	Origin string `json:"origin,omitempty"`
 	// Conflicted is set when cross-batch contradiction detection finds two
 	// candidates from overlapping PR ranges that contradict each other.
@@ -83,6 +124,11 @@ type Rule struct {
 type ReviewedSnapshot struct {
 	SignalCount     int   `json:"signal_count"`
 	SourcePRNumbers []int `json:"source_pr_numbers"`
+	// SourceReviewIDs records the captured reviews behind the rule. Review
+	// signals all report pr_number 0, so without this a rule rebuilt from
+	// entirely different reviews looks unchanged and is suppressed from the
+	// approval loop — hiding new corroboration rather than surfacing it.
+	SourceReviewIDs []string `json:"source_review_ids,omitempty"`
 }
 
 type Example struct {
@@ -108,6 +154,11 @@ type Signal struct {
 	Reviewer  string `json:"reviewer"`
 	Date      string `json:"date"`
 	Snippet   string `json:"snippet"`
+	// ReviewID names the review-cache artifact this signal was extracted from,
+	// for signals mined from a watched code-review source. It is what
+	// verify-grounding checks the snippet against, standing in for PRNumber,
+	// which such a signal does not have. Empty for PR-derived signals.
+	ReviewID string `json:"review_id,omitempty"`
 	// Strength is "explicit" when the reviewer stated a general preference or convention
 	// ("we prefer X", "we always Y"); "implicit" for corrections without a stated rule.
 	// Empty is treated as "implicit" for backward compatibility.
@@ -191,11 +242,9 @@ func Write(path string, s State) error {
 		return err
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// One atomic write, shared with the review store — see internal/fsatomic
+	// for why a per-writer temp name and an explicit mode both matter here.
+	return fsatomic.WriteFile(path, data)
 }
 
 func newRuleID() string {

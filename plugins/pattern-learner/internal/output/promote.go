@@ -220,7 +220,8 @@ func renderPromotedBlock(s state.State, targetPath, skillsDir string, relativeLi
 	b.WriteString("<!-- Managed by pattern-learner. Edits inside this block are overwritten;\n")
 	b.WriteString("     anything outside it is preserved. Refresh with: pattern-learner promote -->\n\n")
 	b.WriteString("# Coding Conventions\n\n")
-	b.WriteString("Extracted from this repo's PR review history by pattern-learner.")
+	b.WriteString("Extracted by pattern-learner from this repo's review history — pull request")
+	b.WriteString(" reviews, and any code-review tools the repo has designated for it to watch.")
 	b.WriteString(" See `.claude/pattern-learner/state.json` for provenance.\n\n")
 
 	if len(universal) > 0 {
