@@ -148,6 +148,17 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a camelcase password echoed from a config", `{"results":[{"extra":{"lines":"  password: dbHunter2pass"}}]}`, "dbHunter2pass", "results"},
 	{"a dotted username in userinfo", `{"credentials":["first.last:s3cr3tpassw0rd@db.internal:5432"]}`, "s3cr3tpassw0rd", "credentials"},
 	{"a dotted password in userinfo", `{"credentials":["admin:sup3r.S3cret@db.internal"]}`, "sup3r.S3cret", "credentials"},
+	// Rows for the leaks the thirtieth review found. A bare `$` prefix is not a
+	// variable expansion: it is also every crypt-format hash there is, which is
+	// exactly what the field these sit under holds. And a long path segment
+	// with no word break in it is a payload whether or not it is hex.
+	{"a bcrypt hash", `password: $2b$12$eImiTXuWVxfM37uY4JANjQ9Xk0mGxYtQ`, "eImiTXuWVxfM", "password"},
+	{"a bcrypt hash echoed from a config", `{"extra":{"lines":"password_hash: $2y$10$N9qo8uLOickgx2ZMRZoMye"}}`, "N9qo8uLOickgx2", "extra"},
+	{"an argon2 hash", `password: $argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ`, "c29tZXNhbHQ", "password"},
+	{"a md5-crypt hash", `password: $1$saltsalt$qJH7.N4xYta3aEG.dfeDMg`, "qJH7", "password"},
+	{"a literal starting with a dollar", `password: $Tr0ub4dor3xK`, "Tr0ub4dor3xK", "password"},
+	{"a lowercase base64 path segment", `secret: uploads/wjalrxutnfemik7mdengbpxrficyexamplekey.key`, "wjalrxutnfemi", "secret"},
+	{"an unbroken path segment echoed from a config", `{"extra":{"lines":"secret: keys/k3jd8fh2ns0dkq9emxz7pq1wbv4rt6yuz.dat"}}`, "k3jd8fh2ns0dkq", "extra"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -279,9 +290,21 @@ var proseCorpus = []struct{ name, in string }{
 	{"an env lookup echoed from a config", `{"extra":{"lines":"api_key: process.env.API_KEY"}}`},
 	{"a package coordinate in a list", `{"secrets":["com.example:lib:1.2.3@aar"]}`},
 	// A long file name carries a digit as often as not; banning them rewrote
-	// the classes a real project has.
-	{"a digit in a long cited path", "- The private_key: internal/auth/UserAuthenticationTokenProviderFactoryImpl2.java is committed"},
-	{"a digit in a long component path", "- The secret: packages/web/src/components/Auth2FactorEnrollmentDialogContainer.tsx holds it"},
+	// the classes a real project has. These are the line-start form on purpose:
+	// with words after the value, followedByWords decides them and the path
+	// rule is never reached, so the mid-sentence versions pinned nothing.
+	{"a digit in a long cited path", "private_key: src/main/UserAuthenticationTokenProviderFactoryImpl2.java"},
+	{"a digit in a long component path", "secret: packages/web/src/components/Auth2FactorEnrollmentDialogContainer.tsx"},
+	// An image reference has one colon and an `@`, and is not a login.
+	{"an image digest reference", `{"secrets":["docker.io/library/nginx:1.2@sha256"]}`},
+	{"a registry digest reference", `{"tokens":["registry.io/ns/img:v1@sha256"]}`},
+	// A value that points at the field holding the credential is not the
+	// credential, wherever it appears — and where it appears most is a scanner
+	// echoing the source line it flagged.
+	{"a config field echoed from source", `{"extra":{"lines":"  password: cfg.DBPassword"}}`},
+	{"a config struct field echoed from source", `{"extra":{"lines":"  api_key: dbConfig.password"}}`},
+	{"a settings lookup echoed from source", `{"extra":{"lines":"  secret: settings.API_KEY"}}`},
+	{"a config field in a bare span", "- `token: cfg.OAuth2Token`"},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
@@ -294,15 +317,19 @@ var proseCorpus = []struct{ name, in string }{
 //
 // A span holding nothing but `name: value`, with no sentence after it, is
 // indistinguishable from the assignment it quotes: "`api_key: abcdefghijkl`"
-// and "- `token: cfg.OAuth2Token`" are the same shape, and the corpus requires
+// and "- **secret: SHA256_DIGEST**" are the same shape, and the corpus requires
 // the first to be redacted. The direction is chosen: a credential emitted into
 // a committed artifact reads exactly like a clean scan, while a rewritten
-// identifier is visible in the artifact next to the finding it belongs to. And
-// the shape is rare — a reviewer quoting code says something about it, and once
-// there is a sentence after the span the name survives, which the rows above
+// identifier is visible in the artifact next to the finding it belongs to.
+//
+// What is left here is narrow. A value that *points* at a credential —
+// `cfg.OAuth2Token`, `settings.API_KEY`, `$DB_PASSWORD` — is recognised as
+// such wherever it appears, including in an `extra.lines` echo, which is the
+// commonest text this package sees. This row is a constant *name* used as a
+// value, which nothing distinguishes from a value; and once there is a
+// sentence after the span, the name survives anyway, which the rows above
 // pin.
 var acceptedRewrites = []struct{ name, in, rewritten string }{
-	{"a config field in a bare span", "- `token: cfg.OAuth2Token`", "cfg.OAuth2Token"},
 	{"a constant in a bare span", "- **secret: SHA256_DIGEST**", "SHA256_DIGEST"},
 }
 

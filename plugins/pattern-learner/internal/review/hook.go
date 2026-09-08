@@ -932,19 +932,40 @@ func isAssignedCredential(text string, loc []int) bool {
 }
 
 // isIndirection reports whether a value points at a credential rather than
-// being one: a shell or template expansion, or an environment lookup. These are
-// the only shapes allowed to overrule a line that spells out an assignment,
-// because they are unambiguous — nothing spells a literal secret `$DB_PASSWORD`
-// — and because a config that does this right is the config a scanner flags
-// least and quotes most.
+// being one: a shell or template expansion, an environment lookup, or a
+// reference to the field that holds it. These are the only shapes allowed to
+// overrule a line that spells out an assignment, because they are unambiguous —
+// nothing spells a literal secret `$DB_PASSWORD` — and because a config that
+// does this right is the config a scanner flags least and quotes most.
 func isIndirection(value string) bool {
-	return strings.HasPrefix(value, "$") ||
-		strings.HasPrefix(value, "{{") ||
+	if reVarExpansion.MatchString(value) || strings.HasPrefix(value, "{{") ||
 		(strings.HasPrefix(value, "<") && strings.HasSuffix(value, ">")) ||
-		reEnvLookup.MatchString(value)
+		reEnvLookup.MatchString(value) {
+		return true
+	}
+	// A qualified reference whose last piece names the credential:
+	// `cfg.DBPassword`, `settings.API_KEY`, `dbConfig.password`. That last
+	// piece is what says the value points at a secret rather than being one —
+	// a literal does not end in the word "password". This is the shape a
+	// scanner echoes out of source in `extra.lines`, which is the commonest
+	// text this package sees.
+	if i := strings.LastIndexAny(value, ".["); i >= 0 {
+		if last := strings.Trim(value[i+1:], `[]"'`); last != "" && reSecretKey.MatchString(last) {
+			return true
+		}
+	}
+	return false
 }
 
-var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
+// A variable expansion, and not merely a value that opens with `$`. The bare
+// prefix excused every crypt-format hash there is — `$2b$12$…`, `$1$salt$…`,
+// `$argon2id$…` — which are exactly what a `password_hash` field holds, and a
+// literal that happens to start with one. A variable's name is spelled the way
+// a variable's name is spelled: one case, no punctuation but the underscore.
+var (
+	reVarExpansion = regexp.MustCompile(`^\$\{?(?:[A-Z][A-Z0-9_]*|[a-z][a-z0-9_]*)\}?$`)
+	reEnvLookup    = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
+)
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
 // rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
@@ -1046,12 +1067,12 @@ func carriesAPassword(value string) bool {
 		return strings.Contains(userinfo[i+3:], ":")
 	}
 	// With no scheme in front of it, everything before the `@` is userinfo only
-	// if it reads like one — and userinfo is `user:pass`, exactly one colon.
-	// Testing for a dot instead was one dot away from being wrong in both
-	// directions at once: `first.last:s3cr3tpassw0rd@db` was excused, and
-	// `com.example:lib:1.2.3@aar` is a package coordinate that the colon count
-	// tells apart on its own.
-	return strings.Count(userinfo, ":") == 1
+	// if it reads like one — and userinfo is `user:pass`, exactly one colon and
+	// no path. Testing for a dot instead was one dot away from being wrong in
+	// both directions at once: `first.last:s3cr3tpassw0rd@db` was excused. The
+	// slash is what keeps an image reference — `docker.io/library/nginx:1.2@sha256`
+	// — from reading as a login.
+	return strings.Count(userinfo, ":") == 1 && !strings.Contains(userinfo, "/")
 }
 
 func isNameSeparator(r rune) bool {
@@ -1252,35 +1273,41 @@ func isFileReference(value string) bool {
 // name is: words, with at most an acronym's worth of capitals together, and no
 // digits mixed through it.
 //
-// Neither half alone was enough. Case alone excused
-// `uploads/a8f3d9e2c1b47f60a8f3d9e2c1b47f60a8f3d9e2.dat`, because lowercase hex
-// reads as a word to any test that only looks at capitals. Banning digits
-// outright — the first correction — rewrote every long file name that carries
-// one, and long file names carry them:
-// `UserAuthenticationTokenProviderFactoryImpl2.java`,
-// `Auth2FactorEnrollmentDialogContainer.tsx`. So the digit rule is about the
-// stem being *nothing but* hex, which is what a content hash is and what a
-// name never is.
+// Two narrower rules were tried first and each covered half the class. Banning
+// digits rewrote every long file name that carries one, and long file names
+// carry them — `UserAuthenticationTokenProviderFactoryImpl2.java`,
+// `Auth2FactorEnrollmentDialogContainer.tsx`. Banning a stem of nothing but hex
+// caught the content hash and nothing else: strip the digits out of a base64
+// key and `wjalrxutnfemik7mdengbpxrficyexamplekey.key` reads as a word again.
+//
+// What every long file name has is word breaks — humps, hyphens, underscores —
+// and what no payload has is any. That is the rule, and it is the same one
+// isWordPiece applies to a name.
 func readsAsWords(seg string) bool {
 	stem := seg
 	if i := strings.LastIndexByte(stem, '.'); i > 0 {
 		stem = stem[:i]
 	}
-	if isHex(stem) {
+	if !hasWordBreak(stem) {
 		return false
 	}
 	sh := shapeOf(seg)
 	return sh.hasLower && sh.maxCaps < maxCapsRun
 }
 
-// isHex reports whether a string is nothing but hexadecimal digits.
-func isHex(s string) bool {
-	if s == "" {
-		return false
+// hasWordBreak reports whether a run of characters is divided into words by
+// anything at all: a hyphen, an underscore, or a capital opening one.
+func hasWordBreak(s string) bool {
+	if strings.ContainsAny(s, "-_") {
+		return true
 	}
-	return strings.IndexFunc(s, func(r rune) bool {
-		return !strings.ContainsRune("0123456789abcdefABCDEF", r)
-	}) < 0
+	rs := []rune(s)
+	for i := 1; i < len(rs); i++ {
+		if unicode.IsUpper(rs[i]) && unicode.IsLower(rs[i-1]) {
+			return true
+		}
+	}
+	return false
 }
 
 // How long a piece of a path may run. maxUnbrokenPathRunes is the stricter
@@ -1323,7 +1350,13 @@ var reBareSecret = regexp.MustCompile(
 		`(?:` + keyLineBreak + `-----END [A-Z ]*PRIVATE KEY-----)?` +
 		`|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{16,}|\bgho_[A-Za-z0-9]{16,}` +
 		`|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}` +
-		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}`)
+		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}` +
+		// A crypt-format hash, which names its own algorithm and is what a
+		// `password_hash` column holds. It belongs here rather than with the
+		// name-and-value rules because their unquoted value class stops at a
+		// comma, and an argon2 hash has commas in its parameters — so those
+		// rules redacted the algorithm and left the salt.
+		`|\$(?:[0-9]|2[abxy]?|argon2[a-z0-9]*|scrypt|pbkdf2[a-z0-9-]*|y|gy|7|sha1)\$[^\s"'\\]+`)
 
 // envelopeKeys are what a tool runner wraps a result in: what tool it was, how
 // it ended, what it was told to do. A map carrying them describes a call
