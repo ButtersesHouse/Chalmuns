@@ -644,6 +644,15 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"a subcommand flag", `uv run --with x semgrep .`, true},
 		{"poetry run from a directory", `poetry run --directory dir semgrep .`, true},
 		{"a flag carrying its own value", `npm --loglevel=verbose run semgrep`, true},
+		// Only the flags that require an argument are listed: `-i`, `-l`,
+		// `--replace` and `--eof` take an optional one, which GNU xargs never
+		// reads as a separate word, so listing them swallowed the program.
+		{"an xargs optional-argument flag", `xargs -i semgrep {}`, true},
+		{"an xargs long optional-argument flag", `xargs --replace semgrep {}`, true},
+		{"a sudo short flag with a value", `sudo -D /tmp semgrep .`, true},
+		{"a sudo command timeout", `sudo -T 60 semgrep .`, true},
+		{"a subcommand short flag", `uv run -p 3.12 semgrep .`, true},
+		{"a two-word subcommand", `uv tool run semgrep .`, true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},

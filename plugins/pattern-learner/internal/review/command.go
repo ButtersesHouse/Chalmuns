@@ -60,8 +60,10 @@ func invocations(command string) (found []string) {
 	// The parser is third-party code on a fail-open path: the capture hook
 	// runs inside someone else's tool call, and this package's contract is
 	// that a payload it cannot handle costs a capture and nothing else. A
-	// panic here would take the tool call with it — and v3.8.0 does panic on
-	// shell text bash accepts, `echo `+"`"+`echo "$\"`+"`"+`` among it.
+	// panic here would take the tool call with it, and v3.8.0 does panic on
+	// some inputs — six bytes of quote, backtick, dollar and backslash reach
+	// `slice bounds out of range` in its lexer. The exact input is pinned in
+	// watch_test.go.
 	defer func() {
 		if recover() != nil {
 			found = nil
@@ -122,9 +124,6 @@ func calledProgram(call *syntax.CallExpr) []string {
 			case inquiryFlags[wrapper][word]:
 				// `command -v semgrep` prints a path; it runs nothing.
 				return out
-			case strings.Contains(word, "="):
-				// `--loglevel=verbose` carries its value; nothing follows.
-				continue
 			case valueFlags[wrapper][word]:
 				i++
 				continue
@@ -159,24 +158,29 @@ var (
 	valueFlags = map[string]map[string]bool{
 		"sudo": {"-u": true, "-g": true, "-p": true, "-C": true, "-h": true,
 			"--user": true, "--group": true, "--prompt": true, "--chdir": true,
-			"--close-from": true, "--host": true, "--role": true, "--type": true},
+			"--close-from": true, "--host": true, "--role": true, "--type": true,
+			"-D": true, "-R": true, "-T": true, "--chroot": true,
+			"--command-timeout": true},
 		"env":     {"-u": true, "-C": true, "--unset": true, "--chdir": true},
 		"timeout": {"-s": true, "-k": true, "--signal": true, "--kill-after": true},
 		"nice":    {"-n": true, "--adjustment": true},
 		"exec":    {"-a": true},
-		"xargs": {"-a": true, "-I": true, "-i": true, "-n": true, "-P": true,
-			"-d": true, "-s": true, "-L": true, "-l": true, "-E": true,
+		// Only the flags GNU xargs requires an argument for. `-i`, `-l`,
+		// `--replace` and `--eof` take an *optional* one, which xargs never
+		// reads as a separate word, so listing them swallowed the program:
+		// `xargs -i semgrep {}` really runs semgrep.
+		"xargs": {"-a": true, "-I": true, "-n": true, "-P": true,
+			"-d": true, "-s": true, "-L": true, "-E": true,
 			"--max-args": true, "--max-procs": true, "--max-chars": true,
-			"--max-lines": true, "--arg-file": true, "--replace": true,
-			"--delimiter": true, "--eof": true},
+			"--max-lines": true, "--arg-file": true, "--delimiter": true},
 		"yarn": {"--cwd": true},
 		// A subcommand's own flags. `wrapper` follows the chain, so `uv run
 		// --with x semgrep .` consults this rather than uv's table, and an
 		// entry filed only under the top-level program was never reached.
-		"run": {"--with": true, "--python": true, "--directory": true,
-			"-C": true, "--cwd": true, "-w": true, "--workspace": true,
-			"--prefix": true, "--filter": true},
-		"tool":   {"--with": true, "--python": true},
+		"run": {"--with": true, "--python": true, "-p": true, "--from": true,
+			"--directory": true, "-C": true, "--cwd": true, "-w": true,
+			"--workspace": true, "--prefix": true, "--filter": true},
+		"tool":   {"--with": true, "--python": true, "-p": true, "--from": true},
 		"npx":    {"-p": true, "--package": true, "-c": true, "--call": true},
 		"npm":    {"-w": true, "--workspace": true, "--prefix": true, "--loglevel": true},
 		"pnpm":   {"-C": true, "--dir": true, "--filter": true},
