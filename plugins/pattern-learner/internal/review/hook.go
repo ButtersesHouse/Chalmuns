@@ -523,7 +523,10 @@ var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
 // escaped inside the value does not end the match early and leave a dangling
 // one behind — which turned the document invalid, and a watcher pinned to a
 // format then lost the whole review.
-const quotedValue = `(?:[^"\\]|\\.)*`
+// A value stops at its delimiter, escaped or not: `\\.` consuming a `\"`
+// ran the match past the credential to the end of the enclosing JSON string
+// and deleted the report content in between.
+const quotedValue = `(?:[^"\\]|\\[^"])*`
 
 // escapedQuote matches the quote delimiter as it arrives in hook text, which
 // is usually JSON: a review's own `"` reaches this package as `\"`, and rules
@@ -568,20 +571,33 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(--?(?:token|password|secret|api[_-]?key|access[_-]?key)[= ])[^\s"',;)\]}]+()`),
 }
 
-// reColonForm is the `name: value` shape — how YAML, an env dump and a header
-// dump all spell it. A bare name before a colon is also ordinary prose, so
-// what follows is judged by looksLikeCredential rather than by the pattern.
-var reColonForm = regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName +
-	`[A-Za-z0-9_.-]*[ \t]*:[ \t]*)(` + escapedQuote + `?)([^\s"',;)\]}]+|[^"']+)(` + escapedQuote + `?)`)
+// The `name: value` shape — how YAML, an env dump and a header dump all spell
+// it, in each of its quotings. A bare name before a colon is also ordinary
+// prose, so what follows is judged by looksLikeCredential rather than by the
+// pattern. Group 1 is the name and its delimiter, group 2 the closing one.
+//
+// The value classes are bounded to a line and to their own quote, and exclude
+// the backslash. A class that fell back to "anything but a quote" ran to the
+// end of the review whenever the next character was a newline, taking every
+// finding after it; one that swallowed a trailing `\` ate the escape of the
+// `\"` that ended the enclosing JSON string and left the document invalid.
+var colonForms = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')([^'\n]*)(')`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]+)([^\s"',;)\]}\\]+)()`),
+}
 
 func redactColonForm(text string) string {
-	return reColonForm.ReplaceAllStringFunc(text, func(m string) string {
-		g := reColonForm.FindStringSubmatch(m)
-		if !looksLikeCredential(g[3]) {
-			return m
-		}
-		return g[1] + g[2] + redactedSentinel + g[4]
-	})
+	for _, re := range colonForms {
+		text = re.ReplaceAllStringFunc(text, func(m string) string {
+			g := re.FindStringSubmatch(m)
+			if !looksLikeCredential(g[2]) {
+				return m
+			}
+			return g[1] + redactedSentinel + g[3]
+		})
+	}
+	return text
 }
 
 // looksLikeCredential decides what may follow a name that says "secret". A
@@ -596,20 +612,20 @@ func looksLikeCredential(value string) bool {
 	if len([]rune(value)) < 6 {
 		return false
 	}
-	if strings.ContainsAny(value, "/\\") || reFileRef.MatchString(value) {
-		return false
+	// Length alone settles a long run, whatever punctuation it holds. Below
+	// that, only a file reference is excluded — a slash on its own is not
+	// disqualifying, because `/` is in the base64 alphabet and rejecting it
+	// let `secret: dXNlcjpwYXNz/d29yZA==` through untouched.
+	if len([]rune(value)) >= 24 {
+		return true
 	}
-	return true
+	return !reFileRef.MatchString(value)
 }
 
-var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)
-
-// credentialish is what may follow a bare name and a colon: an unbroken run of
-// six or more characters. A shorter one is prose — `token: yes` — and the
-// floor is deliberately low, because `swordfish` is a password and `hunter2`
-// is a password. It is only reached after a name that says "secret", and the
-// prose corpus pins what must survive it.
-const credentialish = `[^\s"',;)\]}]{6,}`
+// reFileRef matches what a review sentence puts after a colon: a file the
+// reviewer cited. Rewriting one into `[redacted]` makes the finding cite a
+// path that does not exist, in the text grounding checks the quote against.
+var reFileRef = regexp.MustCompile(`(?:^|/)[A-Za-z0-9_.-]+\.[A-Za-z]{1,4}$`)
 
 // reBareSecret matches the token shapes that identify themselves without a
 // name beside them — an argv entry, a line of a traceback, a URL — and the
@@ -620,11 +636,11 @@ const credentialish = `[^\s"',;)\]}]{6,}`
 // exist. The PEM rule requires its END marker: running to the end of the text
 // instead swallowed the rest of a report that merely quoted the header line.
 var reBareSecret = regexp.MustCompile(
-	// The body is bounded to key material rather than run to end-of-text: a
-	// report that merely quotes the header line has the rest of it swallowed
-	// otherwise, and a key truncated before its END marker still has a body
-	// that must not survive.
-	`-----BEGIN [A-Z ]*PRIVATE KEY-----[A-Za-z0-9+/=\s]*(?:-----END [A-Z ]*PRIVATE KEY-----)?` +
+	// The body is whole lines of key material, not any run of letters and
+	// whitespace: a report that merely quotes the header line mid-sentence had
+	// the rest of that sentence, and the finding after it, swallowed. A key
+	// truncated before its END marker still loses its body.
+	`-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[ \t]*\r?\n[A-Za-z0-9+/=]+)*(?:[ \t]*\r?\n-----END [A-Z ]*PRIVATE KEY-----)?` +
 		`|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{16,}|\bgho_[A-Za-z0-9]{16,}` +
 		`|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}` +
 		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}`)

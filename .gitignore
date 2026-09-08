@@ -5,5 +5,5 @@ __pycache__/
 
 # Left behind by tools run during review sessions.
 node_modules/
-package.json
-package-lock.json
+/package.json
+/package-lock.json

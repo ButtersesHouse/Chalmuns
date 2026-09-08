@@ -602,6 +602,21 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"an array append", "x=(); x+=(semgrep); echo ok", false},
 		{"a function definition", "f() { semgrep; }", false},
 		{"a run after a function definition", "f() { semgrep; }\nsemgrep .", true},
+		// What stands between a wrapper and the program it runs is not the
+		// program: assignments after `env`, flags, and a flag's own value.
+		{"env with an assignment", `env SEMGREP_RULES=x semgrep .`, true},
+		{"sudo env with an assignment", `sudo -n env FOO=1 semgrep .`, true},
+		{"a flag value between wrapper and program", `nice -n 10 semgrep .`, true},
+		{"npx with a flag", `npx --yes semgrep .`, true},
+		{"timeout with a duration", `timeout 60 semgrep .`, true},
+		{"a wrapped tool is not every argument", `sudo grep semgrep notes.txt`, false},
+		// A name half of which comes from an expansion is not a name:
+		// `${TOOL}semgrep` runs whatever $TOOL expands to, glued to semgrep.
+		{"an expansion glued to a name", `TOOL=x; ${TOOL}semgrep .`, false},
+		{"a substitution glued to a name", `$(echo x)semgrep .`, false},
+		// The parser is third-party code on a fail-open path, and v3.8.0
+		// panics on shell text bash accepts.
+		{"input that panics the parser", "echo `echo \"$\\\"`; semgrep --json .", false},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},

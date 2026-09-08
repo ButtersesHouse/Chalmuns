@@ -48,6 +48,17 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a plain word password", `password: correcthorse`, "correcthorse", "password"},
 	{"a truncated pem", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAy8Dbv8prpJ\nAAAA", "MIIEowIBAAKCAQEA", ""},
 	{"a flag with an equals sign", `deploy --token=abcdef123456 --force`, "abcdef123456", "--force"},
+	// Rows for the leaks the eighteenth review found. Each value is shaped so
+	// nothing else in the pattern set would catch it.
+	{"a base64 secret with slashes", `aws_secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`, "wJalrXUtnFEMI", "aws_secret_access_key"},
+	{"a base64 value with a slash", `secret: dXNlcjpwYXNz/d29yZA==`, "dXNlcjpwYXNz", "secret"},
+	{"a single-quoted colon value", `password: 'hunter2trustno1'`, "hunter2trustno1", "password"},
+	{"a single-quoted api key", `api_key: 'abcdefghijklmnop'`, "abcdefghijklmnop", "api_key"},
+	{"a jwt", `token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc`, "eyJhbGciOiJIUzI1NiJ9", "token"},
+	// A report that quotes a key's header line mid-sentence loses the marker
+	// and nothing else: a body class of letters-and-spaces swallowed the rest
+	// of that finding and the one after it.
+	{"a key header quoted mid-sentence", "## Findings\n\n- `config/prod.yaml` embeds -----BEGIN RSA PRIVATE KEY----- and commits it\n\n- The retry loop never backs off\n", "BEGIN RSA PRIVATE KEY", "The retry loop never backs off"},
 }
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
@@ -69,6 +80,9 @@ var proseCorpus = []struct{ name, in string }{
 	{"a path with a hyphen", "the secret: docs/setup-guide.md explains it"},
 	{"an identifier containing auth", "The token check is wrong: user.IsAuthenticated=true is never set."},
 	{"an authorized field", "It sets authorized=true before validating the token."},
+	// A colon at the end of a line, and a report that quotes a key's header
+	// line mid-sentence: both had every finding after them deleted.
+	{"a heading ending in a colon", "## Findings\n\n### 1. Hardcoded credential:\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nThe endpoint is unbounded.\n"},
 }
 
 // mustStayValid: redaction may not make a document unparseable. A watcher
@@ -89,6 +103,14 @@ var jsonCorpus = []string{
 	// pinned-format watcher the whole review.
 	`{"results":[{"extra":{"message":"the token: internal/auth/x.go\" quoted","severity":"ERROR"}}]}`,
 	`{"m":"secret: a/b/c/d/e/f\"g"}`,
+	// A JSON escape after a secret-ish word: splitting it left `\[redacted]`
+	// and an unparseable document, which cost a pinned-format watcher the
+	// whole review.
+	`{"m":"the secret:\nhunter2trustno1 is hardcoded"}`,
+	`{"m":"the token:\thunter2trustno1 is hardcoded"}`,
+	// A credential in the middle of a nested string, with report text after
+	// it: a value class that ate the escaped quote deleted everything between.
+	`{"results":[{"extra":{"lines":"{\"api_key\": \"abc123def\", \"note\": \"this is the finding text\"}"}}],"version":"1.55"}`,
 }
 
 func TestRedactSecrets_removesCredentials(t *testing.T) {

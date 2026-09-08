@@ -1,6 +1,7 @@
 package review
 
 import (
+	"regexp"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -53,20 +54,30 @@ func matchesCommand(name, command string) bool {
 // A line the parser rejects yields none: bash would refuse it too, so nothing
 // in it ran, and reading a command out of a line that cannot execute is how a
 // syntax error got filed as a review.
-func invocations(command string) []string {
+func invocations(command string) (found []string) {
+	// The parser is third-party code on a fail-open path: the capture hook
+	// runs inside someone else's tool call, and this package's contract is
+	// that a payload it cannot handle costs a capture and nothing else. A
+	// panic here would take the tool call with it — and v3.8.0 does panic on
+	// shell text bash accepts, `echo `+"`"+`echo "$\"`+"`"+`` among it.
+	defer func() {
+		if recover() != nil {
+			found = nil
+		}
+	}()
+
+	// A CRLF *script* is a file-format artifact rather than shell syntax, and
+	// a here-document whose terminator carries a CR parses as unterminated;
+	// bash runs such a script, so refusing it cost the capture. Only when
+	// every line ends that way: a lone `\r` inside an LF script is data — a
+	// here-document body line spelled `EOF\r` is not its terminator.
+	if isCRLF(command) {
+		command = strings.ReplaceAll(command, "\r\n", "\n")
+	}
+
 	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
 	if err != nil {
-		// CRLF is a file-format artifact rather than shell syntax, and a
-		// here-document whose terminator carries a CR parses as unterminated.
-		// bash runs such a script; refusing it cost the capture.
-		if !strings.Contains(command, "\r\n") {
-			return nil
-		}
-		file, err = syntax.NewParser().Parse(
-			strings.NewReader(strings.ReplaceAll(command, "\r\n", "\n")), "")
-		if err != nil {
-			return nil
-		}
+		return nil
 	}
 	var out []string
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -88,13 +99,21 @@ func invocations(command string) []string {
 // their own field, so `SEMGREP_RULES=x semgrep .` needs no special handling.
 func calledProgram(call *syntax.CallExpr) []string {
 	var out []string
-	for _, arg := range call.Args {
+	for i, arg := range call.Args {
 		word := literalWord(arg)
 		if word == "" {
 			// An argument with nothing literal in it — `$out`, `$(cmd)` — is
 			// not a name this can check. It is still a word, so it ends the
 			// search rather than letting the next argument stand in for it.
 			return out
+		}
+		// Past the program itself, what stands between a wrapper and the
+		// program it runs is not the program: `env SEMGREP_RULES=x semgrep .`
+		// is a run of semgrep, and so are `npx --yes semgrep .`, `nice -n 10
+		// semgrep .` and `timeout 60 semgrep .`. The parser keeps a leading
+		// assignment in its own field, but one after `env` is an argument.
+		if i > 0 && (reAssignArg.MatchString(word) || strings.HasPrefix(word, "-") || reNumber.MatchString(word)) {
+			continue
 		}
 		out = append(out, word)
 		if !commandWrappers[strings.ToLower(commandBase(word))] {
@@ -104,6 +123,11 @@ func calledProgram(call *syntax.CallExpr) []string {
 	return out
 }
 
+var (
+	reAssignArg = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	reNumber    = regexp.MustCompile(`^[0-9]+$`)
+)
+
 // literalWord renders the parts of a word that are literal text, dropping the
 // parts that are not. `$(pwd)/bin/semgrep` yields "/bin/semgrep", which
 // commandBase reduces to semgrep — the form a CI script uses to run a
@@ -111,6 +135,7 @@ func calledProgram(call *syntax.CallExpr) []string {
 // it says what will run.
 func literalWord(w *syntax.Word) string {
 	var b strings.Builder
+	expanded := false
 	for _, part := range w.Parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
@@ -121,9 +146,44 @@ func literalWord(w *syntax.Word) string {
 			for _, inner := range p.Parts {
 				if lit, ok := inner.(*syntax.Lit); ok {
 					b.WriteString(lit.Value)
+				} else {
+					expanded = true
+					b.Reset()
 				}
 			}
+		default:
+			// An expansion. Whatever came before it is not the program's
+			// name, so the accumulated text starts again after it.
+			expanded = true
+			b.Reset()
 		}
 	}
-	return b.String()
+	text := b.String()
+	if expanded && !strings.Contains(text, "/") {
+		// The expansion produced part of the name itself: `${TOOL}semgrep`
+		// runs whatever `$TOOL` expands to, glued to "semgrep", and reading
+		// the literal half as the program named a tool that never ran. With a
+		// `/` after the expansion the basename is fully literal, which is the
+		// `$(pwd)/bin/semgrep` form a CI script uses.
+		return ""
+	}
+	return text
+}
+
+// isCRLF reports whether every line of a command ends with a carriage return,
+// which is what makes it a CRLF script rather than LF text with a stray CR in
+// it.
+func isCRLF(command string) bool {
+	rest, seen := command, false
+	for {
+		i := strings.IndexByte(rest, '\n')
+		if i < 0 {
+			return seen
+		}
+		if i == 0 || rest[i-1] != '\r' {
+			return false
+		}
+		seen = true
+		rest = rest[i+1:]
+	}
 }
