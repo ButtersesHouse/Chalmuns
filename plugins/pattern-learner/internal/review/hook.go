@@ -70,6 +70,10 @@ func init() {
 // response, most specific first.
 var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
 
+// responseTextKeys is textKeys plus stderr, which is read on different terms —
+// see valueText. It is built once so the two lists cannot drift.
+var responseTextKeys = append(append([]string{}, textKeys...), "stderr")
+
 // FromHook decides whether a hook payload belongs to a designated watcher and,
 // if so, normalizes the reviewed output into an Artifact. The second return is
 // the watcher that matched. ok is false whenever there is nothing to record,
@@ -316,42 +320,56 @@ func valueText(v interface{}, depth int) string {
 		if _, ok := t["findings"]; ok {
 			return marshalText(v)
 		}
-		// A response envelope that carries text fields has already said what it
-		// has: marshalling the whole envelope would record `{"stdout":"", …}`
-		// as the reviewer's words, which grounds perfectly and is JSON
-		// punctuation.
+
+		// One pass over every field that may carry a review, with two rules.
+		//
+		// A structured report wins wherever it sits. A runner that adds
+		// `"message":"Command exited with code 1"` beside a linter's JSON
+		// otherwise had its own bookkeeping read as the review, purely because
+		// "message" is checked before the field the report was in.
+		//
+		// stderr is prose only under protest. A linter writing its report
+		// there is ordinary, but so is one writing a usage error or a progress
+		// banner, and nothing in the stream itself tells the two apart. A
+		// report has a shape; a diagnostic does not, and mining standing
+		// conventions out of a crash message is worse than missing the review.
 		envelope := false
-		for _, key := range textKeys {
+		prose := ""
+		for _, key := range responseTextKeys {
 			inner, present := t[key]
 			if !present {
 				continue
 			}
+			// Present but empty still means "this envelope has said what it
+			// has" — including a null or false stderr, which reaching
+			// marshalText below would have recorded as the reviewer's words.
 			envelope = true
-			if text := valueText(inner, depth+1); strings.TrimSpace(text) != "" {
+			text := valueText(inner, depth+1)
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			if Detect([]byte(text)) != FormatMarkdown {
 				return text
 			}
-		}
-		// stderr is read last and only when it carries a structured report.
-		// A linter writing its report there is ordinary, but so is a linter
-		// writing a usage error or a progress banner there, and nothing in the
-		// stream itself tells the two apart. A report has a shape; a
-		// diagnostic is prose, and mining standing conventions out of a crash
-		// message is worse than missing the review.
-		if raw, ok := t["stderr"].(string); ok {
-			envelope = true
-			if strings.TrimSpace(raw) != "" && Detect([]byte(raw)) != FormatMarkdown {
-				return raw
+			if prose == "" && key != "stderr" {
+				prose = text
 			}
 		}
+		if prose != "" {
+			return prose
+		}
 		if envelope {
-			// The response envelope has already said what it has. Handing back
-			// the fields it did not recognise instead — a tool_use_id, a
-			// sandbox flag — recorded JSON punctuation as the reviewer's words
-			// and, because the first non-empty candidate wins, shadowed a real
-			// review sitting under a later response key.
 			return ""
 		}
-		return marshalText(v)
+		// An unrecognised map is handed over only when it is itself a report.
+		// Marshalling any object recorded a runner's bookkeeping —
+		// `{"is_error":true,"tool_use_id":"…"}` — as the reviewer's words, and
+		// because that JSON sniffs as prose, the clean-run guard in FromHook
+		// (which exempts prose) could not catch it either.
+		if s := marshalText(v); s != "" && Detect([]byte(s)) != FormatMarkdown {
+			return s
+		}
+		return ""
 	}
 	return ""
 }

@@ -775,8 +775,12 @@ func TestCapture_theSameBytesAreOneReviewUnderAutoOrAnExplicitFormat(t *testing.
 // pins it forever, so a single truncated file makes every later run re-mine
 // the whole tail of the cache. The watermark advances and the id is named.
 func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
+	// The broken artifact is the *newest* one on purpose. When it sat in the
+	// middle, a watermark taken from the last artifact read still advanced
+	// past it and the test could not see the pinning case at all.
 	dir := t.TempDir()
-	for i, stamp := range []string{"2026-01-15T10:00:00Z", "2026-01-15T11:00:00Z", "2026-01-15T12:00:00Z"} {
+	stamps := []string{"2026-01-15T10:00:00Z", "2026-01-15T11:00:00Z", "2026-01-15T12:00:00Z"}
+	for i, stamp := range stamps {
 		if _, err := WriteArtifact(dir, Artifact{
 			ReviewID:   fmt.Sprintf("rev-00000000000%d", i+1),
 			Source:     "code-review",
@@ -787,14 +791,12 @@ func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Break the *middle* artifact in a way the metadata listing survives: it
-	// only decodes review_id, source and captured_at, so the file still lists
-	// and is still selected — it is ReadArtifact that fails on it. A file
-	// corrupt enough to fail the listing would vanish from the selection
-	// entirely, which is a different (and unrecoverable) case.
-	if err := os.WriteFile(ArtifactPath(dir, "rev-000000000002"),
-		[]byte(`{"review_id":"rev-000000000002","source":"code-review",`+
-			`"captured_at":"2026-01-15T11:00:00Z","findings":"not an array"}`), 0644); err != nil {
+	// Broken in a way the metadata listing survives: it decodes only
+	// review_id, source and captured_at, so the file still lists and is still
+	// selected — it is ReadArtifact that fails on it.
+	if err := os.WriteFile(ArtifactPath(dir, "rev-000000000003"),
+		[]byte(`{"review_id":"rev-000000000003","source":"code-review",`+
+			`"captured_at":"2026-01-15T12:00:00Z","findings":"not an array"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -805,14 +807,64 @@ func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
 	if len(lean) != 2 {
 		t.Fatalf("want the two readable reviews, got %d", len(lean))
 	}
-	// The watermark advances: holding it behind a permanently broken file
-	// would re-mine the whole tail of the cache on every later run, forever.
+	// The watermark advances past the broken artifact. Holding it behind one
+	// would re-select and re-report that artifact on every run, forever.
 	if watermark != "2026-01-15T12:00:00Z" {
 		t.Errorf("watermark: got %q", watermark)
 	}
-	// Which means the run has to say what it lost, or the review goes missing
-	// on nothing louder than a stderr warning.
-	if len(unreadable) != 1 || unreadable[0] != "rev-000000000002" {
+	if len(unreadable) != 1 || unreadable[0] != "rev-000000000003" {
 		t.Errorf("the unreadable artifact should be reported by id; got %v", unreadable)
+	}
+
+	// And the next run genuinely moves on: nothing left, nothing re-reported.
+	lean, watermark, unreadable, err = ExtractLean(dir, nil, "2026-01-15T12:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lean) != 0 || watermark != "" || len(unreadable) != 0 {
+		t.Errorf("the broken artifact is still being offered: lean=%d watermark=%q unreadable=%v",
+			len(lean), watermark, unreadable)
+	}
+}
+
+// A capture stamp that does not parse is not a position on the watermark line,
+// so once a watermark is in play Select can never offer that artifact again.
+// Dropping it on a stderr warning alone is the same silent loss an unreadable
+// file used to be, and the watermark handed back must itself parse — the next
+// run validates it and would reject its own.
+func TestExtractLean_anUnparseableStampIsReported(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := WriteArtifact(dir, Artifact{
+		ReviewID: "rev-000000000001", Source: "code-review", Format: FormatMarkdown,
+		CapturedAt: "2026-01-15T10:00:00Z", RawText: "## A\n\nsome review text\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := WriteArtifact(dir, Artifact{
+		ReviewID: "rev-000000000002", Source: "code-review", Format: FormatMarkdown,
+		CapturedAt: "not-a-stamp", RawText: "## B\n\nmore review text\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A first run has no watermark, so it mines everything and loses nothing.
+	lean, watermark, unreadable, err := ExtractLean(dir, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lean) != 2 || len(unreadable) != 0 {
+		t.Errorf("a first run mines both and reports nothing lost: lean=%d unreadable=%v", len(lean), unreadable)
+	}
+	if watermark != "2026-01-15T10:00:00Z" {
+		t.Errorf("the watermark must be a stamp the next run can parse; got %q", watermark)
+	}
+
+	// A watermark run cannot reach it, and says so.
+	_, _, unreadable, err = ExtractLean(dir, nil, "2026-01-15T09:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unreadable) != 1 || unreadable[0] != "rev-000000000002" {
+		t.Errorf("the unparseable stamp should be reported by id; got %v", unreadable)
 	}
 }

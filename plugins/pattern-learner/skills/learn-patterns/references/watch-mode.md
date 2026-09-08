@@ -29,6 +29,14 @@ fires on every run. `capture-review --file` still records whatever it is
 handed. A prose review is always recorded — its content is its text, so having
 no parsed findings says nothing about whether it has anything to say.
 
+**stderr.** A designated tool's stderr is read only when it carries a
+structured report (SARIF, ESLint, semgrep or findings JSON). Prose on stderr is
+ignored, because a usage error and a write-up are the same stream and nothing
+distinguishes them — mining standing conventions out of a crash message is the
+worse mistake. A reviewer that writes its **prose** write-up to stderr needs
+`capture-review` by hand: `mytool 2>&1 >/dev/null | $BIN capture-review
+--cache-dir … --source mytool`.
+
 ---
 
 ## Watch Step W1: Determine the action

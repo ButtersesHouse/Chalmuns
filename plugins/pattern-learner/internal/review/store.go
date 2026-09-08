@@ -273,20 +273,21 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 // meta must be ordered oldest-first, as ListArtifactMeta returns it: the
 // watermark is a position in that order, not a maximum over the set.
 //
-// unreadable names the artifacts that were selected but could not be read.
+// unreadable names the artifacts the run could not mine: one it selected but
+// could not read, and one whose capture stamp does not parse, which the
+// watermark can never select again.
+//
 // They are reported rather than swallowed because neither silent option is
-// honest. Advancing the watermark over one loses that review with only a
-// stderr warning; holding the watermark behind one pins it forever — a single
-// truncated file would make every later run re-mine the whole tail of the
-// cache and re-present conventions the user already decided on. So the
-// watermark advances, and the run says out loud which files it could not read
-// so they can be repaired or deleted.
+// honest. Advancing the watermark over a broken artifact loses that review on
+// nothing louder than a stderr warning; holding the watermark behind one pins
+// it forever, so a single truncated file makes every later run re-mine the
+// whole tail of the cache and re-present conventions the user already decided
+// on. So the watermark advances over everything this run considered — read or
+// not — and the run says out loud what it could not read, so the files can be
+// repaired or deleted.
 func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))
-	// An explicit id list never advances the watermark: stepping past reviews
-	// the run skipped on purpose would make them unmineable for good.
-	trackWatermark := len(ids) == 0
 	for _, m := range chosen {
 		a, readErr := ReadArtifact(cacheDir, m.ReviewID)
 		if readErr != nil {
@@ -295,8 +296,35 @@ func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since strin
 			continue
 		}
 		full = append(full, a)
-		if trackWatermark {
-			watermark = a.CapturedAt
+	}
+
+	// An explicit id list never advances the watermark: stepping past reviews
+	// the run skipped on purpose would make them unmineable for good.
+	if len(ids) == 0 {
+		// The newest artifact considered, not the newest one read. Taking it
+		// from what was read left an unreadable *newest* artifact on the wrong
+		// side of the watermark, so it was re-selected and re-reported on every
+		// run from then on — the pinning this design exists to avoid. The stamp
+		// itself must parse: chosen is ordered with unparseable stamps first,
+		// so the last parseable one is the newest, and handing back an
+		// unparseable stamp would make the next run reject its own watermark.
+		for i := len(chosen) - 1; i >= 0; i-- {
+			if !capturedTime(chosen[i].CapturedAt).IsZero() {
+				watermark = chosen[i].CapturedAt
+				break
+			}
+		}
+		// A stamp that does not parse is not a position on the watermark line,
+		// so once a watermark is in play Select can never offer these again.
+		// That is a loss, and it is reported for the same reason an unreadable
+		// file is. On a first run (no watermark) they are mined like any other
+		// artifact, so there is nothing to report.
+		if since != "" {
+			for _, m := range meta {
+				if capturedTime(m.CapturedAt).IsZero() {
+					unreadable = append(unreadable, m.ReviewID)
+				}
+			}
 		}
 	}
 	return Lean(full), watermark, unreadable

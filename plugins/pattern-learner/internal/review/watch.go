@@ -306,15 +306,12 @@ func sanitizeCommand(command string) string {
 		case r == '\'' || r == '"':
 			quote = r
 		case r == '\\':
-			if i+1 < len(runes) && runes[i+1] == '\n' {
-				// A line continuation still ends the line as far as a
-				// here-document is concerned; consuming it silently let the
-				// body leak into the scanned command stream.
-				i++
-				b.WriteRune('\n')
-				i = atNewline(i)
-				continue
-			}
+			// A backslash-newline is a line continuation: bash joins the two
+			// lines into one command, so it is neither a separator nor the
+			// boundary a here-document body starts at. Emitting a real newline
+			// here read `npm install --save-dev \<newline>  eslint` as a run
+			// of eslint, and running the here-document skip here swallowed the
+			// commands on the joined line.
 			b.WriteRune(' ')
 			if i+1 < len(runes) {
 				i++
@@ -344,13 +341,23 @@ func sanitizeCommand(command string) string {
 }
 
 // startsWord reports whether the rune at i begins a word — the only position
-// in which `#` opens a comment. `curl host/path#frag` carries no comment.
+// in which `#` opens a comment.
+//
+// The set is deliberately narrower than the separators neutralize blanks:
+// bash starts a comment after whitespace or a control operator, but `#` after
+// a closing paren or a redirection is part of the word. `echo $(date +%Y)#1`
+// prints `2026#1`, and treating it as a comment dropped the rest of the line —
+// including a designated tool run after a `&&`.
 func startsWord(runes []rune, i int) bool {
 	if i == 0 {
 		return true
 	}
-	prev := runes[i-1]
-	return unicode.IsSpace(prev) || neutralize(prev) == ' '
+	switch prev := runes[i-1]; prev {
+	case ';', '|', '&', '(':
+		return true
+	default:
+		return unicode.IsSpace(prev)
+	}
 }
 
 // isBareWord reports whether a quoted span is a single unadorned word — the
@@ -368,10 +375,13 @@ func isBareWord(span []rune) bool {
 }
 
 // skipHeredocBody returns the index just past the line terminating a
-// here-document that begins at i, or the end of the command if it is never
-// terminated — which is where bash would end it too.
-func skipHeredocBody(runes []rune, i int, delimiter string) int {
-	for i < len(runes) {
+// here-document that begins at i. When no line matches the delimiter it
+// returns start unchanged: an unterminated here-document is far more often a
+// `<<` that was never one — an arithmetic shift in `$(( 1 << x ))`, a
+// delimiter spelled in a way the regex does not know — and skipping to the end
+// of the command on that guess discarded every designated run after it.
+func skipHeredocBody(runes []rune, start int, delimiter string) int {
+	for i := start; i < len(runes); {
 		end := i
 		for end < len(runes) && runes[end] != '\n' {
 			end++
@@ -385,7 +395,7 @@ func skipHeredocBody(runes []rune, i int, delimiter string) int {
 		}
 		i = end
 	}
-	return i
+	return start
 }
 
 // neutralize strips a character of shell meaning while keeping it as text, so
@@ -399,12 +409,12 @@ func neutralize(r rune) rune {
 	return r
 }
 
-// reHeredoc matches a here-document operator and its delimiter word, quoted or
-// not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator. The
-// unquoted alternative accepts the punctuation bash accepts in a word: reading
-// `<<'EOF-1'` as "EOF" meant the terminator was never recognised, and the skip
-// then swallowed every command after the here-document.
-var reHeredoc = regexp.MustCompile(`^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|([A-Za-z_][A-Za-z0-9_.+-]*))`)
+// reHeredoc matches a here-document operator and its delimiter word in every
+// form bash accepts it: `<<EOF`, `<<'EOF'`, `<<-"EOF"`, `<<\EOF`, `<<EOF-1`,
+// `<<1EOF`. All name the same terminator, and a form this misses is a body
+// scanned as commands — that is how `cat <<\EOF` let a here-document body
+// manufacture a command position.
+var reHeredoc = regexp.MustCompile(`^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\([A-Za-z0-9_.+-]+)|([A-Za-z0-9_.+-]+))`)
 
 func heredocDelimiter(s string) string {
 	m := reHeredoc.FindStringSubmatch(s)

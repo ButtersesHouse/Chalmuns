@@ -51,14 +51,20 @@ Take it from here rather than computing it — it is empty after a `--reviews`
 run, because advancing past the reviews such a run deliberately skipped would
 make them unmineable for good.
 
-An `unreadable` array may also be present, listing artifacts that were selected
-but whose files could not be read. The watermark still advances past them, so
-they will not be offered again — say so plainly: "Could not read `<ids>` in the
-review cache; those reviews were skipped. Delete the files or re-capture the
-reviews." Never pass over it silently.
+An `unreadable` array may also be present, listing artifacts this run could not
+mine: a file that would not read, or one whose `captured_at` does not parse and
+which the watermark can therefore never select again. The watermark advances
+past them regardless, so they will not be offered a second time — say so
+plainly: "Could not read `<ids>` in the review cache; those reviews were
+skipped. Delete the files or re-capture the reviews." Never pass over it
+silently.
 
-If `reviews` is empty, stop here and tell the user plainly which case it is:
+If `reviews` is empty, stop here and tell the user plainly which case it is —
+check them in this order, because `unreadable` outranks the rest:
 
+- **Everything selected was unreadable** (`unreadable` is non-empty and
+  `reviews` is `[]`) → report the loss as above. Do **not** say the reviews
+  were already mined: none of them was read.
 - **No watchers designated** (`$BIN watch --state … --list` prints `[]`) →
   "Nothing is being watched yet. Designate a reviewer with
   `/learn-patterns --watch add code-review`, then run the reviewer."

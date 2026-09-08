@@ -463,10 +463,22 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		// Reading `<<'EOF-1'` as "EOF" meant the terminator was never found and
 		// the skip ate the rest of the script.
 		{"delimiter with punctuation", "cat <<'EOF-1' > f\nbody\nEOF-1\nsemgrep .", true},
-		// A line continuation still ends the line for a here-document, and a
-		// second here-document on one line still has a body.
-		{"continuation before a heredoc body", "cat <<EOF \\\nnote; semgrep now runs on every PR\nEOF\ntrue", false},
+		// A line continuation joins the two lines into one command, so it is
+		// neither a separator nor where a here-document body starts. Bash runs
+		// `cat <<EOF note; semgrep …` here and the body begins on the line
+		// after — treating the continuation as a newline read a continued
+		// argument as a command, and running the body skip at it swallowed the
+		// commands on the joined line.
+		{"continuation joins the line", "cat <<EOF \\\nnote; semgrep now runs on every PR\nEOF\ntrue", true},
+		{"continued argument is not a command", "npm install --save-dev \\\n  eslint", false},
+		{"run after a continued heredoc opener", "cat <<EOF > r.yml \\\n  && semgrep --config r.yml .\nrules: []\nEOF", true},
 		{"two heredocs on one line", "cat <<A <<B\nabody\nA\nsemgrep .\nB", false},
+		// A `<<` that never opens a here-document must not swallow the script.
+		{"arithmetic shift is not a heredoc", "n=$(( 1 << x ))\nsemgrep .", true},
+		{"backslash-quoted delimiter", "cat <<\\EOF\nx; semgrep bad\nEOF\ntrue", false},
+		{"digit-leading delimiter", "cat <<1EOF\nx; semgrep bad\n1EOF\ntrue", false},
+		// `#` opens a comment only at the start of a word.
+		{"hash inside a word", "echo $(date +%Y)#1 && semgrep .", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -683,6 +695,53 @@ func TestFromHook_reportOnStderrIsStillAReview(t *testing.T) {
 	got, _, ok := FromHook([]byte(both), ws, fixed)
 	if !ok || !strings.Contains(got.RawText, "shared client") {
 		t.Errorf("stderr noise shadowed the review: ok=%v raw=%q", ok, got.RawText)
+	}
+
+	// And the report wins wherever it sits. A runner that adds its own
+	// `"message":"Command exited with code 1"` beside a linter's JSON had that
+	// bookkeeping read as the review, purely because "message" is one of the
+	// keys checked before the one the report was actually in.
+	shadowed := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"","message":"Command exited with code 1","stderr":` +
+		string(mustJSON(`{"results":[{"check_id":"py.no-requests","path":"svc/c.py",`+
+			`"extra":{"message":"Use the shared http client."}}]}`)) + `}}`
+	got, _, ok = FromHook([]byte(shadowed), ws, fixed)
+	if !ok {
+		t.Fatal("the structured report should have been found")
+	}
+	if len(got.Findings) != 1 {
+		t.Errorf("the runner's bookkeeping shadowed the report: %q", got.RawText)
+	}
+}
+
+// A response envelope that says nothing must not be recorded whatever shape
+// its emptiness takes, and a map carrying only a runner's bookkeeping is not a
+// review either — that JSON sniffs as prose, so the clean-run guard, which
+// exempts prose, could not catch it.
+func TestFromHook_bookkeepingIsNeverAReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	for _, response := range []string{
+		`{"stderr":null}`,
+		`{"stderr":false}`,
+		`{"interrupted":false}`,
+		`{"is_error":true,"tool_use_id":"toolu_01ABC"}`,
+		`{"stdout":"","exit_code":1}`,
+	} {
+		payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+			`"tool_response":` + response + `}`
+		if a, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+			t.Errorf("%s should capture nothing; got %q", response, a.RawText)
+		}
+	}
+
+	// A response that *is* a report, handed over as a decoded object rather
+	// than a string, still has to reach the parser.
+	report := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"results":[{"check_id":"py.no-requests","path":"svc/c.py",` +
+		`"extra":{"message":"Use the shared http client."}}]}}`
+	a, _, ok := FromHook([]byte(report), ws, fixed)
+	if !ok || len(a.Findings) != 1 {
+		t.Errorf("a decoded report should still parse: ok=%v findings=%+v", ok, a.Findings)
 	}
 }
 
