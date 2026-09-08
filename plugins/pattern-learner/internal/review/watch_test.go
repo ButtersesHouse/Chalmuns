@@ -616,7 +616,20 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"a substitution glued to a name", `$(echo x)semgrep .`, false},
 		// The parser is third-party code on a fail-open path, and v3.8.0
 		// panics on shell text bash accepts.
-		{"input that panics the parser", "echo `echo \"$\\\"`; semgrep --json .", false},
+		// The recover() around the parse is load-bearing: this six-byte input
+		// reaches `slice bounds out of range` in v3.8.0's lexer, and the hook
+		// is wrapped in `|| true`, so the process would die silently.
+		{"input that panics the parser", "''`$\\\\", false},
+		// What a wrapper's own arguments look like: a flag that takes a value,
+		// an operand of the wrapper's own, and a flag after which nothing runs.
+		{"a wrapper flag taking a value", `sudo -u ci semgrep .`, true},
+		{"env unsetting a variable", `env -u FOO semgrep .`, true},
+		{"timeout with a unit suffix", `timeout 60s semgrep .`, true},
+		{"timeout with a signal flag", `timeout -s KILL 60 semgrep .`, true},
+		{"exec renaming the process", `exec -a foo semgrep .`, true},
+		{"yarn from another directory", `yarn --cwd sub semgrep .`, true},
+		{"command -v reports, it does not run", `command -v semgrep`, false},
+		{"builtin command -v reports too", `builtin command -v semgrep`, false},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},

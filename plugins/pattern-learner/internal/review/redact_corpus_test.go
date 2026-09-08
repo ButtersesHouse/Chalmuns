@@ -59,6 +59,10 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	// and nothing else: a body class of letters-and-spaces swallowed the rest
 	// of that finding and the one after it.
 	{"a key header quoted mid-sentence", "## Findings\n\n- `config/prod.yaml` embeds -----BEGIN RSA PRIVATE KEY----- and commits it\n\n- The retry loop never backs off\n", "BEGIN RSA PRIVATE KEY", "The retry loop never backs off"},
+	// Rows for the leaks the nineteenth review found.
+	{"a colon with no space", `password:hunter2trustno1`, "hunter2trustno1", "password"},
+	{"an indented pem", "private_key: |\n  -----BEGIN RSA PRIVATE KEY-----\n  MIIEowIBAAKCAQEAy8Dbv8prpJ\n  -----END RSA PRIVATE KEY-----\n", "MIIEowIBAAKCAQEA", "private_key"},
+	{"a pem inside a JSON string", `{"path":"deploy/key.pem","lines":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAy8Dbv8prpJ\n-----END RSA PRIVATE KEY-----"}`, "MIIEowIBAAKCAQEA", "deploy/key.pem"},
 }
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
@@ -80,6 +84,19 @@ var proseCorpus = []struct{ name, in string }{
 	{"a path with a hyphen", "the secret: docs/setup-guide.md explains it"},
 	{"an identifier containing auth", "The token check is wrong: user.IsAuthenticated=true is never set."},
 	{"an authorized field", "It sets authorized=true before validating the token."},
+	// Rows for the over-redaction the same review found: a cited path longer
+	// than any the corpus held, and a quoted sentence after a secret-ish word.
+	// The corpus had grown only in the redact direction, which is what let a
+	// length shortcut past the file-reference guard go unnoticed.
+	{"a long cited path", "- The api_key: internal/auth/token_provider.go is unused"},
+	{"a long cited config path", "- The token: config/production/settings.yaml holds it"},
+	{"a long quoted cited path", `- The credential: "internal/authentication_helper.go" is missing`},
+	{"a quoted requirement", `### 2. Hardcoded password: "must be at least 12 characters"`},
+	{"a quoted instruction", `The secret: "do not commit this" appears in the README`},
+	{"a path with an underscore", "The token: internal/auth/session_token_store.go never expires."},
+	// One unbalanced quote after a secret-ish name deleted every finding up to
+	// the next quote in the review.
+	{"an unbalanced quote after a name", "## Findings\n\n### 1. Hardcoded password: \"admin — see the note\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nUse a \"token bucket\" here.\n\n### 3. Retry loop never backs off\n"},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
 	{"a heading ending in a colon", "## Findings\n\n### 1. Hardcoded credential:\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nThe endpoint is unbounded.\n"},

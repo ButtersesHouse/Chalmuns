@@ -523,10 +523,12 @@ var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
 // escaped inside the value does not end the match early and leave a dangling
 // one behind — which turned the document invalid, and a watcher pinned to a
 // format then lost the whole review.
-// A value stops at its delimiter, escaped or not: `\\.` consuming a `\"`
-// ran the match past the credential to the end of the enclosing JSON string
-// and deleted the report content in between.
-const quotedValue = `(?:[^"\\]|\\[^"])*`
+// A value stops at its delimiter, escaped or not, and never crosses a line.
+// `\\.` consuming a `\"` ran the match past the credential to the end of the
+// enclosing JSON string and deleted the report content in between; matching a
+// newline let one unbalanced quote after a secret-ish name delete every
+// finding up to the next quote in the review.
+const quotedValue = `(?:[^"\\\n]|\\[^"\n])*`
 
 // escapedQuote matches the quote delimiter as it arrives in hook text, which
 // is usually JSON: a review's own `"` reaches this package as `\"`, and rules
@@ -584,11 +586,17 @@ var secretPatterns = []*regexp.Regexp{
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
 	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')([^'\n]*)(')`),
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]+)([^\s"',;)\]}\\]+)()`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*)([^\s"',;)\]}\\]+)()`),
 }
 
 func redactColonForm(text string) string {
 	for _, re := range colonForms {
+		// Checked before replacing: ReplaceAllStringFunc copies the whole text
+		// whether or not it matches, and this runs on output that can be
+		// megabytes, after every matching tool call.
+		if !re.MatchString(text) {
+			continue
+		}
 		text = re.ReplaceAllStringFunc(text, func(m string) string {
 			g := re.FindStringSubmatch(m)
 			if !looksLikeCredential(g[2]) {
@@ -612,20 +620,31 @@ func looksLikeCredential(value string) bool {
 	if len([]rune(value)) < 6 {
 		return false
 	}
-	// Length alone settles a long run, whatever punctuation it holds. Below
-	// that, only a file reference is excluded — a slash on its own is not
-	// disqualifying, because `/` is in the base64 alphabet and rejecting it
-	// let `secret: dXNlcjpwYXNz/d29yZA==` through untouched.
-	if len([]rune(value)) >= 24 {
+	// A credential is one token. A phrase is the reviewer talking: `###
+	// Hardcoded password: "must be at least 12 characters"` is a finding, and
+	// rewriting it makes the artifact say something else.
+	if strings.ContainsAny(value, " \t\n") {
+		return false
+	}
+	if !reFileRef.MatchString(value) {
 		return true
 	}
-	return !reFileRef.MatchString(value)
+	// It ends in something that reads as a file extension. A long unbroken run
+	// with no path separator is a credential anyway — a JWT's last segment
+	// looks like one — while `internal/auth/token_provider.go` is a path the
+	// reviewer cited, and redacting that makes the finding name a file that
+	// does not exist.
+	return !strings.Contains(value, "/") && len([]rune(value)) >= 24
 }
 
 // reFileRef matches what a review sentence puts after a colon: a file the
 // reviewer cited. Rewriting one into `[redacted]` makes the finding cite a
 // path that does not exist, in the text grounding checks the quote against.
 var reFileRef = regexp.MustCompile(`(?:^|/)[A-Za-z0-9_.-]+\.[A-Za-z]{1,4}$`)
+
+// keyLineBreak is how one line of a PEM key is separated from the next in the
+// text this package sees: a real newline, indented or not, or a JSON escape.
+const keyLineBreak = `(?:[ \t]*(?:\r?\n|\\n)[ \t]*)`
 
 // reBareSecret matches the token shapes that identify themselves without a
 // name beside them — an argv entry, a line of a traceback, a URL — and the
@@ -640,7 +659,13 @@ var reBareSecret = regexp.MustCompile(
 	// whitespace: a report that merely quotes the header line mid-sentence had
 	// the rest of that sentence, and the finding after it, swallowed. A key
 	// truncated before its END marker still loses its body.
-	`-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[ \t]*\r?\n[A-Za-z0-9+/=]+)*(?:[ \t]*\r?\n-----END [A-Z ]*PRIVATE KEY-----)?` +
+	//
+	// Every way a reviewer quotes a key is covered by keyLineBreak: indented
+	// inside a fence or a YAML block scalar, and — the likeliest of all, since
+	// a structured response is re-marshalled to JSON before it gets here — with
+	// its line breaks arriving as the two characters `\` and `n`.
+	`-----BEGIN [A-Z ]*PRIVATE KEY-----(?:` + keyLineBreak + `[A-Za-z0-9+/=]+)*` +
+		`(?:` + keyLineBreak + `-----END [A-Z ]*PRIVATE KEY-----)?` +
 		`|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{16,}|\bgho_[A-Za-z0-9]{16,}` +
 		`|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}` +
 		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}`)

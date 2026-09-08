@@ -51,9 +51,11 @@ func matchesCommand(name, command string) bool {
 
 // invocations lists the program names a command line calls.
 //
-// A line the parser rejects yields none: bash would refuse it too, so nothing
-// in it ran, and reading a command out of a line that cannot execute is how a
-// syntax error got filed as a review.
+// A line the parser rejects yields none. bash sometimes salvages such a line —
+// it warns about an unclosed backtick and carries on — so this is a missed
+// capture rather than a correct reading, and it is the safe direction: a
+// command line this package cannot make sense of is not one it should be
+// naming a reviewer from.
 func invocations(command string) (found []string) {
 	// The parser is third-party code on a fail-open path: the capture hook
 	// runs inside someone else's tool call, and this package's contract is
@@ -67,10 +69,15 @@ func invocations(command string) (found []string) {
 	}()
 
 	// A CRLF *script* is a file-format artifact rather than shell syntax, and
-	// a here-document whose terminator carries a CR parses as unterminated;
-	// bash runs such a script, so refusing it cost the capture. Only when
-	// every line ends that way: a lone `\r` inside an LF script is data — a
-	// here-document body line spelled `EOF\r` is not its terminator.
+	// a here-document whose terminator carries a CR parses as unterminated.
+	// Only when every line ends that way: a lone `\r` inside an LF script is
+	// data — a here-document body line spelled `EOF\r` is not its terminator.
+	//
+	// bash itself chokes on a CRLF script with a control structure, so this
+	// reads some lines bash would refuse. That is the same trade the parser
+	// makes everywhere it is stricter or looser than one shell build: what it
+	// buys is that a here-document, a `case` pattern and a function body are
+	// never read as invocations, which is where the harm was.
 	if isCRLF(command) {
 		command = strings.ReplaceAll(command, "\r\n", "\n")
 	}
@@ -99,34 +106,78 @@ func invocations(command string) (found []string) {
 // their own field, so `SEMGREP_RULES=x semgrep .` needs no special handling.
 func calledProgram(call *syntax.CallExpr) []string {
 	var out []string
-	for i, arg := range call.Args {
-		word := literalWord(arg)
+	wrapper := ""
+	operands := 0
+	for i := 0; i < len(call.Args); i++ {
+		word := literalWord(call.Args[i])
 		if word == "" {
 			// An argument with nothing literal in it — `$out`, `$(cmd)` — is
 			// not a name this can check. It is still a word, so it ends the
 			// search rather than letting the next argument stand in for it.
 			return out
 		}
-		// Past the program itself, what stands between a wrapper and the
-		// program it runs is not the program: `env SEMGREP_RULES=x semgrep .`
-		// is a run of semgrep, and so are `npx --yes semgrep .`, `nice -n 10
-		// semgrep .` and `timeout 60 semgrep .`. The parser keeps a leading
-		// assignment in its own field, but one after `env` is an argument.
-		if i > 0 && (reAssignArg.MatchString(word) || strings.HasPrefix(word, "-") || reNumber.MatchString(word)) {
-			continue
+		if wrapper != "" {
+			// Inside a wrapper's own arguments, which are not the program.
+			switch {
+			case inquiryFlags[wrapper][word]:
+				// `command -v semgrep` prints a path; it runs nothing.
+				return out
+			case valueFlags[wrapper][word]:
+				i++
+				continue
+			case strings.HasPrefix(word, "-"), reAssignArg.MatchString(word):
+				continue
+			case operands > 0:
+				// `timeout 60s semgrep .` — the duration is the wrapper's, not
+				// a program.
+				operands--
+				continue
+			}
 		}
 		out = append(out, word)
-		if !commandWrappers[strings.ToLower(commandBase(word))] {
+		base := strings.ToLower(commandBase(word))
+		if !commandWrappers[base] {
 			return out
 		}
+		wrapper, operands = base, wrapperOperands[base]
 	}
 	return out
 }
 
+// What a wrapper's own arguments look like. This is a small table of bounded
+// knowledge about a fixed set of programs — not shell grammar — and each entry
+// is a shape a scan cannot infer: whether a flag consumes the next word, and
+// whether the wrapper takes an operand of its own before the program.
+//
+// Skipping every `-flag` without knowing which take a value promoted the value
+// to the program: `command -v semgrep` reported a run of semgrep, and
+// `sudo -u ci semgrep .` reported a run of ci.
 var (
-	reAssignArg = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-	reNumber    = regexp.MustCompile(`^[0-9]+$`)
+	valueFlags = map[string]map[string]bool{
+		"sudo":    {"-u": true, "-g": true, "-p": true, "-C": true, "-h": true},
+		"env":     {"-u": true, "-C": true, "--unset": true, "--chdir": true},
+		"timeout": {"-s": true, "-k": true, "--signal": true, "--kill-after": true},
+		"nice":    {"-n": true, "--adjustment": true},
+		"exec":    {"-a": true},
+		"xargs":   {"-a": true, "-I": true, "-n": true, "-P": true, "-d": true, "-s": true},
+		"yarn":    {"--cwd": true},
+		"npx":     {"-p": true, "--package": true, "-c": true, "--call": true},
+		"npm":     {"-w": true, "--workspace": true, "--prefix": true},
+		"pnpm":    {"-C": true, "--dir": true, "--filter": true},
+		"uv":      {"--with": true, "--python": true},
+		"uvx":     {"--with": true, "--python": true, "-p": true},
+		"poetry":  {"-C": true, "--directory": true},
+	}
+	// After these, the wrapper reports on a program rather than running it.
+	inquiryFlags = map[string]map[string]bool{
+		"command": {"-v": true, "-V": true},
+		"builtin": {"-v": true, "-V": true},
+	}
+	// Operands the wrapper itself takes before the program.
+	wrapperOperands = map[string]int{"timeout": 1}
 )
+
+var reAssignArg = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 
 // literalWord renders the parts of a word that are literal text, dropping the
 // parts that are not. `$(pwd)/bin/semgrep` yields "/bin/semgrep", which
