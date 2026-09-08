@@ -109,6 +109,15 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a capitalised array credential", `{"passwords":["aB8f3d9e2c1b47f60"]}`, "aB8f3d9e2c1b47f60", "passwords"},
 	{"a slashed array credential", `{"passwords":["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]}`, "wJalrXUtnFEMI", "passwords"},
 	{"a jwt in an array", `{"tokens":["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc"]}`, "eyJhbGciOiJIUzI1NiJ9", "tokens"},
+	// A line-start assignment is the strongest signal there is, so the value
+	// test does not apply there: a credential chunked to look like a qualified
+	// name is still redacted when the syntax says it is one.
+	{"a chunked credential in an assignment", `secret: aB3xY9zQ7wE.rT5yU8iO2p.aS4dF7gH1j`, "aB3xY9zQ7wE", "secret"},
+	{"a quoted passphrase with a dot", `password: "p@ss w0rd.1"`, "p@ss w0rd.1", "password"},
+	{"a capitalised constant-shaped credential", `AWS_SECRET_ACCESS_KEY: WJALRXUTNFEMI_K7MDENGBPXRFICYEXAMPLEKEY`, "WJALRXUTNFEMI", "AWS_SECRET_ACCESS_KEY"},
+	{"a hex credential with an underscore", `api_key: 0F8A2B_C4D6E8FA0B2C4D6E8FA0B2C4D6E8FA0B2C`, "C4D6E8FA0B2C", "api_key"},
+	{"a capitals-run path segment", `private_key: keys/WJALRXUTNFEMIKMDENGBPXRFICYEXAMPLEKEY.key`, "WJALRXUTNFEMI", "private_key"},
+	{"scheme-less userinfo in a list", `{"credentials":["admin:sup3rS3cret@db.internal:5432"]}`, "sup3rS3cret", "credentials"},
 	{"a jwt in a span", "- **api_key: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc** is hardcoded", "eyJhbGciOiJIUzI1NiJ9", "is hardcoded"},
 	{"a url with a password in a span", `- **token: https://user:s3cr3tpassw0rd@example.com/repo** is committed`, "s3cr3tpassw0rd", "is committed"},
 	// An array element that is not itself a credential still goes through the
@@ -154,7 +163,6 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// the alternative rewrote every identifier a review quotes that happens to
 	// carry a digit. See namesSomething.
 	{"a short qualified credential", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7"},
-	{"a chunked credential", `secret: aB3xY9zQ7wE.rT5yU8iO2p.aS4dF7gH1j`, "aB3xY9zQ7wE"},
 	// Past the depth bound the structural pass hands the whole text to the
 	// patterns, and the patterns have no equivalent of the array rule — a name
 	// followed by `[` is not a `name: value`. Nothing but nesting built to

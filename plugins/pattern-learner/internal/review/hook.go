@@ -884,18 +884,25 @@ func isAssignedCredential(text string, loc []int) bool {
 		// file that does not exist, in the text grounding checks against.
 		return false
 	}
-	if namesSomething(value) {
-		// Likewise a name: `cfg.OAuth2Token`, `SHA256_DIGEST`, a scanner's own
-		// rule id. The same test the array branch uses, so a value is judged
-		// the same way wherever it turns up.
-		return false
-	}
 	if beginsItsUnit(text, loc[0]) {
 		// An assignment. What follows is an annotation — `# rotate this`,
 		// `(line 4)`, the punctuation closing a field — unless it is a word,
 		// which means the line was a sentence that happened to start with a
 		// secret-ish name.
 		return !startsWithWord(rest)
+	}
+	if namesSomething(value) {
+		// A name the reviewer quoted: `cfg.OAuth2Token`, `SHA256_DIGEST`,
+		// `sessionToken2`, a scanner's own rule id. The same test the array
+		// branch uses, so a value is judged the same way wherever the
+		// surroundings leave the judgement to it.
+		//
+		// Only below the branch above. There the syntax has already said the
+		// line is an assignment holding a value, which is the strongest signal
+		// there is — a config line a scanner echoed, an env dump — and a value
+		// test applied on top of it excused `password: MySecretPass` and
+		// `AWS_SECRET_ACCESS_KEY: WJALRX…_K7MDENG…`.
+		return false
 	}
 	// Inside a markdown span, the sentence around it says nothing about the
 	// value: `- **DB_PASSWORD: hunter2trustno1** is committed in
@@ -939,23 +946,53 @@ func isAssignedCredential(text string, loc []int) bool {
 // name survives it; that is the same trade isFileReference makes, for the same
 // reason.
 func namesSomething(value string) bool {
-	if strings.Contains(value, "://") && strings.Contains(value, "@") {
-		// Userinfo, which is where a URL keeps its password. A plain endpoint
-		// has all the joints of a name and is one.
+	if value == "" || strings.ContainsAny(value, " \t\n") {
+		// A name is one word. `password: "p@ss w0rd.1"` is not one, and reading
+		// the space as part of a piece made every quoted passphrase a name.
 		return false
 	}
-	if strings.Contains(value, "_") && value == strings.ToUpper(value) {
-		return true
-	}
-	if !strings.Contains(value, ".") {
+	if carriesAPassword(value) {
 		return false
 	}
+	// Every piece has to be a word, whichever shape said it was a name: an
+	// underscore between two 25-character runs is not a CONSTANT_NAME, it is
+	// `WJALRXUTNFEMI_K7MDENGBPXRFICYEXAMPLEKEY`.
 	for _, piece := range strings.FieldsFunc(value, isNameSeparator) {
 		if len([]rune(piece)) >= maxNamePieceRunes {
 			return false
 		}
 	}
-	return true
+	if strings.Contains(value, "_") && value == strings.ToUpper(value) {
+		return true
+	}
+	if strings.Contains(value, ".") {
+		return true
+	}
+	// camelCase, on terms strict enough to mean something. "Contains a
+	// lowercase letter followed by an uppercase one" was the first attempt and
+	// more than 999 random base64 strings in 1000 satisfy it. Requiring *every*
+	// capital to open a lowercase word is a real test: a run of capitals is
+	// what base64 has and an identifier does not, and the odds of forty random
+	// characters avoiding one are about a million to one.
+	sh := shapeOf(value)
+	return sh.hasUpper && sh.hasLower && !sh.capsRun
+}
+
+// carriesAPassword reports whether a value is a URL whose userinfo holds one.
+// `https://oauth2@dev.azure.com/org/_git/repo` is a clone URL a review cites;
+// `postgres://admin:sup3rS3cret@db.internal:5432/app` is a credential, and so
+// is the same thing with the scheme left off. What separates them is the colon
+// inside the userinfo, not the `@`.
+func carriesAPassword(value string) bool {
+	at := strings.Index(value, "@")
+	if at < 0 {
+		return false
+	}
+	userinfo := value[:at]
+	if i := strings.Index(userinfo, "://"); i >= 0 {
+		userinfo = userinfo[i+3:]
+	}
+	return strings.Contains(userinfo, ":")
 }
 
 func isNameSeparator(r rune) bool {
@@ -965,6 +1002,27 @@ func isNameSeparator(r rune) bool {
 // maxNamePieceRunes is how long one piece of a qualified name runs before it
 // stops being a word and starts being a payload.
 const maxNamePieceRunes = 16
+
+// wordShape is a value's case pattern. capsRun records a capital that does not
+// open a lowercase word, which is what a payload has and a name does not.
+type wordShape struct{ hasUpper, hasLower, capsRun bool }
+
+func shapeOf(value string) wordShape {
+	var sh wordShape
+	rs := []rune(value)
+	for i, r := range rs {
+		switch {
+		case unicode.IsUpper(r):
+			sh.hasUpper = true
+			if i+1 >= len(rs) || !unicode.IsLower(rs[i+1]) {
+				sh.capsRun = true
+			}
+		case unicode.IsLower(r):
+			sh.hasLower = true
+		}
+	}
+	return sh
+}
 
 // beginsItsUnit reports whether the match at i starts its line or its string,
 // give or take the punctuation a list item, a heading, a fence or an indent
@@ -1088,12 +1146,13 @@ func hasLetter(s string) bool {
 // extension. A total-length ceiling could not tell those apart: the secret
 // above and the Java path are four runes apart.
 //
-// A long segment is allowed when it carries no digits, because that is what a
-// long *name* looks like: `AuthenticationTokenProviderTest.java` is routine in
-// a Java or TypeScript test suite, while the base64 chunk this bound is for —
-// `AKIAIOSFODNN7EXAMPLEwJalrXUtn.key` — has digits mixed through it. Bounding
-// long segments outright rewrote the first; allowing them outright kept the
-// second.
+// A long segment is allowed when it reads as words, because that is what a
+// long file *name* is: `AuthenticationTokenProviderTest.java` is routine in a
+// Java or TypeScript test suite, and every capital in it opens a word. The
+// base64 chunk this bound is for does not —
+// `AKIAIOSFODNN7EXAMPLEwJalrXUtn.key` and `WJALRXUTNFEMIKMDENG….key` are runs
+// of capitals. Bounding long segments outright rewrote the first; allowing
+// them on "carries no digits" let the second through with its digits stripped.
 //
 // Known limitation: a base64 secret whose slashes happen to fall often enough
 // to keep every piece short is read as a path. The two are not separable by
@@ -1107,12 +1166,21 @@ func isFileReference(value string) bool {
 		return len([]rune(value)) < maxUnbrokenPathRunes
 	}
 	for _, seg := range strings.Split(value, "/") {
-		if n := len([]rune(seg)); n >= maxLongSegmentRunes ||
-			(n >= maxPathSegmentRunes && strings.ContainsAny(seg, "0123456789")) {
+		if n := len([]rune(seg)); n >= maxLongSegmentRunes || (n >= maxPathSegmentRunes && !readsAsWords(seg)) {
 			return false
 		}
 	}
 	return true
+}
+
+// readsAsWords reports whether a segment is spelled the way a file name is:
+// lowercase, or capitals that each open a word. It is namesSomething's
+// camelCase test without the requirement that there be a capital at all, since
+// a file name is as often all lowercase — which a credential of this length is
+// not.
+func readsAsWords(seg string) bool {
+	sh := shapeOf(seg)
+	return sh.hasLower && !sh.capsRun
 }
 
 // How long a piece of a path may run. maxUnbrokenPathRunes is the stricter
