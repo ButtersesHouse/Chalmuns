@@ -133,10 +133,30 @@ func forbiddenCommand(cmd string) string {
 	return ""
 }
 
-// forbiddenFile returns a non-empty reason if the Write/Edit target is a script.
+// forbiddenFile returns a non-empty reason if the Write/Edit target is a
+// script, or the pipeline's own state file.
 func forbiddenFile(path string) string {
 	if reScriptFile.MatchString(path) {
 		return "Creating or editing a script file (" + filepath.Base(path) + ") is blocked during a learn-patterns run. " + sanctioned
 	}
+	if isStateFile(path) {
+		return "Editing .claude/pattern-learner/state.json directly is blocked during a learn-patterns run. " +
+			"state-write is where IDs, timestamps, stats and the protected-rule check are applied, and a " +
+			"direct write skips all four — including the check that stops a rule the developer added by hand " +
+			"from being dropped or rewritten. Write the payload to .claude/pattern-learner/state-pending.json " +
+			"and pipe it through `state-write` instead (that is also where --allow-protected is passed)."
+	}
 	return ""
+}
+
+// isStateFile reports whether path names the pipeline's own state document,
+// however it was spelled. Only state.json is off limits: Step 11 builds
+// state-pending.json with the Write tool by design, and that staging file is
+// the sanctioned way to hand a large payload to state-write.
+func isStateFile(path string) bool {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if filepath.Base(clean) != "state.json" {
+		return false
+	}
+	return filepath.Base(filepath.Dir(clean)) == "pattern-learner"
 }

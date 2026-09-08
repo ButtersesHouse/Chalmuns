@@ -36,7 +36,10 @@ logic.**
   (Step 8). Everything else is a `$BIN` call.
 - **If a subcommand is missing, errors, or seems unable to do what you need: STOP and
   report it to the user. Do not write a workaround script.** A gap in the tooling is a
-  bug to fix in the binary, not something to paper over.
+  bug to fix in the binary, not something to paper over. One refusal is not a gap:
+  `state-write` declining to change a rule the developer added by hand is the tooling
+  working, and Step 11 says what to do about it — ask the developer, then rerun with
+  `--allow-protected`. Never route around it.
 - Two non-Go edges are sanctioned by design and are not policy violations: **PR fetch**
   (GitHub MCP, or the `gh`/`jq`/`xargs` inline path in the Step 5 large-repo note — the
   binary is zero-network) and **cursor-agent** (optional enhancement for `--discover`,
@@ -51,8 +54,12 @@ logic.**
 
 This policy is mechanically enforced: while a run is in progress (Step 2 creates a
 run-lock at `.claude/pattern-learner/.run-lock`), a PreToolUse hook blocks interpreter
-invocations and script file creation. If you find yourself blocked, it means you are
-trying to reimplement a sanctioned subcommand — use the subcommand instead.
+invocations, script file creation, and any `Write`/`Edit` of
+`.claude/pattern-learner/state.json` — that file is `state-write`'s to produce, and
+editing it directly skips the IDs, timestamps, stats and protected-rule check it
+applies. Writing `state-pending.json` is untouched; that staging file is the sanctioned
+way to hand a large payload to `state-write`. If you find yourself blocked, it means you
+are trying to reimplement a sanctioned subcommand — use the subcommand instead.
 
 ## Instructions
 

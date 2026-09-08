@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -64,6 +65,11 @@ func TestForbiddenFile(t *testing.T) {
 		"makebatches.js",
 		"transform.ts",
 		"a/b/c/verify.bash",
+		// The state document itself: state-write is where the protected-rule
+		// check lives, so a direct write is the way around it.
+		".claude/pattern-learner/state.json",
+		"/repo/.claude/pattern-learner/state.json",
+		"./.claude/pattern-learner/./state.json",
 	}
 	for _, p := range blocked {
 		if forbiddenFile(p) == "" {
@@ -72,7 +78,11 @@ func TestForbiddenFile(t *testing.T) {
 	}
 
 	allowed := []string{
+		// Step 11 builds this one with the Write tool by design.
 		".claude/pattern-learner/state-pending.json",
+		// A state.json that is not the pipeline's is none of our business.
+		"internal/server/state.json",
+		"state.json",
 		"signals.json",
 		"candidates.json",
 		"CLAUDE.md",
@@ -226,5 +236,39 @@ func TestDecide_badJSONAllows(t *testing.T) {
 	)
 	if !res.allowed || res.blocked {
 		t.Errorf("malformed payload should fail open (allow); got %+v", res)
+	}
+}
+
+// The protected-rule check lives in state-write. A run that edits state.json
+// with the Write tool skips it, along with the ID, timestamp and stats
+// invariants, so the guard closes that door while a run is in progress.
+func TestDecide_writeStateJSONBlocked(t *testing.T) {
+	dir := withLock(t)
+	for _, tool := range []string{"Write", "Edit"} {
+		res := runDecide(t, map[string]any{
+			"tool_name":  tool,
+			"cwd":        dir,
+			"tool_input": map[string]any{"file_path": filepath.Join(dir, ".claude/pattern-learner/state.json")},
+		})
+		if !res.blocked {
+			t.Errorf("%s of state.json must be blocked during a run; got %+v", tool, res)
+		}
+		if !strings.Contains(res.reason, "state-write") {
+			t.Errorf("the block must name the sanctioned path; got %q", res.reason)
+		}
+	}
+}
+
+// Outside a run the guard is inert, so a repair of a corrupt state file is
+// still possible — the lock is what makes this a run-scoped restriction.
+func TestDecide_writeStateJSONAllowedWithoutLock(t *testing.T) {
+	dir := t.TempDir()
+	res := runDecide(t, map[string]any{
+		"tool_name":  "Write",
+		"cwd":        dir,
+		"tool_input": map[string]any{"file_path": filepath.Join(dir, ".claude/pattern-learner/state.json")},
+	})
+	if !res.allowed || res.blocked {
+		t.Errorf("with no run in progress the guard must stay inert; got %+v", res)
 	}
 }
