@@ -185,6 +185,7 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a payload before a secret-ish tail", `{"extra":{"lines":"  api_key: hunter2trustno1.password"}}`, "hunter2trustno1", "extra"},
 	{"a camel payload before a secret-ish tail", `password: wJalr2XUtn3FEMI.secret`, "wJalr2XUtn3FEMI", "password"},
 	{"a numeric payload before a secret-ish tail", `password: 8391027465019283.password`, "8391027465019283", "password"},
+
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -357,6 +358,28 @@ var proseCorpus = []struct{ name, in string }{
 	// PowerShell's drive separator is a colon, so the braced spelling has to
 	// agree with the bare one.
 	{"a braced powershell environment drive", `api_key: ${env:API_KEY2}`},
+	// Rows for the over-redaction the thirty-fourth review found. A compose
+	// file composes: reading only a value that is exactly one expansion
+	// rewrote every one of these.
+	{"two expansions joined", `password: ${DB_USER}:${DB_PASS}`},
+	{"an expansion with a suffix", `password: ${VAR}-suffix`},
+	{"two expansions concatenated", `password: ${PREFIX}${SUFFIX}`},
+	{"expansions echoed from a compose file", `{"extra":{"lines":"  password: ${DB_USER}:${DB_PASS}"}}`},
+	// A bash default is spelled with a colon too, and the character after it is
+	// what tells it from PowerShell's drive.
+	{"an uppercase bash default", `password: ${ENV:-changeme}`},
+	{"a lowercase bash default", `password: ${env:-changeme}`},
+	{"a bash default with no colon", `password: ${env-changeme}`},
+	// Ordinary snake_case containers carry a digit; the bound has to clear
+	// them.
+	{"an oauth2 container", `{"extra":{"lines":"  password: oauth2_config.password"}}`},
+	{"a versioned container", `{"extra":{"lines":"  password: api_v2_config.password"}}`},
+	{"a numbered container", `{"extra":{"lines":"  secret: s3_bucket_cfg.secret"}}`},
+	// The expansion alternative in the value class excludes what the general
+	// class excludes, or an unclosed `${` runs to a brace further down the line
+	// and eats the quote that ends the enclosing JSON string.
+	{"an unclosed expansion inside JSON", `{"results":[{"m":"ok"}],"lines":"password: ${DB_PASSWORD"}`},
+	{"an unclosed expansion before an escape", `{"cmd":"password: ${DB_PASS\"},\"x\":1"}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
@@ -396,6 +419,7 @@ var acceptedRewrites = []struct{ name, in, rewritten string }{
 // pinned to a format gets an error from Capture and loses the whole review;
 // an auto one degrades to prose and loses every finding.
 var jsonCorpus = []string{
+	`{"results":[{"extra":{"lines":"password: ${DB_PASS"}}],"api_key":"abcdefghijkl"}`,
 	`{"results":[{"check_id":"c"}],"auth":{"required":true}}`,
 	`{"results":[],"auth_required":false}`,
 	`{"results":[],"token_count":1234}`,

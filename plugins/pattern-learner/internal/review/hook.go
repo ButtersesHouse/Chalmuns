@@ -818,13 +818,17 @@ var secretPatterns = []*regexp.Regexp{
 // closing backtick of “ `api_key: abcdef` “ left the rest of the write-up
 // rendering as code.
 //
-// The two closing braces it does take are an index, `[0]`, and an expansion,
-// `${VAR:-default}`. Both because a reference — `creds[0].password` — and stopping at the
+// The two closing brackets it does take are an index, `[0]`, and an expansion,
+// `${VAR:-default}` — and inside the expansion it excludes exactly what it
+// excludes outside one, or an unclosed `${` ran to a brace further down the
+// line and ate the quote that ended the enclosing JSON string. Both are taken
+// because a reference — `creds[0].password` — and stopping at the
 // bracket left `creds[0` to be judged on its own, which reads as a credential
-// and rewrote the reference into `[redacted]].password`. The index alternative
-// comes first: the engine takes the first branch that lets the whole pattern
-// succeed, and the general class matching a lone `[` was one of them.
-const bareValue = "((?:\\$\\{[^}\\s]*\\}|\\[[0-9]+\\]|[^\\s\"',;)\\]}\\\\])+)"
+// and rewrote the reference into `[redacted]].password`. Both alternatives come
+// before the general class: the engine takes the first branch that lets the
+// whole pattern succeed, and the general class matching a lone `[` or `$` was
+// one of them.
+const bareValue = "((?:\\$\\{[^\\s\"',;)\\]}\\\\]*\\}|\\[[0-9]+\\]|[^\\s\"',;)\\]}\\\\])+)"
 
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
@@ -1011,42 +1015,100 @@ func isContainerPiece(piece string) bool {
 // besides. What this accepts is what a shell, a compose file or PowerShell
 // actually writes, defaults included.
 func isVarExpansion(value string) bool {
-	if !strings.HasPrefix(value, "$") {
-		return false
-	}
-	name := value[1:]
-	if strings.HasPrefix(name, "{") {
-		// The closing brace is optional here because the unquoted value class
-		// excludes it, so what reaches this is `${POSTGRES_PASSWORD` with the
-		// brace still in the reviewer's text.
-		name = strings.TrimSuffix(name[1:], "}")
-		// `${VAR:-changeme}` and its relatives: the default belongs to the
-		// expansion, and taking the value up to it left a dangling brace.
-		//
-		// But the default is also where a compose file keeps the password it
-		// hardcoded, so it is only ignorable while it looks like a placeholder.
-		// A digit in it says otherwise: `${DB_PASSWORD:-hunter2trustno1}`.
-		// PowerShell's drive separator is also a colon, and `${env:API_KEY2}`
-		// is a name rather than a name and a default — testing what follows it
-		// made the braced spelling disagree with the bare one.
-		if i := strings.IndexAny(name, ":-+?"); i > 0 && !strings.EqualFold(name[:i], "env") {
-			if strings.ContainsAny(name[i:], "0123456789") {
-				return false
-			}
-			name = name[:i]
+	rest, saw := value, false
+	for {
+		i := strings.IndexByte(rest, '$')
+		if i < 0 {
+			break
 		}
+		// The literal text joining two expansions. A composed value is still an
+		// expansion — `${DB_USER}:${DB_PASS}`, `${VAR}-suffix`, `${PREFIX}${SUFFIX}`
+		// — as long as what joins them is not itself carrying a secret. Reading
+		// only a value that is exactly one expansion rewrote every one of those,
+		// and a compose file is written that way.
+		if strings.ContainsAny(rest[:i], "0123456789") {
+			return false
+		}
+		name, width := readExpansion(rest[i:])
+		if width == 0 || !isVarName(name) {
+			return false
+		}
+		saw, rest = true, rest[i+width:]
 	}
-	// PowerShell reaches the environment through a drive prefix.
-	if len(name) > 4 && strings.EqualFold(name[:4], "env:") {
-		name = name[4:]
+	return saw && !strings.ContainsAny(rest, "0123456789")
+}
+
+// readExpansion reads one `$NAME` or `${NAME…}` at the start of s, returning the
+// variable's name and how many bytes the expansion occupies. A width of zero
+// means it is not one, or its default holds something that is not a placeholder.
+func readExpansion(s string) (string, int) {
+	body := s[1:]
+	if !strings.HasPrefix(body, "{") {
+		n := scanVarRef(body)
+		return body[:n], 1 + n
 	}
-	return isVarName(name)
+	inner := body[1:]
+	// The closing brace is optional because the unquoted value class excludes
+	// it, so what reaches this is often `${POSTGRES_PASSWORD` with the brace
+	// still in the reviewer's text.
+	width := 2 + len(inner)
+	if end := strings.IndexByte(inner, '}'); end >= 0 {
+		inner, width = inner[:end], 2+end+1
+	}
+	name, ok := stripDefault(inner)
+	if !ok {
+		return "", 0
+	}
+	return name, width
+}
+
+// scanVarRef returns how many bytes at the start of s form a variable
+// reference, PowerShell's `env:` drive prefix included.
+func scanVarRef(s string) int {
+	n := 0
+	if len(s) > 4 && strings.EqualFold(s[:4], "env:") {
+		n = 4
+	}
+	for n < len(s) && (s[n] == '_' || isAlnumByte(s[n])) {
+		n++
+	}
+	return n
+}
+
+func isAlnumByte(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+// stripDefault removes `:-changeme` and its relatives from inside `${…}`. The
+// default belongs to the expansion — taking the value up to it left a dangling
+// brace — but it is also where a compose file keeps the password it hardcoded,
+// so a digit in it means this is not an expansion to wave through.
+//
+// PowerShell's drive separator is a colon too, and `${env:API_KEY2}` is a name
+// rather than a name and a default. What tells them apart is the character
+// after the colon: a default's colon is always paired with one of `-+?=`.
+func stripDefault(inner string) (string, bool) {
+	i := strings.IndexAny(inner, ":-+?")
+	if i <= 0 {
+		return inner, true
+	}
+	if inner[i] == ':' && i+1 < len(inner) && !strings.ContainsAny(inner[i+1:i+2], "-+?=") {
+		return inner, true
+	}
+	if strings.ContainsAny(inner[i:], "0123456789") {
+		return "", false
+	}
+	return inner[:i], true
 }
 
 // isVarName reports whether a string is spelled the way a variable's name is:
 // one case throughout, or camelCase opening in lowercase, and nothing in it but
 // letters, digits and the underscore.
 func isVarName(name string) bool {
+	// PowerShell reaches the environment through a drive prefix.
+	if len(name) > 4 && strings.EqualFold(name[:4], "env:") {
+		name = name[4:]
+	}
 	if name == "" || strings.IndexFunc(name, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
 	}) >= 0 {
@@ -1077,7 +1139,7 @@ var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.m
 // an index is bounded shorter still.
 const (
 	maxContainerRunes  = 20
-	maxDigitPieceRunes = 13
+	maxDigitPieceRunes = 15 // `oauth2_config`, `my_db2_config`, `api_v2_config`
 	maxIndexDigits     = 4
 )
 
