@@ -194,6 +194,11 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	// And the sequence has to be the whole value, not the end of one.
 	{"a literal with an expansion appended", `password: changeme${DB}`, "changeme", "password"},
 	{"a passphrase with a variable appended", `password: correcthorsebatterystaple$FOO`, "correcthorse", "password"},
+	// Rows the thirty-sixth review asked for: the trailing literal bounded from
+	// above, and the digit-carrying container bound pinned from above as well
+	// as from below.
+	{"a key with a variable in front of it", `password: ${A}wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY`, "wJalrXUtnFEMI", "password"},
+	{"a payload one rune over the container bound", `password: wJalr2XUtn3FEM.password`, "wJalr2XUtn3FEM", "password"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -228,6 +233,11 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// The rate is low — a key is base64 or hex, and both carry digits — and the
 	// alternative rewrote `validatingwebhookconfiguration.go`, a real file.
 	{"a digit-free lowercase payload in a path", `secret: uploads/wjalrxutnfemikmdengbpxrficyexamplekey.key`, "wjalrxutnfemi"},
+	// The mirror of the row pinned above: a digit-free literal *after* an
+	// expansion is glue, and glue is what `${VAR}-suffix` is made of. Short and
+	// digit-free is all that separates the two, which is the same trade the
+	// `${DB_PASSWORD:-changeme}` row makes inside the braces.
+	{"a short literal after an expansion", `password: ${DB}changeme`, "changeme"},
 	// A payload just under the digit-carrying container bound reads as the
 	// thing a credential is reached through. The bound has to clear
 	// `oauth2_config` and its kind, and nothing separates a thirteen-rune

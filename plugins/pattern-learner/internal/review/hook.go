@@ -1040,7 +1040,7 @@ func isVarExpansion(value string) bool {
 		// — as long as what joins them is not itself carrying a secret. Reading
 		// only a value that is exactly one expansion rewrote every one of those,
 		// and a compose file is written that way.
-		if strings.ContainsAny(rest[:i], "0123456789") {
+		if !isGlue(rest[:i]) {
 			return false
 		}
 		name, width := readExpansion(rest[i:])
@@ -1049,8 +1049,22 @@ func isVarExpansion(value string) bool {
 		}
 		saw, rest = true, rest[i+width:]
 	}
-	return saw && !strings.ContainsAny(rest, "0123456789")
+	return saw && isGlue(rest)
 }
+
+// isGlue reports whether the literal text around an expansion is joining it to
+// something rather than being the secret itself. Two things say it is: it
+// carries no digit, and it is short. `${DB_USER}:${DB_PASS}` and `${VAR}-suffix`
+// are compositions; `${A}wJalrXUtnFEMIKMDENGbPxRfiCYEXAMPLEKEY` is a key with a
+// variable in front of it.
+func isGlue(text string) bool {
+	return len([]rune(text)) <= maxGlueRunes && !strings.ContainsAny(text, "0123456789")
+}
+
+// maxGlueRunes is how much literal text may sit between or after expansions.
+// Long enough for the separators and suffixes a config composes with, short
+// enough that a payload does not fit.
+const maxGlueRunes = 12
 
 // readExpansion reads one `$NAME` or `${NAME…}` at the start of s, returning the
 // variable's name and how many bytes the expansion occupies. A width of zero
