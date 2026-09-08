@@ -104,7 +104,7 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a long slashed value with a dotted tail", `secret: wJalrXUtnFEMI/K7MDENGbPxRfiCYEXAMPLEKEY/AKIAIOSFODNN7EXAMPLEwJalrXUtn.key`, "wJalrXUtnFEMI", "secret"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
-	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, 80), "hunter2trustno1", "password"},
+	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
 }
 
 // deeplyNested wraps a document in n levels of array, which is what makes the
@@ -134,6 +134,17 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
+	// A credential shaped like a name survives where the sentence around it
+	// cannot be consulted — inside a markdown span the write-up continues past.
+	// See namesSomething: the alternative rewrote every identifier a review
+	// quotes that happens to carry a digit.
+	{"an identifier-shaped credential in a span", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7"},
+	// Past the depth bound the structural pass hands the whole text to the
+	// patterns, and the patterns have no equivalent of the array rule — a name
+	// followed by `[` is not a `name: value`. Nothing but nesting built to
+	// reach the bound gets there.
+	{"an array of credentials past the depth bound",
+		deeplyNested(`{"passwords":["a8f3d9e2c1b47f60"]}`, maxScrubDepth+200), "a8f3d9e2c1b47f60"},
 }
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
@@ -192,6 +203,22 @@ var proseCorpus = []struct{ name, in string }{
 	// identifier is not.
 	{"a cited path in a span a sentence continues past", "- **The api_key: internal/auth/token.go** is unused"},
 	{"a rule name listed under a secret-ish key", `{"secrets":["hardcoded-aws-key","generic-api-key"]}`},
+	// Rows for the over-redaction the twenty-fifth review found. Bounding the
+	// sentence at the span left the value to decide alone, and "one token with
+	// a digit in it" describes most of the identifiers a review names.
+	{"a qualified identifier in a span", "- `token: cfg.OAuth2Token` is never validated"},
+	{"a constant name in a span", "- **secret: SHA256_DIGEST** is logged at startup"},
+	{"an env lookup in a span", "- **api_key: process.env.API_KEY2** is read at boot"},
+	{"a version in a span", "- **api_key: v1.2.3-rc1** is pinned in the lockfile"},
+	// A path is short pieces however deep it goes, so a ceiling on the whole
+	// value rewrote the ones a real project has.
+	{"a deep cited path", "- The private_key: src/main/java/com/example/service/authentication/TokenServiceImpl.java is committed"},
+	{"a scoped package path", "- The token: node_modules/@aws-sdk/client-secrets-manager/dist-cjs/index.js reads it"},
+	{"a deep config path", "- The secret: packages/backend/src/config/environments/production/keys-v2.json holds it"},
+	// A list under a secret-ish key holds names as often as values.
+	{"variable names listed under a secret-ish key", `{"secrets":["OAUTH2_CLIENT_ID","DB_PASSWORD","STRIPE_KEY"]}`},
+	{"a versioned rule id listed under a secret-ish key", `{"secrets":["gitleaks:generic-api-key:v8.18.0"]}`},
+	{"an endpoint listed under a secret-ish key", `{"tokens":["https://api.example.com/v2/tokens"]}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
@@ -281,7 +308,7 @@ func TestRedactJSON_abandonsADocumentTooDeepToWalk(t *testing.T) {
 	if _, ok := redactJSON(shallow); !ok {
 		t.Fatal("a shallow document should be handled structurally")
 	}
-	if _, ok := redactJSON(deeplyNested(shallow, 80)); ok {
+	if _, ok := redactJSON(deeplyNested(shallow, maxScrubDepth+200)); ok {
 		t.Error("a document past the depth bound should fall through to the patterns")
 	}
 	// The bound is on nesting, not on size: a wide document is still walked.

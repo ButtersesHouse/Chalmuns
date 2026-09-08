@@ -603,15 +603,26 @@ func redactJSON(text string) (string, bool) {
 // structural pass inconclusive rather than partially applied.
 type jsonScrub struct{ tooDeep bool }
 
+// maxScrubDepth bounds the walk. A review report nests a handful of levels; a
+// thousand is far enough past that the fallback is reachable only by something
+// built to reach it.
+const maxScrubDepth = 1000
+
 // value rewrites one decoded value, reporting whether it changed anything. key
 // is the field it was found under, which is what decides whether a string is a
 // credential or the review.
 func (s *jsonScrub) value(v interface{}, key string, depth int) (interface{}, bool) {
-	if depth > 64 {
+	if depth > maxScrubDepth {
 		// Recorded rather than acted on: replacing the subtree destroyed
 		// whatever was nested there and changed its type, and passing it
 		// through is a hole a credential can be nested behind. redactJSON
 		// abandons the pass instead, and the patterns take the whole text.
+		//
+		// Falling back costs the rules that only exist here — the key-aware
+		// ones — so the bound is set where no report reaches it rather than
+		// where recursion gets uncomfortable. The document has already been
+		// decoded by the time this walks it, at the same depth, so anything
+		// this can be handed is something the standard decoder just walked.
 		s.tooDeep = true
 		return v, false
 	}
@@ -645,9 +656,21 @@ func (s *jsonScrub) value(v interface{}, key string, depth int) (interface{}, bo
 			// really is a list of credentials, and dropping the key committed
 			// them. So the name is carried in and the element is taken on its
 			// own shape: an opaque token is a credential, a rule name is not.
-			if str, ok := e.(string); ok && reSecretKey.MatchString(key) && looksOpaque(str) {
-				out[i], changed = redactedMarker, true
-				continue
+			if str, ok := e.(string); ok && reSecretKey.MatchString(key) {
+				switch {
+				case looksOpaque(str):
+					out[i], changed = redactedMarker, true
+					continue
+				case namesSomething(str):
+					// The key says the list holds credentials and the element
+					// says it is a name, so the judgement is made and the prose
+					// rules do not get to make it again: they found a
+					// `name: value` inside the rule id
+					// `gitleaks:generic-api-key:v8.18.0` and rewrote its
+					// version.
+					out[i] = str
+					continue
+				}
 			}
 			// A nested array is the same list one level down, so it keeps the
 			// name; anything else is a value of its own and starts afresh.
@@ -685,7 +708,12 @@ func looksOpaque(s string) bool {
 	return len([]rune(s)) >= 8 &&
 		!strings.ContainsAny(s, " \t\n") &&
 		strings.ContainsAny(s, "0123456789") &&
-		!isFileReference(s)
+		!isFileReference(s) &&
+		// A list under such a key holds names as often as values: a scanner's
+		// rule ids (`gitleaks:generic-api-key:v8.18.0`), the *names* of the
+		// variables it found (`OAUTH2_CLIENT_ID`), an endpoint. Destroying
+		// those loses the finding, and every one of them names something.
+		!namesSomething(s)
 }
 
 // reSecretKey matches a field name that says its value is a credential.
@@ -874,7 +902,15 @@ func isAssignedCredential(text string, loc []int) bool {
 	// docker-compose.yml` is a reviewer quoting an assignment and then
 	// describing it, and reading "is committed" as words after the value left
 	// the credential in the artifact.
+	//
+	// Dropping those words leaves the value to settle it alone, so here — and
+	// only here, where nothing else can — a value that reads as a name the
+	// reviewer quoted is not taken. Everywhere else the surroundings still
+	// decide, which is what keeps `Using api_key: wJalrXUtnFEMI` redacted.
 	if end := markdownSpanEnd(text, loc[0]); end >= loc[4]+len(value) {
+		if namesSomething(value) {
+			return false
+		}
 		rest = text[loc[4]+len(value) : end]
 	}
 	// A name with words before it is prose. Only a value that could be
@@ -885,6 +921,31 @@ func isAssignedCredential(text string, loc []int) bool {
 		strings.ContainsAny(value, "0123456789") &&
 		!followedByWords(rest)
 }
+
+// namesSomething reports whether a value reads as a name the reviewer quoted
+// rather than as a credential: a dotted expression (`cfg.OAuth2Token`,
+// `process.env.API_KEY`, `gitleaks:generic-api-key:v8.18.0`, a URL), a
+// CONSTANT_NAME (`SHA256_DIGEST`, `OAUTH2_CLIENT_ID`), or a camelCase one
+// (`sessionToken`).
+//
+// It is a weak test and is used only where the alternative is no test at all:
+// where a value has been cut off from the sentence that would otherwise judge
+// it. A credential shaped like an identifier survives it — which is the same
+// trade isFileReference makes, and made for the same reason: of the two
+// errors, rewriting a name the reviewer cited is the one that leaves the
+// finding describing something that does not exist, in the text grounding
+// checks against.
+func namesSomething(value string) bool {
+	if strings.Contains(value, ".") {
+		return true
+	}
+	if strings.Contains(value, "_") && value == strings.ToUpper(value) {
+		return true
+	}
+	return reCamelHump.MatchString(value)
+}
+
+var reCamelHump = regexp.MustCompile(`[a-z][A-Z]`)
 
 // beginsItsUnit reports whether the match at i starts its line or its string,
 // give or take the punctuation a list item, a heading, a fence or an indent
@@ -999,31 +1060,42 @@ func hasLetter(s string) bool {
 // the finding name a file that does not exist, in the text grounding checks
 // against.
 //
-// Length is the one thing that separates the two without a separator. A JWT
-// ends in a dotted segment of letters — `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc`
-// satisfies the extension test exactly — and a path that long has directories
-// in it. So an unbroken run of this length is a token whatever it ends with.
+// What separates the two is how long a *segment* runs, not how long the value
+// is. A path is directory names and a file name, each of them short, however
+// deep it goes: `src/main/java/com/example/service/authentication/
+// TokenServiceImpl.java` is 70 runes and its longest piece is 21. A payload has
+// no such joints — a base64 secret with slashes in it runs 26 and 33 — and a
+// JWT is one unbroken run whose last dotted piece looks exactly like an
+// extension. A total-length ceiling could not tell those apart: the secret
+// above and the Java path are four runes apart.
 //
-// Known limitation: a value that both holds a path separator and ends in a
-// short dotted extension is read as a path, so a base64 secret shaped that way
-// survives — up to the ceiling. The two are not separable by shape below it,
-// and reading a cited path as a credential is the error that corrupts the
-// corpus this feature builds; past it, no path a review cites is that long.
+// Known limitation: a base64 secret whose slashes happen to fall often enough
+// to keep every piece short is read as a path. The two are not separable by
+// shape there, and reading a cited path as a credential is the error that
+// corrupts the corpus this feature builds.
 func isFileReference(value string) bool {
 	if !reFileRef.MatchString(value) {
 		return false
 	}
-	n := len([]rune(value))
-	return n < maxPathRunes && (n < maxUnbrokenPathRunes || strings.Contains(value, "/"))
+	if !strings.Contains(value, "/") {
+		return len([]rune(value)) < maxUnbrokenPathRunes
+	}
+	for _, seg := range strings.Split(value, "/") {
+		if len([]rune(seg)) >= maxPathSegmentRunes {
+			return false
+		}
+	}
+	return true
 }
 
-// How long a value may be and still read as a path. The lower bound applies
-// where nothing but the extension says "path"; the upper one applies whatever
-// the value contains, because a repository path a review cites is a name, not
-// a payload.
+// How long a piece of a path may run. maxUnbrokenPathRunes is the stricter
+// bound for a value with no separator at all, where the whole thing is one file
+// name and nothing but the extension says "path"; it is what tells a JWT's last
+// dotted segment from a real extension. maxPathSegmentRunes bounds each
+// directory or file name in a value that does have separators.
 const (
 	maxUnbrokenPathRunes = 24
-	maxPathRunes         = 64
+	maxPathSegmentRunes  = 32
 )
 
 var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)

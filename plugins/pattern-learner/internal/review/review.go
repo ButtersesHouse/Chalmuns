@@ -171,16 +171,19 @@ func Capture(in Input) (Artifact, error) {
 	// Redaction runs before parsing so that no downstream field — a finding's
 	// body, its code_before, RawText, the lean view a subagent reads — is built
 	// from unredacted text.
+	//
+	// The cap is checked on the input and not again afterwards, so a review
+	// that was under it when offered is never turned away. Redaction can grow
+	// the text — `[redacted]` is longer than a short credential, and a document
+	// that is nothing but credentials grows by about half — so the stored
+	// RawText can exceed the cap by that much. Re-checking bounded it exactly
+	// and cost a review: the capture had already been accepted, the hook
+	// discards Capture's error by design, and the run would have ended in
+	// silence — which reads downstream as "the tool found no conventions".
+	// The cap is there to refuse an unreasonable capture, not to guarantee a
+	// byte count.
 	if red := redactSecrets(string(in.Data)); red != string(in.Data) {
 		in.Data = []byte(red)
-		// Redaction can grow the text — `[redacted]` is longer than a short
-		// credential — so the cap is checked again on what will actually be
-		// stored. Checking it only on the input let a document under the cap
-		// produce a RawText over it, which is the one thing the cap exists to
-		// bound.
-		if err := checkSize(len(in.Data)); err != nil {
-			return Artifact{}, err
-		}
 	}
 	format := in.Format
 	sniffed := format == "" || format == FormatAuto

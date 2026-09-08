@@ -261,22 +261,30 @@ func TestCapture_redactsWhicheverDoorTheReviewCameThrough(t *testing.T) {
 	}
 }
 
-func TestCapture_capsTheTextItActuallyStores(t *testing.T) {
+func TestCapture_capsWhatWasOfferedNotWhatRedactionMadeOfIt(t *testing.T) {
 	// `[redacted]` is longer than a short credential, so redaction grows the
-	// text. Checking the cap only on the input let a document under it produce
-	// a RawText over it — the one thing the cap exists to bound.
+	// text and the stored RawText can pass the cap. Re-checking it afterwards
+	// bounded that exactly and cost the review: the hook discards Capture's
+	// error by design, so a capture already accepted would have ended as
+	// silence. A review under the cap when it was offered is kept.
 	one := "auth=a1b2c3 "
 	body := strings.Repeat(one, maxArtifactBytes/len(one)-1)
 	if len(body) > maxArtifactBytes {
 		t.Fatalf("test input must start under the cap, got %d", len(body))
 	}
-	if _, err := Capture(Input{Data: []byte(body), Source: "semgrep", Now: fixed}); err == nil {
-		t.Error("a capture that redaction grows past the cap should be refused")
+	a, err := Capture(Input{Data: []byte(body), Source: "semgrep", Now: fixed})
+	if err != nil {
+		t.Fatalf("a capture under the cap must be kept whatever redaction does to it: %v", err)
 	}
-	// And a capture that stays under it is still accepted.
-	a := capture(t, "semgrep", FormatAuto, "## A finding\n\nauth=a1b2c3\n")
+	if len(a.RawText) <= maxArtifactBytes {
+		t.Fatalf("this input is meant to grow past the cap, got %d", len(a.RawText))
+	}
 	if strings.Contains(a.RawText, "a1b2c3") {
-		t.Errorf("credential survived: %q", a.RawText)
+		t.Error("credential survived")
+	}
+	// What was offered over the cap is still refused.
+	if _, err := Capture(Input{Data: make([]byte, maxArtifactBytes+1), Source: "semgrep", Now: fixed}); err == nil {
+		t.Error("an oversized capture should be refused")
 	}
 }
 
