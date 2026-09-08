@@ -37,6 +37,17 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"pem block", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAy8Dbv8prpJ\nAAAA\n-----END RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA", ""},
 	{"truncated json", `{"results":[{"m":"ok"}],"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep`, "sk-secret-abc123", `"m":"ok"`},
 	{"nested log string", `{"results":[{"m":"ok"}],"log":"{\"command\":\"TOKEN=sk-secret-abc123 semgrep\"}"}`, "sk-secret-abc123", `"m":"ok"`},
+	// Rows added because the ones above them passed for the wrong reason: a
+	// fake value carrying the word "secret", or a `sk-` prefix reBareSecret
+	// catches on its own. Each of these has a value nothing else would match.
+	{"auth name segment", `X_AUTH_HDR=8f3a9b2c1d`, "8f3a9b2c1d", "X_AUTH_HDR"},
+	{"oauth prefix", `OAUTH=abcdefghij`, "abcdefghij", "OAUTH"},
+	{"base64 basic auth", `BASIC_AUTH=dXNlcjpwYXNzd29yZA==`, "dXNlcjpwYXNzd29yZA", "BASIC_AUTH"},
+	{"a source line echoed inside JSON", `{"extra":{"lines":"password = \"hunter2trustno1\""}}`, "hunter2trustno1", "lines"},
+	{"a short alphabetic password", `password: swordfish`, "swordfish", "password"},
+	{"a plain word password", `password: correcthorse`, "correcthorse", "password"},
+	{"a truncated pem", "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAy8Dbv8prpJ\nAAAA", "MIIEowIBAAKCAQEA", ""},
+	{"a flag with an equals sign", `deploy --token=abcdef123456 --force`, "abcdef123456", "--force"},
 }
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
@@ -52,6 +63,12 @@ var proseCorpus = []struct{ name, in string }{
 	{"a fenced config example", "```json\n{\n  \"args\": [\"--json\"],\n  \"rule\": \"x\"\n}\n```"},
 	{"a short value after a colon", "token: yes"},
 	{"a sentence about passwords", "The password policy is documented in docs/auth.md and applies to every service."},
+	// Prose rows added for the same reason: each names a file the reviewer
+	// cited, which a length-only rule rewrote into one that does not exist.
+	{"a path after a secret-ish word", "- The api_key: internal/auth/token.go is unused"},
+	{"a path with a hyphen", "the secret: docs/setup-guide.md explains it"},
+	{"an identifier containing auth", "The token check is wrong: user.IsAuthenticated=true is never set."},
+	{"an authorized field", "It sets authorized=true before validating the token."},
 }
 
 // mustStayValid: redaction may not make a document unparseable. A watcher
@@ -67,6 +84,11 @@ var jsonCorpus = []string{
 	`{"headers":{"Authorization":"Bearer eyJ.abc.def"}}`,
 	`{"results":[{"check_id":"c","extra":{"metadata":{"secret":"matches the \"AKIA\" prefix"}}},{"check_id":"d"}]}`,
 	`{"results":[{"extra":{"lines":"-----BEGIN RSA PRIVATE KEY-----"}}],"version":"1.55.2"}`,
+	// A value whose end is an escaped quote: a class that ate the backslash
+	// left a bare quote behind and made the document unparseable, which cost a
+	// pinned-format watcher the whole review.
+	`{"results":[{"extra":{"message":"the token: internal/auth/x.go\" quoted","severity":"ERROR"}}]}`,
+	`{"m":"secret: a/b/c/d/e/f\"g"}`,
 }
 
 func TestRedactSecrets_removesCredentials(t *testing.T) {
