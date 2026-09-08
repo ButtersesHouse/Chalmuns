@@ -80,9 +80,8 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a word before the name", `Using api_key: abcdef123456`, "abcdef123456", "Using api_key"},
 	{"a heading before the name", `### 1. Hardcoded password: "hunter2trustno1"`, "hunter2trustno1", "Hardcoded password"},
 	{"two credentials on one line", `password: hunter2trustno1, token: swordfish123`, "swordfish123", "token"},
-	// A dotted tail is not a path unless a separator says so, and a bullet is
-	// a bullet whichever character the reviewer used.
-	{"a value with a dotted tail", `password: hunter2.key`, "hunter2.key", "password"},
+	// A bullet is a bullet whichever character the reviewer used, and a code
+	// span holding nothing but an assignment is an assignment.
 	{"a plus bullet", `+ password: "p@ss w0rd"`, "p@ss w0rd", "password"},
 	{"an ordered list item", `1. password: "p@ss w0rd"`, "p@ss w0rd", "password"},
 	// A markdown delimiter is not part of the value; swallowing the closing
@@ -100,6 +99,12 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// cited path as a credential is the one that corrupts the corpus this
 	// feature builds. See isFileReference.
 	{"a slashed value with a dotted tail", `secret: wJalrX/K7MDENG/bPxRfiCYEXAMPLE.key`, "wJalrX"},
+	// A short value ending in a dotted extension is a path even without a
+	// separator, because `private_key: server.pem` and `api_key: settings.py`
+	// are files a review names and requiring the separator rewrote both. The
+	// cost is a password that happens to end that way. Past 24 runes with no
+	// separator the length settles it and a JWT is redacted; see isFileReference.
+	{"a short value with a dotted tail", `password: hunter2.key`, "hunter2.key"},
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
@@ -148,6 +153,10 @@ var proseCorpus = []struct{ name, in string }{
 	// follows it.
 	{"a value followed by a clause", "- The api_key: abcdefghij, hardcoded in config.go, must move to env"},
 	{"an identifier ending a sentence", "- Rename the token: sessionToken."},
+	// A code span that a sentence continues past is a sentence about code, not
+	// a bullet holding an assignment. The span that holds nothing but the
+	// assignment is redacted; see beginsItsUnit.
+	{"a code span a sentence continues past", "`token: sessionToken` is never validated"},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.

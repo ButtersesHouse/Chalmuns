@@ -116,9 +116,11 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		return Artifact{}, state.Watcher{}, false
 	}
 
-	// Redacted here rather than at the Capture call, so nothing downstream —
-	// the artifact, the label, the lean view — ever sees the credential.
-	text := redactSecrets(responseText(doc, isReporting))
+	// Credentials are stripped by Capture, which every path into an artifact
+	// goes through. Doing it here as well cost a second pass over text that can
+	// be megabytes, and left the other paths unprotected when this one was the
+	// only place anybody thought to look.
+	text := responseText(doc, isReporting)
 	if strings.TrimSpace(text) == "" {
 		return Artifact{}, state.Watcher{}, false
 	}
@@ -548,50 +550,97 @@ func redactJSON(text string) (string, bool) {
 	if err := dec.Decode(&doc); err != nil {
 		return "", false
 	}
+	// The *whole* text, or none of it. A decoder stops at the first value, so
+	// accepting one silently threw away everything after it: a JSON Lines
+	// response, or a report with a banner before it, came back as its first
+	// object with every finding gone.
+	if dec.More() || strings.TrimSpace(trimmed[dec.InputOffset():]) != "" {
+		return "", false
+	}
+
+	redacted, changed := redactValue(doc, "", 0)
+	if !changed {
+		// Nothing to remove, so nothing is rewritten. Re-encoding reorders
+		// keys, compacts the tool's own formatting and rewrites escapes and
+		// invalid UTF-8 — in text this package documents as byte-for-byte, and
+		// which verify-grounding matches a signal's quote against.
+		return text, true
+	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	// Without this a reviewer's `a < b && c > d` comes back as escape
 	// sequences, and a signal quoting it fails grounding.
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(redactValue(doc, "", 0)); err != nil {
+	if err := enc.Encode(redacted); err != nil {
 		return "", false
 	}
 	return strings.TrimRight(buf.String(), "\n"), true
 }
 
-// redactValue rewrites one decoded value. key is the field it was found under,
-// which is what decides whether a string is a credential or the review.
-func redactValue(v interface{}, key string, depth int) interface{} {
+// redactValue rewrites one decoded value, reporting whether it changed
+// anything. key is the field it was found under, which is what decides whether
+// a string is a credential or the review.
+func redactValue(v interface{}, key string, depth int) (interface{}, bool) {
 	if depth > 64 {
-		return v
+		// Past the bound the subtree is replaced rather than passed through:
+		// a guard that gives up silently is one a credential can be nested
+		// behind.
+		return redactedMarker, true
 	}
 	switch t := v.(type) {
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(t))
+		changed := false
 		for k, val := range t {
-			out[k] = redactValue(val, k, depth+1)
+			// A key can be the credential itself — a tool that counts what it
+			// found keys the map by each secret.
+			outKey := redactSecretsInValue(k)
+			if outKey != k {
+				changed = true
+			}
+			redacted, hit := redactValue(val, k, depth+1)
+			changed = changed || hit
+			out[outKey] = redacted
 		}
-		return out
+		if !changed {
+			return v, false
+		}
+		return out, true
 	case []interface{}:
 		out := make([]interface{}, len(t))
+		changed := false
 		for i, e := range t {
-			// An array element keeps its field's name: the values of an
-			// `argv` are the command line, whichever slot they sit in.
-			out[i] = redactValue(e, key, depth+1)
+			// The field's name is not carried into its elements. A `secrets`
+			// key on a summary object usually names which secret *rules* ran,
+			// and redacting every element of it made the review unreadable.
+			redacted, hit := redactValue(e, "", depth+1)
+			changed = changed || hit
+			out[i] = redacted
 		}
-		return out
+		if !changed {
+			return v, false
+		}
+		return out, true
 	case string:
 		if reSecretKey.MatchString(key) {
-			return redactedMarker
+			return redactedMarker, true
 		}
-		return redactSecretsInValue(t)
+		if out := redactSecretsInValue(t); out != t {
+			return out, true
+		}
+		return t, false
 	}
-	return v
+	return v, false
 }
 
 // reSecretKey matches a field name that says its value is a credential.
-var reSecretKey = regexp.MustCompile(`(?i)^["']?[A-Za-z0-9_.-]*(?:` + secretName +
-	`|authorization|auth)[A-Za-z0-9_.-]*["']?$`)
+//
+// `auth` has to end a name segment, as it does in secretPatterns and for the
+// same reason: as a substring it matches `author`, `authors`, `authenticated`
+// and `unauthorized`, and replacing those values deleted the reviewer's own
+// text — a commit author, a rule's metadata — from the artifact.
+var reSecretKey = regexp.MustCompile(`(?i)^["']?(?:[A-Za-z0-9_.-]*` + secretName +
+	`[A-Za-z0-9_.-]*|authorization|[A-Za-z0-9]*auth(?:[_-][A-Za-z0-9]+)*)["']?$`)
 
 // redactSecretsInValue runs the text patterns over one string value, where a
 // match cannot reach anything outside it.
@@ -683,7 +732,7 @@ var secretPatterns = []*regexp.Regexp{
 // at shell and JSON punctuation: replacing a span that had swallowed the
 // closing backtick of “ `api_key: abcdef` “ left the rest of the write-up
 // rendering as code.
-const bareValue = "([^\\s\"'`*,;)\\]}\\\\]+)"
+const bareValue = "([^\\s\"',;)\\]}\\\\]+)"
 
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
@@ -720,9 +769,12 @@ func redactColonForm(text string) string {
 			if !isAssignedCredential(text, loc) {
 				continue
 			}
+			// A closing `` ` `` or `**` belongs to the write-up, not to the
+			// value: swallowing it left the rest of the review rendering as
+			// code. Only the value itself is replaced.
 			b.WriteString(text[last:loc[4]])
 			b.WriteString(redactedSentinel)
-			last = loc[5]
+			last = loc[4] + len(strings.TrimRight(text[loc[4]:loc[5]], "`*_"))
 		}
 		if last == 0 {
 			continue
@@ -737,8 +789,8 @@ func redactColonForm(text string) string {
 // FindAllStringSubmatchIndex entry: loc[0:2] is the whole match, loc[4:6] the
 // value.
 func isAssignedCredential(text string, loc []int) bool {
-	value := text[loc[4]:loc[5]]
-	rest := text[loc[1]:]
+	value := strings.TrimRight(text[loc[4]:loc[5]], "`*_")
+	rest := text[loc[4]+len(value):]
 	if len([]rune(strings.TrimSpace(value))) < 6 {
 		// `token: yes` is a sentence.
 		return false
@@ -771,7 +823,33 @@ func isAssignedCredential(text string, loc []int) bool {
 // and the whole report arrives as one line of JSON.
 func beginsItsUnit(text string, i int) bool {
 	start := strings.LastIndexAny(text[:i], "\n\"'")
-	prefix := strings.TrimLeft(text[start+1:i], " \t-*+>|{,[#`")
+	unit := text[start+1:]
+	if j := strings.IndexAny(unit, "\n\"'"); j >= 0 {
+		unit = unit[:j]
+	}
+	prefix := text[start+1 : i]
+	// A `` ` `` or `*` that opens a span and closes it again on the same line
+	// is a code span or an emphasis rather than a list item — but only prose
+	// after the closing delimiter says which. "`token: sessionToken` is never
+	// validated" is a sentence about code, and reading its backtick as a bullet
+	// redacted the identifier the reviewer named; "`api_key: abcdefghijkl`" is
+	// a span holding nothing but the assignment, and reading *its* backtick as
+	// emphasis leaked the key. `**` is tested before `*` and the search stops
+	// at the delimiter that opened, or bold's second star reads as a span of
+	// its own that closes at the end of the line.
+	opener := strings.TrimLeft(prefix, " \t-+>|{,[#")
+	for _, delim := range []string{"`", "**", "*", "_"} {
+		if !strings.HasPrefix(opener, delim) {
+			continue
+		}
+		open := strings.Index(unit, delim)
+		closes := strings.Index(unit[open+len(delim):], delim)
+		if closes >= 0 && hasLetter(unit[open+closes+2*len(delim):]) {
+			return false
+		}
+		break
+	}
+	prefix = strings.TrimLeft(prefix, " \t-*+>|{,[#`_")
 	// An ordered list item — `1. password: …` — is a bullet too.
 	return prefix == "" || reOrderedItem.MatchString(prefix)
 }
@@ -810,7 +888,12 @@ func followedByWords(rest string) bool {
 	// The whole remainder, not just its first character. Stopping at the first
 	// rune made a comma or a period read as "the line ended here", so
 	// `- The api_key: abcdefghij, hardcoded in config.go` was rewritten.
-	for _, r := range rest {
+	return hasLetter(rest)
+}
+
+// hasLetter reports whether a span holds anything word-shaped.
+func hasLetter(s string) bool {
+	for _, r := range s {
 		if unicode.IsLetter(r) {
 			return true
 		}
@@ -819,10 +902,20 @@ func followedByWords(rest string) bool {
 }
 
 // isFileReference reports whether a value reads as a path the reviewer cited
-// rather than as a credential: a path separator and a dotted extension, both.
-// Either alone is too much — `hunter2.key` is a password with a suffix, and a
-// base64 run is full of slashes — and requiring both is what the corpus note
-// and this comment have always described.
+// rather than as a credential: it ends in a dotted extension.
+//
+// A directory component is not required. `private_key: server.pem` and
+// `api_key: settings.py` are files a review names, and requiring a `/` on top
+// of the extension redacted both — while requiring nothing but the extension
+// costs only `password: hunter2.key`, a password that happens to end that way.
+// Of the two errors, rewriting a path the reviewer cited is the one that makes
+// the finding name a file that does not exist, in the text grounding checks
+// against.
+//
+// Length is the one thing that separates the two without a separator. A JWT
+// ends in a dotted segment of letters — `eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc`
+// satisfies the extension test exactly — and a path that long has directories
+// in it. So an unbroken run of this length is a token whatever it ends with.
 //
 // Known limitation: a value that both holds a path separator and ends in a
 // short dotted extension is read as a path, so a base64 secret shaped that way
@@ -832,7 +925,7 @@ func isFileReference(value string) bool {
 	if !reFileRef.MatchString(value) {
 		return false
 	}
-	return strings.Contains(value, "/") && len([]rune(value)) < 64
+	return strings.Contains(value, "/") || len([]rune(value)) < 24
 }
 
 var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)

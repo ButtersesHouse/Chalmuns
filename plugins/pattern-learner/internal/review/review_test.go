@@ -241,6 +241,26 @@ func TestCapture_rawTextIsVerbatim(t *testing.T) {
 	}
 }
 
+func TestCapture_redactsWhicheverDoorTheReviewCameThrough(t *testing.T) {
+	// The hook used to be the only path that scrubbed, so `capture-review
+	// --file report.json` wrote a scanner's own report — its message echoing
+	// the offending source line — into the repository verbatim.
+	body := `{"results":[{"check_id":"c","path":"a.py","start":{"line":3},` +
+		`"extra":{"message":"Hardcoded: SEMGREP_APP_TOKEN=sk-secret-abc123","lines":"print(x)"}}]}`
+	a := capture(t, "semgrep", FormatAuto, body)
+	if strings.Contains(a.RawText, "sk-secret-abc123") {
+		t.Errorf("credential survived into RawText: %q", a.RawText)
+	}
+	if len(a.Findings) != 1 || strings.Contains(a.Findings[0].Body, "sk-secret-abc123") {
+		t.Errorf("credential survived into the finding: %+v", a.Findings)
+	}
+	// Redaction removes the credential and nothing else: the finding is still
+	// the finding, and the format still sniffs as semgrep.
+	if a.Format != FormatSemgrep || !strings.Contains(a.Findings[0].Body, "Hardcoded:") {
+		t.Errorf("redaction took more than the credential: %s %+v", a.Format, a.Findings)
+	}
+}
+
 func TestCapture_idIsContentAddressed(t *testing.T) {
 	body := `{"findings":[{"file":"a.go","summary":"s"}]}`
 	first := capture(t, "code-review", FormatAuto, body)

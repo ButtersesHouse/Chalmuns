@@ -121,7 +121,7 @@ func calledProgram(call *syntax.CallExpr) []string {
 		if wrapper != "" {
 			// Inside a wrapper's own arguments, which are not the program.
 			switch {
-			case inquiryFlags[wrapper][word]:
+			case inquiryFlags[wrapper][word], bundlesInquiryFlag(wrapper, word):
 				// `command -v semgrep` prints a path; it runs nothing.
 				return out
 			case valueFlags[wrapper][word]:
@@ -160,8 +160,7 @@ var (
 			"--user": true, "--group": true, "--prompt": true, "--chdir": true,
 			"--close-from": true, "--host": true, "--role": true, "--type": true,
 			"-D": true, "-R": true, "-T": true, "--chroot": true,
-			"--command-timeout": true, "-r": true, "-t": true, "-U": true,
-			"--other-user": true},
+			"--command-timeout": true, "-r": true, "-t": true},
 		"env":     {"-u": true, "-C": true, "--unset": true, "--chdir": true},
 		"timeout": {"-s": true, "-k": true, "--signal": true, "--kill-after": true},
 		"nice":    {"-n": true, "--adjustment": true},
@@ -198,8 +197,11 @@ var (
 		"builtin": {"-v": true, "-V": true},
 		// sudo -l lists what is permitted, -v refreshes the timestamp, -e
 		// opens an editor. None of them runs the program named after.
-		"sudo": {"-l": true, "-v": true, "-e": true,
-			"--list": true, "--validate": true, "--edit": true},
+		// -U is only meaningful with -l, and sudo refuses it otherwise, so it
+		// reports rather than runs whichever way it is spelled.
+		"sudo": {"-l": true, "-v": true, "-e": true, "-U": true,
+			"--list": true, "--validate": true, "--edit": true,
+			"--other-user": true},
 	}
 	// Operands the wrapper itself takes before the program.
 	wrapperOperands = map[string]int{"timeout": 1}
@@ -209,6 +211,22 @@ var (
 	subWrappers = map[string]map[string]bool{"uv": {"tool": true}}
 )
 
+// bundlesInquiryFlag reports whether a cluster of short options carries one
+// that makes the wrapper report rather than run. `sudo -nl semgrep` lists
+// privileges and never executes semgrep, and testing the whole token missed
+// every spelling but the bare one.
+func bundlesInquiryFlag(wrapper, word string) bool {
+	if len(word) < 3 || !strings.HasPrefix(word, "-") || strings.HasPrefix(word, "--") {
+		return false
+	}
+	for _, r := range word[1:] {
+		if inquiryFlags[wrapper]["-"+string(r)] {
+			return true
+		}
+	}
+	return false
+}
+
 // isAssignment reports whether a wrapper's argument sets a variable rather
 // than naming the program. `env` passes any `NAME=VALUE` string to putenv and
 // does not require a shell-legal identifier, so `env a.b=c semgrep .` is still
@@ -217,7 +235,15 @@ func isAssignment(wrapper, word string) bool {
 	if reAssignArg.MatchString(word) {
 		return true
 	}
-	return wrapper == "env" && strings.Contains(word, "=") && !strings.HasPrefix(word, "=")
+	if wrapper != "env" {
+		return false
+	}
+	// The `=` must come before any `/`, or a program path carrying one —
+	// `/opt/tool=v2/bin/semgrep` — is skipped as an assignment and the run
+	// is missed.
+	eq := strings.Index(word, "=")
+	slash := strings.Index(word, "/")
+	return eq > 0 && (slash < 0 || eq < slash)
 }
 
 var reAssignArg = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)

@@ -152,6 +152,19 @@ func Capture(in Input) (Artifact, error) {
 	if source == "" {
 		return Artifact{}, fmt.Errorf("--source required: a captured review is attributed to the tool that produced it")
 	}
+	// Every capture is redacted, here rather than at each caller, because this
+	// is the one place an Artifact is built and the artifact is what gets
+	// committed to the repository. The hook was the only path that scrubbed,
+	// which left `capture-review --file report.json` writing a scanner's own
+	// report — `extra.message` echoing the offending `SEMGREP_APP_TOKEN=` line —
+	// into the repository verbatim. The door differs; the destination does not.
+	//
+	// Redaction runs before parsing so that no downstream field — a finding's
+	// body, its code_before, RawText, the lean view a subagent reads — is built
+	// from unredacted text.
+	if red := redactSecrets(string(in.Data)); red != string(in.Data) {
+		in.Data = []byte(red)
+	}
 	format := in.Format
 	sniffed := format == "" || format == FormatAuto
 	if sniffed {
