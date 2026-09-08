@@ -352,3 +352,38 @@ func TestClassify_reviewEvidenceIsCountedInReviews(t *testing.T) {
 		t.Errorf("five separate reviews agreeing is established; got %v", got["confidence"])
 	}
 }
+
+// Once a candidate carries review evidence, PR sources collapse per PR too: a
+// reviewer who flagged four files in one review and three comments left on one
+// PR are two occasions, not seven. signal_count reports the same number the
+// threshold was applied to, so the approval display cannot disagree with the
+// tier beside it.
+func TestClassify_mixedEvidenceCountsOccasionsNotSignals(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"title": "r",
+		"sources": []src{
+			{ReviewID: "rev-000000000001", Strength: "implicit"},
+			{ReviewID: "rev-000000000001", Strength: "implicit"},
+			{ReviewID: "rev-000000000001", Strength: "implicit"},
+			{ReviewID: "rev-000000000001", Strength: "implicit"},
+			{PRNumber: 90, Strength: "implicit"},
+			{PRNumber: 90, Strength: "implicit"},
+			{PRNumber: 90, Strength: "implicit"},
+		},
+	})
+	got := classifyOne(t, raw, 100, 0)
+	if got == nil {
+		t.Fatal("candidate was dropped")
+	}
+	if got["confidence"] != "emerging" {
+		t.Errorf("one review and one PR is two occasions, not seven; got %v", got["confidence"])
+	}
+	if n, _ := got["signal_count"].(float64); n != 2 {
+		t.Errorf("signal_count should report the occasions the tier was decided on; got %v", got["signal_count"])
+	}
+}

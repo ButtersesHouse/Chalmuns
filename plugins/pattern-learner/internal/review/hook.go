@@ -91,7 +91,7 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 
 	// A skill that reports through a reporting tool is captured from that tool
 	// alone; its own call carries prompt text, not findings.
-	if !isReporting && reportingSkills[strings.ToLower(strings.TrimPrefix(skill, "/"))] {
+	if !isReporting && reportingSkills[bareSkillName(skill)] {
 		return Artifact{}, state.Watcher{}, false
 	}
 
@@ -133,6 +133,19 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		return Artifact{}, state.Watcher{}, false
 	}
 	return art, *matched, true
+}
+
+// bareSkillName reduces a skill reference to the name a designation carries:
+// no leading slash, no plugin qualifier. matchesSkill accepts all three forms,
+// so anything deciding "is this that skill" must too — comparing only the bare
+// spelling let a plugin-qualified /code-review past the double-capture filter
+// while still matching the watcher.
+func bareSkillName(skill string) string {
+	skill = strings.TrimPrefix(strings.TrimSpace(skill), "/")
+	if i := strings.LastIndex(skill, ":"); i >= 0 {
+		skill = skill[i+1:]
+	}
+	return strings.ToLower(skill)
 }
 
 // reSkillFrontmatter matches the opening of a skill or slash-command
@@ -282,12 +295,23 @@ func valueText(v interface{}, depth int) string {
 		if _, ok := t["findings"]; ok {
 			return marshalText(v)
 		}
+		// A response envelope that carries text fields has already said what it
+		// has: if they are all empty the tool produced no output, and falling
+		// through to marshal the envelope would record `{"stdout":"", …}` as
+		// the reviewer's words.
+		envelope := false
 		for _, key := range textKeys {
-			if inner, present := t[key]; present {
-				if text := valueText(inner, depth+1); strings.TrimSpace(text) != "" {
-					return text
-				}
+			inner, present := t[key]
+			if !present {
+				continue
 			}
+			envelope = true
+			if text := valueText(inner, depth+1); strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+		if envelope {
+			return ""
 		}
 		return marshalText(v)
 	}

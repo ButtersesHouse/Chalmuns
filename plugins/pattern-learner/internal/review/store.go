@@ -115,6 +115,11 @@ func ListArtifactMeta(cacheDir string) ([]Artifact, error) {
 	for _, path := range matches {
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
+			// Warned, not swallowed: ListArtifacts warns on exactly this, and
+			// which lister a caller happened to use must not decide whether a
+			// corrupt artifact is visible or vanishes from every tally and
+			// every selection.
+			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", path, readErr)
 			continue
 		}
 		var meta struct {
@@ -123,6 +128,7 @@ func ListArtifactMeta(cacheDir string) ([]Artifact, error) {
 			CapturedAt string `json:"captured_at"`
 		}
 		if err := json.Unmarshal(data, &meta); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", path, err)
 			continue
 		}
 		out = append(out, Artifact{ReviewID: meta.ReviewID, Source: meta.Source, CapturedAt: meta.CapturedAt})
@@ -257,24 +263,27 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 	if err != nil {
 		return nil, "", err
 	}
-	chosen := Select(meta, ids, since)
-	if len(ids) > 0 {
-		// An explicit id run mines out of order on purpose, so it has no
-		// watermark to hand back: advancing past reviews it skipped would make
-		// them unmineable for good.
-		watermark = ""
-	} else {
-		watermark = Newest(chosen)
-	}
+	return ExtractLeanFrom(cacheDir, meta, ids, since)
+}
 
-	full := make([]Artifact, 0, len(chosen))
-	for _, m := range chosen {
-		a, err := ReadArtifact(cacheDir, m.ReviewID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", m.ReviewID, err)
+// ExtractLeanFrom is ExtractLean over a metadata listing the caller already
+// has, so a run that validated ids against the cache does not read it twice.
+func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, err error) {
+	full := make([]Artifact, 0)
+	for _, m := range Select(meta, ids, since) {
+		a, readErr := ReadArtifact(cacheDir, m.ReviewID)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", m.ReviewID, readErr)
 			continue
 		}
 		full = append(full, a)
+	}
+	// The watermark comes from what was actually read, not from what was
+	// selected. Taking it from the selection advanced past an artifact whose
+	// file failed to read, so the next --since run never selected it again and
+	// the review was unmineable for good — on the strength of one warning.
+	if len(ids) == 0 {
+		watermark = Newest(full)
 	}
 	return Lean(full), watermark, nil
 }

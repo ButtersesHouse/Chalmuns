@@ -201,7 +201,6 @@ func parseESLint(data []byte) ([]Finding, error) {
 			Message  string `json:"message"`
 			Line     int    `json:"line"`
 		} `json:"messages"`
-		Source string `json:"source"`
 	}
 	if err := json.Unmarshal(data, &files); err != nil {
 		return nil, fmt.Errorf("parse ESLint JSON: %w", err)
@@ -323,7 +322,7 @@ func fenceBlocks(s string) []fenceBlock {
 	var buf strings.Builder
 	offset := 0
 	for _, line := range strings.SplitAfter(s, "\n") {
-		bare := strings.TrimLeft(strings.TrimRight(line, "\r\n"), " \t")
+		bare := strings.TrimSpace(strings.TrimRight(line, "\r\n"))
 		// Both fence syntaxes are legal markdown and reviewers use both; a
 		// fence must be closed by its own character, so a ``` inside a ~~~
 		// block is content.
@@ -373,7 +372,24 @@ func fenceBlocks(s string) []fenceBlock {
 // RawText, and the extraction step reads that. Inventing one finding per
 // paragraph would fabricate structure the reviewer did not write.
 func parseMarkdown(text string) []Finding {
-	locs := reMDHeading.FindAllStringSubmatchIndex(text, -1)
+	// Headings inside a fenced block are code — a shell or Python comment, a
+	// markdown sample. Reading them as headings split one finding into
+	// several and presented "# install deps first" as a convention title.
+	fences := fenceBlocks(text)
+	inFence := func(off int) bool {
+		for _, b := range fences {
+			if off >= b.start && off < b.end {
+				return true
+			}
+		}
+		return false
+	}
+	var locs [][]int
+	for _, loc := range reMDHeading.FindAllStringSubmatchIndex(text, -1) {
+		if !inFence(loc[0]) {
+			locs = append(locs, loc)
+		}
+	}
 	if len(locs) == 0 {
 		return nil
 	}

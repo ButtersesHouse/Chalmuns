@@ -67,6 +67,29 @@ func RunClassify(args []string) error {
 	return enc.Encode(result)
 }
 
+// countEvidence counts the distinct occasions a candidate's sources came from:
+// one per review, one per PR, and one per source that names neither (a manual
+// or discovered rule, which is its own occasion).
+//
+// It is applied only to candidates that carry at least one review source. A
+// candidate mined purely from PRs keeps the historical signal count, so adding
+// Review Mode does not silently re-grade every rule learned before it existed.
+func countEvidence(sources []classifySource) int {
+	seen := map[string]bool{}
+	loose := 0
+	for _, s := range sources {
+		switch {
+		case s.ReviewID != "":
+			seen["rev:"+s.ReviewID] = true
+		case s.PRNumber > 0:
+			seen[fmt.Sprintf("pr:%d", s.PRNumber)] = true
+		default:
+			loose++
+		}
+	}
+	return len(seen) + loose
+}
+
 // Classify assigns confidence and applies the Step 9 threshold and recency
 // downgrade to a slice of raw candidate JSON objects. Each candidate must
 // carry a "sources" array; each source may carry a "strength" field.
@@ -77,12 +100,12 @@ func RunClassify(args []string) error {
 //   - Implicit (all sources implicit or empty):
 //     5+ signals → "established"; 1–4 → "emerging"
 //
-// For a candidate whose evidence is all from captured reviews, the count is of
-// distinct reviews rather than signals: one review reporting one finding in
-// five files is one piece of evidence, not five.
+// A candidate carrying review evidence is counted in distinct occasions rather
+// than signals — one review is one occasion however many findings it held —
+// see countEvidence.
 //
 // Recency downgrade (implicit-only, and only for candidates with at least one
-// PR source):
+// PR source and no review source):
 //
 //	cutoff = maxPRSeen − (maxPRSeen − sincePR) × 0.5
 //	If max(source.pr_number) < cutoff: established → emerging; emerging → dropped.
@@ -122,11 +145,9 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 		maxSourcePR := 0
 		hasPRSource := false
 		hasReviewSource := false
-		reviews := map[string]bool{}
 		for _, src := range c.Sources {
 			if src.ReviewID != "" {
 				hasReviewSource = true
-				reviews[src.ReviewID] = true
 			}
 			if src.Strength == "explicit" {
 				isExplicit = true
@@ -138,15 +159,14 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 				maxSourcePR = src.PRNumber
 			}
 		}
+		// Once review evidence is in play, evidence is counted in distinct
+		// occasions rather than signals: one review is one occasion however
+		// many findings it held. Counting signals graded a single linter run
+		// that tripped one check in five files as "established" — top tier,
+		// which the approval UI sanctions bulk-approving.
 		n := len(c.Sources)
-		// Review evidence is counted in reviews, not signals. One run of a
-		// linter tripping the same check in five files is five sources and one
-		// review, and grading that "established" puts a rule nobody has read
-		// into the top tier — which the approval UI then sanctions bulk-
-		// approving by tier. triage holds the same line for --auto; this is
-		// the same judgement for the interactive path.
-		if len(reviews) > 0 && !hasPRSource {
-			n = len(reviews)
+		if hasReviewSource {
+			n = countEvidence(c.Sources)
 		}
 
 		// Assign initial confidence.

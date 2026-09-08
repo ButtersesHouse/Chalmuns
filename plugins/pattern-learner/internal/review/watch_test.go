@@ -553,3 +553,30 @@ func TestMatch_heredocOperatorInsideQuotesIsText(t *testing.T) {
 		t.Errorf("the run after the quoted text should still match\n  sanitized: %q", sanitizeCommand(cmd))
 	}
 }
+
+// A skill invoked from a plugin arrives qualified ("pattern-learner:code-review"),
+// and the double-capture filter compares bare names. Missing the qualifier let
+// the Skill call through alongside the ReportFindings call, recording one
+// review twice — the exact miscount TestFromHook_oneReviewIsCapturedOnce
+// exists to prevent.
+func TestFromHook_pluginQualifiedSkillIsStillTheReporter(t *testing.T) {
+	ws := watchers(t, "code-review:any")
+	payload := `{"tool_name":"Skill","tool_input":{"skill":"reviewer-pack:code-review"},` +
+		`"tool_response":{"stdout":"Reviewing the diff at high effort…"}}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("the reporting skill's own call is prompt text, not the review")
+	}
+}
+
+// A tool that ran and produced nothing comes back as an envelope of empty
+// strings. Marshalling it recorded `{"stdout":"","stderr":""}` as the
+// reviewer's words — a review made of JSON punctuation, which then counted as
+// an occasion the convention recurred on.
+func TestFromHook_emptyResponseEnvelopeIsNotAReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"","stderr":"","interrupted":false}}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("an empty response envelope should capture nothing")
+	}
+}

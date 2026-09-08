@@ -117,7 +117,7 @@ func runWatch(args []string) error {
 // state directory first so designating a watcher works in a repo that has
 // never run the pipeline.
 func writeStateFile(path string, s state.State) error {
-	if err := os.MkdirAll(dirOf(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 	return state.Write(path, s)
@@ -310,19 +310,19 @@ func runExtractReview(args []string) error {
 		}
 	}
 
+	meta, err := review.ListArtifactMeta(cacheDir)
+	if err != nil {
+		return err
+	}
+
 	// An unknown id selects nothing, and "nothing" is the same answer the
 	// watermark path gives for "already mined" — so a typo would be reported
 	// to the user as a review already consumed. Name it instead.
-	if len(ids) > 0 {
-		all, listErr := review.ListArtifactMeta(cacheDir)
-		if listErr == nil {
-			if missing := review.MissingIDs(all, ids); len(missing) > 0 {
-				return fmt.Errorf("no captured review with id %s in %s", strings.Join(missing, ", "), cacheDir)
-			}
-		}
+	if missing := review.MissingIDs(meta, ids); len(missing) > 0 {
+		return fmt.Errorf("no captured review with id %s in %s", strings.Join(missing, ", "), cacheDir)
 	}
 
-	lean, watermark, err := review.ExtractLean(cacheDir, ids, since)
+	lean, watermark, err := review.ExtractLeanFrom(cacheDir, meta, ids, since)
 	if err != nil {
 		return err
 	}

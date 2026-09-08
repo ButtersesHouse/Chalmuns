@@ -694,3 +694,85 @@ func TestCapture_foreignFenceCharacterInsideABlockIsContent(t *testing.T) {
 		t.Errorf("the block should survive a foreign fence marker; after=%q", f.CodeAfter)
 	}
 }
+
+// A closing fence with trailing whitespace is still a closing fence. Treating
+// it as content left every following heading trapped inside the block, so a
+// review whose first fence happened to end in a space produced one finding
+// instead of ten.
+func TestCapture_closingFenceWithTrailingSpace(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## First\n\nUse the helper.\n\n```go\nx := 1\n```   \n\n## Second\n\nAnd wrap errors.\n")
+	if len(a.Findings) != 2 {
+		t.Fatalf("want 2 findings, got %d: %+v", len(a.Findings), a.Findings)
+	}
+	if a.Findings[1].Title != "Second" {
+		t.Errorf("second heading should have escaped the fence; got %q", a.Findings[1].Title)
+	}
+}
+
+// A '#' at the start of a line inside a code fence is a comment, a shell
+// prompt or a Markdown example — not a section of the review. Splitting on it
+// invented findings whose bodies were someone else's source code.
+func TestCapture_hashInsideAFenceIsNotAHeading(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## Only finding\n\nRun it like this:\n\n```sh\n# not a heading\nmake test\n```\n")
+	if len(a.Findings) != 1 {
+		t.Fatalf("want 1 finding, got %d: %+v", len(a.Findings), a.Findings)
+	}
+	if a.Findings[0].Title != "Only finding" {
+		t.Errorf("title: %q", a.Findings[0].Title)
+	}
+}
+
+// Two different linters that both come back clean have the same content —
+// nothing — so an id derived from the findings alone collapsed them into one
+// artifact. The first clean run then stood for every later one, and the tally
+// the watch list prints attributed it to whichever reviewer got there first.
+func TestCapture_cleanRunsOfDifferentToolsAreDifferentReviews(t *testing.T) {
+	eslint := capture(t, "eslint", FormatAuto, `[]`)
+	semgrep := capture(t, "semgrep", FormatAuto, `{"results":[]}`)
+	if len(eslint.Findings) != 0 || len(semgrep.Findings) != 0 {
+		t.Fatalf("both runs should be clean: %d / %d", len(eslint.Findings), len(semgrep.Findings))
+	}
+	if eslint.ReviewID == semgrep.ReviewID {
+		t.Errorf("a clean eslint run and a clean semgrep run share id %s", eslint.ReviewID)
+	}
+	// Two clean runs of the *same* tool are still one review: that is the
+	// idempotence the content-addressed id exists for.
+	again := capture(t, "eslint", FormatAuto, `[]`)
+	if again.ReviewID != eslint.ReviewID {
+		t.Errorf("re-running one clean linter should be the same review: %s vs %s", again.ReviewID, eslint.ReviewID)
+	}
+}
+
+// The watermark must come from what was read, not from what was selected. An
+// artifact whose file will not parse used to advance it anyway, so the next
+// --since run never selected it again and the review was lost for good.
+func TestExtractLean_watermarkStopsAtAnUnreadableArtifact(t *testing.T) {
+	dir := t.TempDir()
+	for _, a := range []Artifact{
+		{ReviewID: "rev-000000000001", Source: "code-review", Format: FormatMarkdown,
+			CapturedAt: "2026-01-15T10:00:00Z", RawText: "## A\n\ntext\n"},
+		{ReviewID: "rev-000000000002", Source: "code-review", Format: FormatMarkdown,
+			CapturedAt: "2026-01-15T11:00:00Z", RawText: "## B\n\ntext\n"},
+	} {
+		if _, err := WriteArtifact(dir, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Corrupt the newer one after the fact, exactly as a truncated write would.
+	if err := os.WriteFile(ArtifactPath(dir, "rev-000000000002"), []byte(`{"review_id":`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lean, watermark, err := ExtractLean(dir, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lean) != 1 {
+		t.Fatalf("want the one readable review, got %d", len(lean))
+	}
+	if watermark != "2026-01-15T10:00:00Z" {
+		t.Errorf("watermark advanced past the unreadable artifact: %q", watermark)
+	}
+}

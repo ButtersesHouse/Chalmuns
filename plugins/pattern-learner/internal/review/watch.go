@@ -279,13 +279,21 @@ func maskLine(line string) (masked, delimiter string) {
 		case quote != 0:
 			if r == quote {
 				quote = 0
+				b.WriteRune(' ')
+				continue
 			}
-			b.WriteRune(' ')
+			// Inside quotes, only the shell's own punctuation loses its
+			// meaning. Blanking the whole span instead also erased a quoted
+			// program name, so `"semgrep" --json .` and
+			// `"$HOME/bin/semgrep" .` — ordinary ways to invoke a tool whose
+			// path has a space — matched nothing at all, which is the silence
+			// this package exists to avoid.
+			b.WriteRune(neutralize(r))
 		case r == '\\':
 			b.WriteRune(' ')
 			if i+1 < len(runes) {
 				i++
-				b.WriteRune(' ')
+				b.WriteRune(neutralize(runes[i]))
 			}
 		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && delimiter == "":
 			// An operator, because we are outside quotes. Read its delimiter
@@ -298,6 +306,17 @@ func maskLine(line string) (masked, delimiter string) {
 		}
 	}
 	return b.String(), delimiter
+}
+
+// neutralize strips a character of shell meaning while keeping it as text, so
+// quoted data cannot manufacture a command position but a quoted program name
+// still reads as one word.
+func neutralize(r rune) rune {
+	switch r {
+	case ';', '|', '&', '(', ')', '<', '>', '\n':
+		return ' '
+	}
+	return r
 }
 
 // reHeredoc matches a here-document operator and its delimiter word, quoted or

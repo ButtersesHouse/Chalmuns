@@ -13,7 +13,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Skill|SlashCommand|Task|ReportFindings",
+        "matcher": "Bash|Skill|SlashCommand|ReportFindings",
         "hooks": [
           {
             "type": "command",

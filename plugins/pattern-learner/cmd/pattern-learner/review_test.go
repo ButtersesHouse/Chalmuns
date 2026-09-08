@@ -468,3 +468,49 @@ func TestRunExtractReview_rejectsAMalformedWatermark(t *testing.T) {
 		t.Errorf("a well-formed watermark should be accepted: %v", err)
 	}
 }
+
+// A typo in --reviews used to select nothing, which is the same answer the
+// watermark path gives for "already mined" — so the user was told a review had
+// been consumed when none was looked at. Naming the id is the whole point;
+// selecting the real ones alongside it must still work.
+func TestRunExtractReview_namesAnUnknownReviewID(t *testing.T) {
+	_, _, cacheDir := projectFixture(t)
+	if err := runCaptureReview([]string{
+		"--cache-dir", cacheDir, "--source", "code-review",
+		"--file", writeTemp(t, `{"findings":[{"file":"a.go","summary":"Use the shared logger."}]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metas, err := review.ListArtifactMeta(cacheDir)
+	if err != nil || len(metas) != 1 {
+		t.Fatalf("fixture: %v (%d artifacts)", err, len(metas))
+	}
+	real := metas[0].ReviewID
+
+	err = runExtractReview([]string{"--cache-dir", cacheDir, "--reviews", real + ",rev-0000deadbeef"})
+	if err == nil {
+		t.Fatal("an unknown review id should be an error, not an empty selection")
+	}
+	if !strings.Contains(err.Error(), "rev-0000deadbeef") {
+		t.Errorf("the error should name the id that is missing; got %v", err)
+	}
+	if strings.Contains(err.Error(), real) {
+		t.Errorf("the error should not name the id that exists; got %v", err)
+	}
+
+	// An explicit selection hands back no watermark: advancing past reviews
+	// this run skipped on purpose would make them unmineable for good.
+	out, err := captureStdout(t, func() error {
+		return runExtractReview([]string{"--cache-dir", cacheDir, "--reviews", real})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res extractReviewResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Reviews) != 1 || res.NextWatermark != "" {
+		t.Errorf("explicit selection: want 1 review and no watermark; got %d / %q", len(res.Reviews), res.NextWatermark)
+	}
+}

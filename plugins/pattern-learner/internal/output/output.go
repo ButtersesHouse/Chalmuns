@@ -1635,7 +1635,12 @@ func sourceLabel(r state.Rule) string {
 
 // hasReviewSource reports whether any signal was mined from a captured review.
 func hasReviewSource(sources []state.Signal) bool {
-	return len(reviewSources(sources)) > 0
+	for _, s := range sources {
+		if s.ReviewID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // reviewSources returns just the signals mined from captured reviews.

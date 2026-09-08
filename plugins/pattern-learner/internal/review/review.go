@@ -205,7 +205,7 @@ func Capture(in Input) (Artifact, error) {
 		now = time.Now()
 	}
 	return Artifact{
-		ReviewID:   artifactID(source, findings, in.Data),
+		ReviewID:   artifactID(source, format, findings, in.Data),
 		Source:     source,
 		Format:     format,
 		CapturedAt: now.UTC().Format(time.RFC3339Nano),
@@ -231,14 +231,24 @@ func Capture(in Input) (Artifact, error) {
 //
 // Source stays in the digest: two *different* tools reporting the same thing
 // is real corroboration and must remain two artifacts.
-func artifactID(source string, findings []Finding, data []byte) string {
+func artifactID(source, format string, findings []Finding, data []byte) string {
 	h := sha256.New()
 	h.Write([]byte(source))
 	h.Write([]byte{0})
 	if len(findings) == 0 {
-		// Nothing was parsed (prose, or a shape with no findings): the bytes
-		// are all the identity there is.
-		h.Write(data)
+		if format == FormatMarkdown {
+			// Prose carries its whole meaning in its text, so the bytes are
+			// all the identity there is.
+			h.Write(data)
+		} else {
+			// A structured report that found nothing is the same review every
+			// time, whatever its incidental fields say. Hashing the bytes
+			// minted a fresh artifact for each clean run — eslint varies the
+			// echoed `source`, semgrep varies `paths.scanned` — so a tool run
+			// on a green tree accumulated a content-free artifact per run,
+			// each of which the extraction step then read.
+			h.Write([]byte("clean:" + format))
+		}
 	} else {
 		// Sorted, so a tool that reports the same findings in a different
 		// order between runs — a parallel scanner, or one whose worklist
