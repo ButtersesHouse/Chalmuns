@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -29,7 +30,7 @@ import (
 // set is unchanged). Bump it whenever generated output or a subcommand's
 // behaviour changes, and update the expected value in SKILL.md and the
 // plugin manifest to match.
-const Version = "0.4.0"
+const Version = "0.5.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -106,7 +107,7 @@ func runStateRead(args []string) error {
 }
 
 func runStateWrite(args []string) error {
-	if err := cliflags.Check(args, []string{"--state"}, nil); err != nil {
+	if err := cliflags.Check(args, []string{"--state", "--allow-protected"}, nil); err != nil {
 		return err
 	}
 	path := cliflags.Value(args, "--state", "")
@@ -127,13 +128,36 @@ func runStateWrite(args []string) error {
 	// reviewer, with no error and nothing in the cache to explain why. They
 	// are managed by the `watch` subcommand alone, so a payload that omits
 	// them means "unchanged", never "remove them".
+	//
+	// Rules added by hand belong in that set too, for the same reason and a
+	// stronger one: a dropped PR-mined rule is re-mined on the next refresh,
+	// but a dropped manual rule is gone, and write-outputs then prunes the
+	// skill it lived in. See internal/state/protect.go for what counts as
+	// overriding one and what counts as strengthening it.
 	prior, err := state.Read(path)
-	if err == nil {
+	if err != nil {
+		// A prior state that exists but will not parse cannot be checked, and
+		// writing over it discards exactly the rules this check protects.
+		// Refuse rather than let a corrupt file become the way past the gate.
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("%w (refusing to overwrite a state file that will not parse: "+
+				"it may hold rules added by hand, and this write would discard them — "+
+				"repair or move it, then rerun)", err)
+		}
+	} else {
 		if len(s.Watchers) == 0 {
 			s.Watchers = prior.Watchers
 		}
 		if s.LastIngestedReviewAt == "" {
 			s.LastIngestedReviewAt = prior.LastIngestedReviewAt
+		}
+		allow := splitList(cliflags.Value(args, "--allow-protected", ""))
+		violations, err := state.EnforceProtected(prior, &s, allow)
+		if err != nil {
+			return err
+		}
+		if len(violations) > 0 {
+			return errors.New(state.FormatViolations(violations))
 		}
 	}
 
@@ -141,6 +165,17 @@ func runStateWrite(args []string) error {
 		return err
 	}
 	return state.Write(path, s)
+}
+
+// splitList reads a comma-separated flag value into trimmed, non-empty parts.
+func splitList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func runWriteOutputs(args []string) error {

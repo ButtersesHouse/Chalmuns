@@ -20,6 +20,15 @@ against and no occurrence count to score. The rule is authoritative because a hu
 stated it: it is written with `origin: "manual"`, `strength: "explicit"`,
 `confidence: "stated"`, and `status: "approved"`.
 
+`origin: "manual"` is not just a label. It is what `state-write` reads to protect the rule
+from every later run: once written, no ingestion pass may drop it, rewrite its text or
+title, retarget it, change its status, relabel its origin, downgrade its confidence, or
+remove a source or example already on it — not without `--allow-protected` naming that
+rule, which the developer has to approve. Later runs may still *append* mined sources and
+examples to it, and should: a manual rule the reviewers keep echoing ought to show that.
+Get `origin` right here and the rule is durable; omit it and it is ordinary pipeline
+output from the next run onward.
+
 The two pieces of judgment in this mode — deciding whether the rule already exists, and
 deciding which domain it belongs to — are genuinely semantic and interactive. You perform
 them directly. Do not write a script; the only `$BIN` calls are `state-read` (already done
@@ -71,6 +80,15 @@ the new rule against each existing one. This is your judgment, not a string matc
   `supersedes: ["<existing_rule_id>"]` on the new rule (Step 11 will mark the old one
   `superseded`). If no, stop.
 - **Distinct** (neither equivalent nor contradicting): proceed to A3.
+
+**When the rule you are about to change is itself a manual one** (`origin: "manual"`),
+`state-write` will refuse the write unless it is told the developer approved it. That
+applies to **Replace its text** (it rewrites `title`/`rule`/examples) and to accepting a
+**supersession** over one (Step 11 sets the old rule's `status`); it does not apply to
+**Strengthen it**, which only appends a source and may raise confidence. In this mode the
+user's answer to the question you just asked *is* the approval — you do not ask twice — so
+carry it into Step 11 as `--allow-protected <existing_rule_id>` on that write. If you did
+not ask, you do not have permission: go back and ask.
 
 ---
 

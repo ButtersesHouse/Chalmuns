@@ -124,7 +124,7 @@ If the build fails, stop and report the error. Do not continue.
 
 Refer to the binary as `BIN=.claude/pattern-learner/bin/pattern-learner` for the rest of these steps.
 
-**Binary self-check**: run `$BIN version` and confirm it prints exactly `0.4.0`. If the command errors (an older binary reports `unknown subcommand: version`) or prints any other value, the binary was built from older source and its output format differs from what these steps describe — delete it and rebuild from Step 2, then re-run the check. If it still does not print `0.4.0` after a clean rebuild, STOP and report it: the plugin source found in step 1 is not the version this skill file belongs to. Do not proceed with a mismatched binary.
+**Binary self-check**: run `$BIN version` and confirm it prints exactly `0.5.0`. If the command errors (an older binary reports `unknown subcommand: version`) or prints any other value, the binary was built from older source and its output format differs from what these steps describe — delete it and rebuild from Step 2, then re-run the check. If it still does not print `0.5.0` after a clean rebuild, STOP and report it: the plugin source found in step 1 is not the version this skill file belongs to. Do not proceed with a mismatched binary.
 
 **Create the run-lock** (enables the off-script guard for the duration of this run):
 ```
@@ -294,11 +294,20 @@ For each pair of candidates that are semantically contradictory:
 **Universal-rule qualification**: a rule belongs in the `"CLAUDE.md"` universal sentinel (generated as the `conventions` skill) only when it applies to every file in the repository regardless of technology or context — e.g. "no abbreviations in identifiers", "prefix commits with the ticket number", "never log PII". Rules that depend on file path, language, framework, or layer belong in domain skills, even if they appeared across many PRs. Coarse locations like `"backend"`, `"frontend"`, or `"general"` are not valid domain names — re-normalize these to the most specific subdomain the rule's file globs imply. When in doubt between `"CLAUDE.md"` and a domain, choose the domain.
 
 **C. Against existing state rules**: For each candidate:
-- **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's text and `status`. Merge the candidate's `do_examples`/`dont_examples` into the existing rule's arrays (deduplicate by code content, cap each at 4). Do NOT create a new rule.
+- **Equivalent**: semantically the same convention → append the new signal to that rule's `sources`, increment `signal_count`, update `last_seen_pr`. Recompute confidence via Step 9 logic (any source explicit → explicit path: `"established"` 3+ signals, `"stated"` fewer; else implicit path). Preserve the existing rule's `id`, `title`, `rule` text, `target`, `origin`, `created_at` and `status` — a merge corroborates a rule, it does not restate it. Merge the candidate's `do_examples`/`dont_examples` into the existing rule's arrays (deduplicate by code content, cap each at 4; when the cap bites, the entries already on the rule are the ones that stay). Do NOT create a new rule.
 - **Contradicts**: semantically *opposite* to an existing rule (e.g., existing says "use X", new says "we always use Y instead"). Do NOT merge. Create a new candidate rule with `supersedes: ["<existing_rule_id>"]`. The user will see both in the approval UI and decide whether to accept the supersession (which then sets the existing rule's `status: "superseded"` and `superseded_by: "<new_rule_id>"`).
 - **Semantically distinct**: not equivalent and not contradicting → treat as a new candidate rule.
 
 **D. Against rejected signals**: If a candidate is semantically equivalent to any entry in `rejected_signals` → discard silently. Do this AFTER contradiction check so an explicit reversal of a rejected rule still has a chance to surface (rare but possible).
+
+**Rules the developer added by hand are protected.** A rule with `origin: "manual"` came
+from a person stating it, not from a run, so no run can reproduce it if it is lost.
+`state-write` enforces this: it refuses a payload that drops such a rule, rewrites its
+text or title, retargets it, changes its `status`, relabels its `origin`, downgrades its
+confidence to `emerging`, or removes any source or example already on it. Appending a
+mined source or example is allowed and is exactly what should happen here — corroborating
+a manual rule is the point. If a candidate genuinely contradicts one, that is the
+supersession path below, and the user decides it in Step 10.
 
 New candidates get `status: "proposed"`. IDs will be assigned by `state-write` in Step 11.
 
@@ -335,6 +344,12 @@ The display format, the per-rule keys (`a`/`r`/`e`/`s`) and exactly what each on
 
 Build the complete updated state JSON:
 - All rules (approved, rejected, proposed, superseded) with updated statuses, signal counts, sources
+- `origin` per rule: carry it through verbatim on every rule that already had one, and set it on
+  every rule this run created — `"pr-review"` for PR mining, `"discover"` for `--discover`,
+  `"code-review"` for `--learn-reviews`, `"manual"` for `--add`. It decides a rule's provenance
+  line, exempts a non-PR rule from the staleness marker, and marks the rules `state-write`
+  protects. An omitted `origin` reads as `"pr-review"` everywhere downstream, so dropping it
+  from a manual rule is how that rule quietly stops being the developer's.
 - `reviewed_snapshot` and `conflicted` per rule: both fields are part of the `Rule` struct and round-trip through `state-write` automatically. `reviewed_snapshot` is set by the `s` action and cleared on approve/reject (not on edit). `conflicted` is set by Step 8A-cross and cleared when the user resolves the conflict during review.
 - Updated `last_extracted_pr_number` = `max_pr_seen` from Step 5 (the highest PR number encountered on any page, merged or not — this sets the watermark so the next refresh only fetches newer PRs). Leave unchanged if `--review` or `--learn-reviews`.
 - `last_ingested_review_at`: the review-cache watermark. Set it only in Review Mode (Step R5.4), to the `captured_at` of the newest review mined this run; leave it untouched in every other mode.
@@ -369,6 +384,27 @@ cat .claude/pattern-learner/state-pending.json | $BIN state-write --state .claud
 ```
 
 The binary assigns `rule_<hex>` IDs to new rules and writes atomically. Delete `state-pending.json` after a successful write.
+
+**If `state-write` refuses because a protected rule would change**, it writes nothing and
+prints which rule, which field, and the old and new values. This is the one place the
+pipeline stops and asks a person, so treat it that way:
+
+1. **Do not pass `--allow-protected` to get past the error**, and do not edit the payload to
+   match the prior state so the check goes quiet. Either one silently discards a change that
+   may have been correct, and the second hides that anything happened at all.
+2. Work out which it is. A rule you did not mean to touch means the payload is wrong — the
+   usual cause is retyping the whole document and losing a rule or a field. Rebuild the
+   payload from the Step 4 state and rerun; no flag, no prompt.
+3. A change you *did* mean — the user rejected the rule at Step 10, accepted a supersession
+   over it, or edited it — is a decision only the developer can make. Show them the refusal
+   text verbatim via `AskUserQuestion`: the rule's title, the fields, and old → new. On an
+   affirmative answer, rerun the same write with `--allow-protected <rule_id>` naming exactly
+   the rules they approved (comma-separated for several). On anything else, rebuild the
+   payload leaving those rules as they were.
+4. Count what happened for the Step 13 summary.
+
+`--allow-protected` with an id that names no protected rule is itself an error, so a typo
+cannot read as permission.
 
 ---
 
@@ -438,9 +474,14 @@ New rules proposed:         <N>
   Rejected:                 <N>
   Skipped (deferred):       <N>
 Supersessions accepted:     <N>  (existing rules replaced)
+Protected rules (added by hand): <N>
+  changes approved by you:  <N>
+  changes declined:         <N>
 Files written (skills only — nothing at the repo root):
   .claude/skills/<domain>/SKILL.md  (<N> rules, <inline | chunked index> + <N> examples/rules companion files)
   [...]
+Skills pruned (no approved rules left):
+  <list the "pruned <dir>" warnings write-outputs printed, or "none">
 Promoted to top level:      <"not requested" | "<path> — <created|updated|appended|unchanged|skipped>">
 Stale rules (last_seen_pr is 200+ below current watermark):
   <list titles or "none">

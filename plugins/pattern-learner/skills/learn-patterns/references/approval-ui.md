@@ -122,6 +122,14 @@ Wait for user input per rule:
 - `e` → prompt user to edit title, rule text, or examples inline; re-display updated rule for confirmation
 - `s` → leave as `status: "proposed"` and save a review snapshot: `reviewed_snapshot = {signal_count: <current signal_count>, source_pr_numbers: <sorted list of PR numbers from sources>, source_review_ids: <sorted list of review_ids from sources, omitted when there are none>}`. On the next run the rule will be suppressed unless new signals arrive (signal_count increases, new PR numbers appear, or the rule is now backed by different reviews). Recording `source_review_ids` is what makes that last case work: every review signal reports `pr_number: 0`, so a rule rebuilt from two entirely different reviews has the same PR list as before and would be suppressed as unchanged — hiding exactly the new corroboration the user asked to be watched for.
 
+Two of these keys can change a rule the developer added by hand: `a` on a rule that
+supersedes a manual one (it sets that rule's `status` to `"superseded"`), and `r` or `e` on
+a manual rule itself. `state-write` refuses those writes unless it is told the developer
+approved them, and here the keypress **is** that approval — no second prompt. Note the
+protected rule's id as you go and pass them all on the Step 11 write as
+`--allow-protected <id>[,<id>...]`. Never pass the flag for a rule the user did not decide
+on in this loop.
+
 After all rules are reviewed, display a summary of decisions:
 ```
 You approved <N>, rejected <N>, edited <N>, skipped <N>. Proceed to write state? [y/n]

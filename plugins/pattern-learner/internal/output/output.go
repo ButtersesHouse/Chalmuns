@@ -907,6 +907,13 @@ func pruneStaleSkills(skillsDir string, live map[string][]state.Rule, owner stri
 			warnings = append(warnings, fmt.Sprintf("%s is a generated skill stamped for repository %q with no approved rules in this state; it was left in place because it may have been copied in on purpose — delete it if it is a leftover from before this repository was forked or renamed", dir, info.stamp))
 			continue
 		}
+		// Say what was deleted. A pruned directory is the visible half of a
+		// rule leaving state, and the one case worth catching is a rule that
+		// left because a hand-retyped payload dropped it rather than because
+		// anyone rejected it. state-write refuses that for rules added by
+		// hand, but nothing refuses it for the rest, and a deletion nobody
+		// mentions is one nobody checks.
+		warnings = append(warnings, fmt.Sprintf("pruned %s: no approved rules remain for skill %q", dir, e.Name()))
 		if isLink {
 			if err := os.Remove(dir); err != nil {
 				return warnings, err

@@ -1971,8 +1971,16 @@ func TestRetiredCopyNotFoldedThroughSymlink(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(retired, "notes.md")); err != nil {
 		t.Error("the leftover must be kept")
 	}
-	if w := prepared.Warnings(); len(w) != 1 || !strings.Contains(w[0], "is now a symlink") {
-		t.Errorf("expected a symlink warning, got %v", w)
+	// A pruned "api" also reports itself now, so count the warning this test
+	// is about rather than the whole list.
+	symlinkWarnings := 0
+	for _, w := range prepared.Warnings() {
+		if strings.Contains(w, "is now a symlink") {
+			symlinkWarnings++
+		}
+	}
+	if symlinkWarnings != 1 {
+		t.Errorf("expected exactly one symlink warning, got %v", prepared.Warnings())
 	}
 }
 
@@ -3389,5 +3397,38 @@ func TestWriteManualRuleKeepsReviewCorroboration(t *testing.T) {
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if !strings.Contains(content, "_Source: manually added and code review (code-review)_") {
 		t.Errorf("want both provenances; got:\n%s", content)
+	}
+}
+
+// A pruned skill is the visible half of a rule leaving state, and the run that
+// deletes one and reports nothing looks exactly like a run that deleted
+// nothing. Rules added by hand are refused at state-write before they can get
+// here; every other rule relies on this line to be noticed at all.
+func TestPruneReportsWhatItDeleted(t *testing.T) {
+	dir := t.TempDir()
+	if err := Write(stateWith(approvedRule("Rule", "v1", "api", "stated", 1)), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	next := stateWith(approvedRule("Rule", "x", "ui", "stated", 1))
+	prepared, err := Validate(&next, dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, ".claude", "skills", "api", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatal("the stale skill should have been pruned")
+	}
+	var reported bool
+	for _, w := range prepared.Warnings() {
+		if strings.Contains(w, "pruned") && strings.Contains(w, `"api"`) {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("a deleted skill must name itself in the warnings; got %v", prepared.Warnings())
 	}
 }

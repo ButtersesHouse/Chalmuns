@@ -36,6 +36,21 @@ can be proposed. Approval stays manual by default. The point is the loop: an
 agent generates, the reviewer flags, the rule lands in a domain skill, and the
 next generation is loaded with it.
 
+You can also state a rule yourself, and it stays stated:
+
+```
+/learn-patterns --add "wrap returned errors with %w"
+```
+
+A rule added this way is written with `origin: "manual"`, and the binary treats
+that as a lock. Later mining runs may *append* corroborating sources and examples
+to it, but `state-write` refuses any payload that drops it, rewrites its text,
+retargets it, changes its status, or downgrades its confidence — it names the
+rule and the exact fields, writes nothing, and the run has to ask you before it
+can pass `--allow-protected <rule_id>`. That matters because the pipeline hands
+`state-write` a state document the model retypes in full on every run, so
+"preserve what was there" cannot be left to prose.
+
 ### `skill-right-sizing`
 - **`right-size-skills`** — proposes the cheapest `model:`/`effort:` each skill
   needs (plan-ready report; advisory).

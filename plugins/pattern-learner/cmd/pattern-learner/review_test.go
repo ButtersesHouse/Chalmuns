@@ -520,3 +520,169 @@ func TestRunExtractReview_namesAnUnknownReviewID(t *testing.T) {
 		t.Errorf("explicit selection: want 1 review and no watermark; got %d / %q", len(res.Reviews), res.NextWatermark)
 	}
 }
+
+// seedManualRule writes a state holding one rule the developer added by hand,
+// the shape --add produces, and returns its assigned ID.
+func seedManualRule(t *testing.T, statePath string) string {
+	t.Helper()
+	s := state.Empty()
+	s.Rules = []state.Rule{{
+		Title:      "Wrap errors with %w",
+		Rule:       "Wrap returned errors with fmt.Errorf and %w when propagating.",
+		Target:     state.Target{Location: "api", FileGlob: []string{"internal/api/**/*.go"}},
+		Confidence: "stated",
+		Status:     "approved",
+		Origin:     "manual",
+		Sources: []state.Signal{{
+			Reviewer: "mryave", Date: "2026-09-01",
+			Snippet: "wrap returned errors with %w", Strength: "explicit",
+		}},
+		SignalCount: 1,
+	}}
+	if err := os.MkdirAll(filepath.Dir(statePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Write(statePath, s); err != nil {
+		t.Fatal(err)
+	}
+	got, err := state.Read(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got.Rules[0].ID
+}
+
+// The failure the protected-rule check exists for: Step 11 hands state-write a
+// document the model retyped from scratch, and a manual rule missing from it
+// is erased — after which write-outputs prunes the skill it lived in, with
+// nothing in the summary to say it ever existed.
+func TestRunStateWrite_refusesToDropAManualRule(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	seedManualRule(t, statePath)
+	before, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"schema_version":"1","repo":{"owner":"o","repo":"r"},"last_extracted_pr_number":42,
+	  "rules":[{"title":"mined","rule":"something else","status":"approved","confidence":"emerging","sources":[]}]}`
+	var writeErr error
+	withStdin(t, payload, func() {
+		writeErr = runStateWrite([]string{"--state", statePath})
+	})
+	if writeErr == nil {
+		t.Fatal("dropping a rule the developer added by hand must be refused")
+	}
+	for _, want := range []string{"Wrap errors with %w", "--allow-protected", "nothing was written"} {
+		if !strings.Contains(writeErr.Error(), want) {
+			t.Errorf("the refusal must mention %q so the developer can decide; got:\n%s", want, writeErr)
+		}
+	}
+
+	after, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Error("a refused write must leave the state file untouched, not partly applied")
+	}
+}
+
+// The permission the refusal asks for: the developer said yes, and the run
+// names the rule they approved.
+func TestRunStateWrite_allowProtectedLetsTheChangeThrough(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	id := seedManualRule(t, statePath)
+
+	payload := `{"schema_version":"1","repo":{"owner":"o","repo":"r"},
+	  "rules":[{"title":"mined","rule":"something else","status":"approved","confidence":"emerging","sources":[]}]}`
+	withStdin(t, payload, func() {
+		if err := runStateWrite([]string{"--state", statePath, "--allow-protected", id}); err != nil {
+			t.Fatalf("an approved override must be honoured: %v", err)
+		}
+	})
+
+	got, err := state.Read(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rules) != 1 || got.Rules[0].Title != "mined" {
+		t.Errorf("the approved payload must be written as given; got %+v", got.Rules)
+	}
+}
+
+// Mining a manual rule is the pipeline doing its job. Only overriding is
+// refused, so a payload that appends corroboration needs no flag.
+func TestRunStateWrite_manualRuleMayBeStrengthenedWithoutPermission(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	id := seedManualRule(t, statePath)
+
+	payload := `{"schema_version":"1","repo":{"owner":"o","repo":"r"},"rules":[{
+	  "id":"` + id + `","title":"Wrap errors with %w",
+	  "rule":"Wrap returned errors with fmt.Errorf and %w when propagating.",
+	  "target":{"location":"api","file_glob":["internal/api/**/*.go"]},
+	  "confidence":"established","status":"approved","origin":"manual","signal_count":2,"last_seen_pr":118,
+	  "sources":[
+	    {"reviewer":"mryave","date":"2026-09-01","snippet":"wrap returned errors with %w","strength":"explicit"},
+	    {"pr_number":118,"reviewer":"someone-else","date":"2026-09-05","snippet":"please wrap this","strength":"implicit"}
+	  ]}]}`
+	withStdin(t, payload, func() {
+		if err := runStateWrite([]string{"--state", statePath}); err != nil {
+			t.Fatalf("appending a mined source to a manual rule must not need permission: %v", err)
+		}
+	})
+
+	got, err := state.Read(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rules) != 1 || len(got.Rules[0].Sources) != 2 || got.Rules[0].Origin != "manual" {
+		t.Errorf("the corroborated rule must be written and stay the developer's; got %+v", got.Rules)
+	}
+}
+
+// An --allow-protected that matches nothing is a typo, and a typo that reads
+// as permission is worse than no gate at all.
+func TestRunStateWrite_allowProtectedUnknownIDIsRefused(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	seedManualRule(t, statePath)
+
+	payload := `{"schema_version":"1","rules":[]}`
+	var writeErr error
+	withStdin(t, payload, func() {
+		writeErr = runStateWrite([]string{"--state", statePath, "--allow-protected", "rule_typo"})
+	})
+	if writeErr == nil || !strings.Contains(writeErr.Error(), "rule_typo") {
+		t.Fatalf("an override naming no protected rule must be refused by name; got %v", writeErr)
+	}
+}
+
+// A state file that will not parse cannot be checked, and writing over it
+// discards exactly the rules the check protects.
+func TestRunStateWrite_refusesAnUnparseablePriorState(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	if err := os.MkdirAll(filepath.Dir(statePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte("{ this is not json"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var writeErr error
+	withStdin(t, `{"schema_version":"1","rules":[]}`, func() {
+		writeErr = runStateWrite([]string{"--state", statePath})
+	})
+	if writeErr == nil {
+		t.Fatal("a corrupt state file must not become the way past the protected-rule check")
+	}
+}
+
+// The flag belongs to state-write alone; cliflags refuses it elsewhere rather
+// than ignoring it, which is how --skils-dir once pruned the wrong directory.
+func TestAllowProtectedIsStateWriteOnly(t *testing.T) {
+	_, statePath, _ := projectFixture(t)
+	err := runStateRead([]string{"--state", statePath, "--allow-protected", "rule_x"})
+	if err == nil || !strings.Contains(err.Error(), "unknown flag") {
+		t.Errorf("state-read must reject --allow-protected; got %v", err)
+	}
+}
