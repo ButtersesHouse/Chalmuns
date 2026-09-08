@@ -884,19 +884,17 @@ func isAssignedCredential(text string, loc []int) bool {
 		// file that does not exist, in the text grounding checks against.
 		return false
 	}
-	if namesSomething(value) {
-		// A name the reviewer quoted, or an indirection standing in for the
-		// credential: `cfg.OAuth2Token`, `SHA256_DIGEST`, `sessionToken2`,
-		// `${POSTGRES_PASSWORD}`, `process.env.API_KEY`, a scanner's own rule
-		// id. The same test the array branch uses, so a value is judged the
-		// same way wherever it turns up.
+	if isIndirection(value) {
+		// A reference standing where the credential would be. This is the one
+		// value test that outranks the assignment syntax below, because
+		// `password: $DB_PASSWORD` is the commonest line in a scanned config
+		// and there is no reading of it that holds a secret.
 		//
-		// This sits above the assignment branch because the commonest line in a
-		// scanned config is `password: $DB_PASSWORD`, and reading the syntax
-		// alone rewrote it into a hardcoded secret. It is safe there only
-		// because the shape tests are the strict ones — no whitespace, every
-		// piece a bounded word — which is what `password: "p@ss w0rd.1"` and
-		// `AWS_SECRET_ACCESS_KEY: WJALRX…_K7MDENG…` fail on.
+		// It is deliberately this narrow. Letting the whole name test outrank
+		// the syntax was tried, and it excused `password: myPassword123`,
+		// `password: sup3rS3cret` and a scanner echoing `lines: "  password:
+		// dbHunter2pass"` — which is the module's primary input shape. Where
+		// the line says it is an assignment, the assignment wins.
 		return false
 	}
 	if beginsItsUnit(text, loc[0]) {
@@ -912,10 +910,17 @@ func isAssignedCredential(text string, loc []int) bool {
 	// describing it, and reading "is committed" as words after the value left
 	// the credential in the artifact.
 	//
-	// Dropping those words leaves the value to settle it alone, which is safe
-	// only because a value that names something has already been let go above.
+	// Dropping those words leaves the value to settle it alone, so a value that
+	// names something is let go first — here, below the assignment branch,
+	// where the surroundings really have left the judgement to the value.
 	if end := markdownSpanEnd(text, loc[0]); end >= loc[4]+len(value) {
 		rest = text[loc[4]+len(value) : end]
+	}
+	if namesSomething(value) {
+		// `cfg.OAuth2Token`, `SHA256_DIGEST`, `sessionToken2`, a scanner's own
+		// rule id. The same test the array branch uses, so a value is judged
+		// the same way wherever the surroundings leave the judgement to it.
+		return false
 	}
 	// A name with words before it is prose. Only a value that could be
 	// nothing else is taken from it: one token, carrying a digit — an
@@ -925,6 +930,21 @@ func isAssignedCredential(text string, loc []int) bool {
 		strings.ContainsAny(value, "0123456789") &&
 		!followedByWords(rest)
 }
+
+// isIndirection reports whether a value points at a credential rather than
+// being one: a shell or template expansion, or an environment lookup. These are
+// the only shapes allowed to overrule a line that spells out an assignment,
+// because they are unambiguous — nothing spells a literal secret `$DB_PASSWORD`
+// — and because a config that does this right is the config a scanner flags
+// least and quotes most.
+func isIndirection(value string) bool {
+	return strings.HasPrefix(value, "$") ||
+		strings.HasPrefix(value, "{{") ||
+		(strings.HasPrefix(value, "<") && strings.HasSuffix(value, ">")) ||
+		reEnvLookup.MatchString(value)
+}
+
+var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
 // rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
@@ -1026,9 +1046,12 @@ func carriesAPassword(value string) bool {
 		return strings.Contains(userinfo[i+3:], ":")
 	}
 	// With no scheme in front of it, everything before the `@` is userinfo only
-	// if it reads like one. `com.example:lib:1.2.3@aar` is a package
-	// coordinate, and the dots are what say so.
-	return strings.Contains(userinfo, ":") && !strings.Contains(userinfo, ".")
+	// if it reads like one — and userinfo is `user:pass`, exactly one colon.
+	// Testing for a dot instead was one dot away from being wrong in both
+	// directions at once: `first.last:s3cr3tpassw0rd@db` was excused, and
+	// `com.example:lib:1.2.3@aar` is a package coordinate that the colon count
+	// tells apart on its own.
+	return strings.Count(userinfo, ":") == 1
 }
 
 func isNameSeparator(r rune) bool {
@@ -1229,17 +1252,35 @@ func isFileReference(value string) bool {
 // name is: words, with at most an acronym's worth of capitals together, and no
 // digits mixed through it.
 //
-// Both halves are needed and each one alone failed. Digits alone rewrote
-// `ProductionAPIGatewayCertificate.pem`, because a name that long usually has
-// an acronym in it. Case alone excused
-// `uploads/a8f3d9e2c1b47f60a8f3d9e2c1b47f60a8f3d9e2.dat`, because lowercase
-// hex reads as a word to any test that only looks at capitals.
+// Neither half alone was enough. Case alone excused
+// `uploads/a8f3d9e2c1b47f60a8f3d9e2c1b47f60a8f3d9e2.dat`, because lowercase hex
+// reads as a word to any test that only looks at capitals. Banning digits
+// outright — the first correction — rewrote every long file name that carries
+// one, and long file names carry them:
+// `UserAuthenticationTokenProviderFactoryImpl2.java`,
+// `Auth2FactorEnrollmentDialogContainer.tsx`. So the digit rule is about the
+// stem being *nothing but* hex, which is what a content hash is and what a
+// name never is.
 func readsAsWords(seg string) bool {
-	if strings.ContainsAny(seg, "0123456789") {
+	stem := seg
+	if i := strings.LastIndexByte(stem, '.'); i > 0 {
+		stem = stem[:i]
+	}
+	if isHex(stem) {
 		return false
 	}
 	sh := shapeOf(seg)
 	return sh.hasLower && sh.maxCaps < maxCapsRun
+}
+
+// isHex reports whether a string is nothing but hexadecimal digits.
+func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	return strings.IndexFunc(s, func(r rune) bool {
+		return !strings.ContainsRune("0123456789abcdefABCDEF", r)
+	}) < 0
 }
 
 // How long a piece of a path may run. maxUnbrokenPathRunes is the stricter

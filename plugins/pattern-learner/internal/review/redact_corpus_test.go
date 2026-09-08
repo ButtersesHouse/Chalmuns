@@ -109,9 +109,10 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a capitalised array credential", `{"passwords":["aB8f3d9e2c1b47f60"]}`, "aB8f3d9e2c1b47f60", "passwords"},
 	{"a slashed array credential", `{"passwords":["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]}`, "wJalrXUtnFEMI", "passwords"},
 	{"a jwt in an array", `{"tokens":["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc"]}`, "eyJhbGciOiJIUzI1NiJ9", "tokens"},
-	// A line-start assignment is the strongest signal there is, so the value
-	// test does not apply there: a credential chunked to look like a qualified
-	// name is still redacted when the syntax says it is one.
+	// A line-start assignment is the strongest signal there is, so the name test
+	// does not apply there: a credential chunked to look like a qualified name
+	// is still redacted when the syntax says it is one. The single exception is
+	// an indirection — `password: $DB_PASSWORD` — which the proseCorpus pins.
 	{"a chunked credential in an assignment", `secret: aB3xY9zQ7wE.rT5yU8iO2p.aS4dF7gH1j`, "aB3xY9zQ7wE", "secret"},
 	{"a quoted passphrase with a dot", `password: "p@ss w0rd.1"`, "p@ss w0rd.1", "password"},
 	{"a capitalised constant-shaped credential", `AWS_SECRET_ACCESS_KEY: WJALRXUTNFEMI_K7MDENGBPXRFICYEXAMPLEKEY`, "WJALRXUTNFEMI", "AWS_SECRET_ACCESS_KEY"},
@@ -132,6 +133,21 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	// them.
 	{"a credential inside a listed sentence", `{"secrets":["Hardcoded key AKIAIOSFODNN7EXAMPLE in app.py"]}`, "AKIAIOSFODNN7EXAMPLE", "app.py"},
 	{"a connection string in a list", `{"credentials":["postgres://admin:sup3rS3cret@db.internal:5432/app"]}`, "sup3rS3cret", "credentials"},
+	// Rows for the leaks the twenty-ninth review found, and a second sample for
+	// every class the rounds before it pinned by its literal. Each row above was
+	// passing for a reason the class does not guarantee — one 32-rune piece, a
+	// username with no dot in it — so each is doubled here with a value chosen
+	// so it cannot pass by accident. Pinning the literal instead of the class
+	// is what let six rounds trade one direction for the other.
+	{"a chunked hex credential", `api_key: 0F8A2B_C4D6E8FA_0B2C4D6E_8FA0B2C4`, "0F8A2B", "api_key"},
+	{"a chunked base64 credential", `AWS_SECRET_ACCESS_KEY: wJalrX_UtnFEMI_K7MDENG_bPxRfiCY`, "wJalrX", "AWS_SECRET_ACCESS_KEY"},
+	{"a camelcase password in an assignment", `password: myPassword123`, "myPassword123", "password"},
+	{"a leetspeak password in an assignment", `password: sup3rS3cret`, "sup3rS3cret", "password"},
+	{"an identifier-shaped password in an assignment", `token: sessionToken2`, "sessionToken2", "token"},
+	{"a dotted password in an assignment", `password: hunter2.trustno1`, "hunter2.trustno1", "password"},
+	{"a camelcase password echoed from a config", `{"results":[{"extra":{"lines":"  password: dbHunter2pass"}}]}`, "dbHunter2pass", "results"},
+	{"a dotted username in userinfo", `{"credentials":["first.last:s3cr3tpassw0rd@db.internal:5432"]}`, "s3cr3tpassw0rd", "credentials"},
+	{"a dotted password in userinfo", `{"credentials":["admin:sup3r.S3cret@db.internal"]}`, "sup3r.S3cret", "credentials"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -261,13 +277,33 @@ var proseCorpus = []struct{ name, in string }{
 	{"a shell env indirection", `password: $DB_PASSWORD`},
 	{"a braced env indirection", `password: ${POSTGRES_PASSWORD}`},
 	{"an env lookup echoed from a config", `{"extra":{"lines":"api_key: process.env.API_KEY"}}`},
-	{"a config field in a span", "- `token: cfg.OAuth2Token`"},
-	{"a constant in a span", "- **secret: SHA256_DIGEST**"},
 	{"a package coordinate in a list", `{"secrets":["com.example:lib:1.2.3@aar"]}`},
+	// A long file name carries a digit as often as not; banning them rewrote
+	// the classes a real project has.
+	{"a digit in a long cited path", "- The private_key: internal/auth/UserAuthenticationTokenProviderFactoryImpl2.java is committed"},
+	{"a digit in a long component path", "- The secret: packages/web/src/components/Auth2FactorEnrollmentDialogContainer.tsx holds it"},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
 	{"a heading ending in a colon", "## Findings\n\n### 1. Hardcoded credential:\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nThe endpoint is unbounded.\n"},
+}
+
+// acceptedRewrites are the reviewer's own words this deliberately rewrites —
+// the knownLimitations list in the other direction, and asserted for the same
+// reason: an over-redaction that nothing pins is one nobody notices.
+//
+// A span holding nothing but `name: value`, with no sentence after it, is
+// indistinguishable from the assignment it quotes: "`api_key: abcdefghijkl`"
+// and "- `token: cfg.OAuth2Token`" are the same shape, and the corpus requires
+// the first to be redacted. The direction is chosen: a credential emitted into
+// a committed artifact reads exactly like a clean scan, while a rewritten
+// identifier is visible in the artifact next to the finding it belongs to. And
+// the shape is rare — a reviewer quoting code says something about it, and once
+// there is a sentence after the span the name survives, which the rows above
+// pin.
+var acceptedRewrites = []struct{ name, in, rewritten string }{
+	{"a config field in a bare span", "- `token: cfg.OAuth2Token`", "cfg.OAuth2Token"},
+	{"a constant in a bare span", "- **secret: SHA256_DIGEST**", "SHA256_DIGEST"},
 }
 
 // mustStayValid: redaction may not make a document unparseable. A watcher
@@ -330,6 +366,18 @@ func TestRedactSecrets_knownLimitations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := redactSecrets(tc.in); !strings.Contains(got, tc.survives) {
 				t.Errorf("this is now caught — update knownLimitations:\n  in:  %q\n  out: %q", tc.in, got)
+			}
+		})
+	}
+}
+
+// The other direction of the same discipline: a change that stops rewriting one
+// of these is welcome, and has to say so here rather than passing silently.
+func TestRedactSecrets_acceptedRewrites(t *testing.T) {
+	for _, tc := range acceptedRewrites {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactSecrets(tc.in); strings.Contains(got, tc.rewritten) {
+				t.Errorf("this is now left alone — move it to proseCorpus:\n  in:  %q\n  out: %q", tc.in, got)
 			}
 		})
 	}
