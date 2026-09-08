@@ -574,19 +574,38 @@ var secretPatterns = []*regexp.Regexp{
 }
 
 // The `name: value` shape — how YAML, an env dump and a header dump all spell
-// it, in each of its quotings. A bare name before a colon is also ordinary
-// prose, so what follows is judged by looksLikeCredential rather than by the
-// pattern. Group 1 is the name and its delimiter, group 2 the closing one.
+// it, in each of its quotings. Group 1 is everything up to and including the
+// delimiter, group 2 the value, group 3 the closing delimiter.
 //
+// The name must begin what encloses it — a line, or a string inside a JSON
+// document — and nothing may follow the value on that line but punctuation.
+// That is what separates a config assignment from a review sentence, and it is
+// the question four rounds of judging the *value* kept getting wrong in one
+// direction or the other: `password: "p@ss w0rd"` and `- The credential:
+// "auth.go" is missing` have values no test of the value alone tells apart,
+// while their surroundings are not alike at all.
+//
+// A string start counts as well as a line start because the shape that
+// matters most has no newline in it: a secret scanner echoes the offending
+// source line, and the whole report arrives as one line of JSON.
+const (
+	unitStart = `(?:(?m:^)|\\?"|')[\s\-*>|{,\[]*`
+	// What follows the value, up to the end of its line or its string. It is
+	// captured rather than asserted because RE2 has no lookahead, and it is
+	// what tells `apiKey:process.env.API_KEY is read at startup` — a reviewer
+	// quoting code — from a config line.
+	unitRest = `([^\n"]*)`
+)
+
 // The value classes are bounded to a line and to their own quote, and exclude
 // the backslash. A class that fell back to "anything but a quote" ran to the
 // end of the review whenever the next character was a newline, taking every
 // finding after it; one that swallowed a trailing `\` ate the escape of the
 // `\"` that ended the enclosing JSON string and left the document invalid.
 var colonForms = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')([^'\n]*)(')`),
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*)([^\s"',;)\]}\\]+)()`),
+	regexp.MustCompile(`(?i)` + unitStart + `([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)` + unitRest),
+	regexp.MustCompile(`(?i)` + unitStart + `([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*')([^'\n]*)(')` + unitRest),
+	regexp.MustCompile(`(?i)` + unitStart + `([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*)([^\s"',;)\]}\\]+)()` + unitRest),
 }
 
 func redactColonForm(text string) string {
@@ -599,10 +618,14 @@ func redactColonForm(text string) string {
 		}
 		text = re.ReplaceAllStringFunc(text, func(m string) string {
 			g := re.FindStringSubmatch(m)
-			if !looksLikeCredential(g[2]) {
+			if !looksLikeCredential(g[2]) || reLetter.MatchString(g[4]) {
+				// Words after the value mean this was a sentence, not an
+				// assignment.
 				return m
 			}
-			return g[1] + redactedSentinel + g[3]
+			// The leading characters are outside every group, so they are
+			// restored from the match rather than rebuilt.
+			return strings.TrimSuffix(m, g[1]+g[2]+g[3]+g[4]) + g[1] + redactedSentinel + g[3] + g[4]
 		})
 	}
 	return text
@@ -615,32 +638,18 @@ func redactColonForm(text string) string {
 // `- The api_key: internal/auth/token.go is unused`. Those are the reviewer's
 // own words, and rewriting them into a finding that cites a file which does
 // not exist is the failure this whole pattern set is bounded against.
-func looksLikeCredential(value string) bool {
-	value = strings.TrimSpace(value)
-	if len([]rune(value)) < 6 {
-		return false
-	}
-	// A credential is one token. A phrase is the reviewer talking: `###
-	// Hardcoded password: "must be at least 12 characters"` is a finding, and
-	// rewriting it makes the artifact say something else.
-	if strings.ContainsAny(value, " \t\n") {
-		return false
-	}
-	if !reFileRef.MatchString(value) {
-		return true
-	}
-	// It ends in something that reads as a file extension. A long unbroken run
-	// with no path separator is a credential anyway — a JWT's last segment
-	// looks like one — while `internal/auth/token_provider.go` is a path the
-	// reviewer cited, and redacting that makes the finding name a file that
-	// does not exist.
-	return !strings.Contains(value, "/") && len([]rune(value)) >= 24
-}
+var reLetter = regexp.MustCompile(`[A-Za-z]`)
 
-// reFileRef matches what a review sentence puts after a colon: a file the
-// reviewer cited. Rewriting one into `[redacted]` makes the finding cite a
-// path that does not exist, in the text grounding checks the quote against.
-var reFileRef = regexp.MustCompile(`(?:^|/)[A-Za-z0-9_.-]+\.[A-Za-z]{1,4}$`)
+func looksLikeCredential(value string) bool {
+	// Six characters, and nothing else. Everything the value-shape tests used
+	// to carry — no whitespace, not a file reference, long enough to be a JWT
+	// — was standing in for a question the line already answers, and each of
+	// them was wrong in one direction: rejecting whitespace lost `password:
+	// "p@ss w0rd"`, rejecting a slash lost a base64 secret, allowing any long
+	// value rewrote every cited path over 23 characters. The floor is here
+	// only so `token: yes` reads as the sentence it is.
+	return len([]rune(strings.TrimSpace(value))) >= 6
+}
 
 // keyLineBreak is how one line of a PEM key is separated from the next in the
 // text this package sees: a real newline, indented or not, or a JSON escape.

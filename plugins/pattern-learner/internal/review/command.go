@@ -122,6 +122,9 @@ func calledProgram(call *syntax.CallExpr) []string {
 			case inquiryFlags[wrapper][word]:
 				// `command -v semgrep` prints a path; it runs nothing.
 				return out
+			case strings.Contains(word, "="):
+				// `--loglevel=verbose` carries its value; nothing follows.
+				continue
 			case valueFlags[wrapper][word]:
 				i++
 				continue
@@ -154,19 +157,32 @@ func calledProgram(call *syntax.CallExpr) []string {
 // `sudo -u ci semgrep .` reported a run of ci.
 var (
 	valueFlags = map[string]map[string]bool{
-		"sudo":    {"-u": true, "-g": true, "-p": true, "-C": true, "-h": true},
+		"sudo": {"-u": true, "-g": true, "-p": true, "-C": true, "-h": true,
+			"--user": true, "--group": true, "--prompt": true, "--chdir": true,
+			"--close-from": true, "--host": true, "--role": true, "--type": true},
 		"env":     {"-u": true, "-C": true, "--unset": true, "--chdir": true},
 		"timeout": {"-s": true, "-k": true, "--signal": true, "--kill-after": true},
 		"nice":    {"-n": true, "--adjustment": true},
 		"exec":    {"-a": true},
-		"xargs":   {"-a": true, "-I": true, "-n": true, "-P": true, "-d": true, "-s": true},
-		"yarn":    {"--cwd": true},
-		"npx":     {"-p": true, "--package": true, "-c": true, "--call": true},
-		"npm":     {"-w": true, "--workspace": true, "--prefix": true},
-		"pnpm":    {"-C": true, "--dir": true, "--filter": true},
-		"uv":      {"--with": true, "--python": true},
-		"uvx":     {"--with": true, "--python": true, "-p": true},
-		"poetry":  {"-C": true, "--directory": true},
+		"xargs": {"-a": true, "-I": true, "-i": true, "-n": true, "-P": true,
+			"-d": true, "-s": true, "-L": true, "-l": true, "-E": true,
+			"--max-args": true, "--max-procs": true, "--max-chars": true,
+			"--max-lines": true, "--arg-file": true, "--replace": true,
+			"--delimiter": true, "--eof": true},
+		"yarn": {"--cwd": true},
+		// A subcommand's own flags. `wrapper` follows the chain, so `uv run
+		// --with x semgrep .` consults this rather than uv's table, and an
+		// entry filed only under the top-level program was never reached.
+		"run": {"--with": true, "--python": true, "--directory": true,
+			"-C": true, "--cwd": true, "-w": true, "--workspace": true,
+			"--prefix": true, "--filter": true},
+		"tool":   {"--with": true, "--python": true},
+		"npx":    {"-p": true, "--package": true, "-c": true, "--call": true},
+		"npm":    {"-w": true, "--workspace": true, "--prefix": true, "--loglevel": true},
+		"pnpm":   {"-C": true, "--dir": true, "--filter": true},
+		"uv":     {"--with": true, "--python": true, "--directory": true},
+		"uvx":    {"--with": true, "--python": true, "-p": true},
+		"poetry": {"-C": true, "--directory": true},
 	}
 	// After these, the wrapper reports on a program rather than running it.
 	inquiryFlags = map[string]map[string]bool{

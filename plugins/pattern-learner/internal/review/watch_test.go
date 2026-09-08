@@ -620,6 +620,11 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		// reaches `slice bounds out of range` in v3.8.0's lexer, and the hook
 		// is wrapped in `|| true`, so the process would die silently.
 		{"input that panics the parser", "''`$\\\\", false},
+		// A line bash salvages — it warns about the unclosed backtick and runs
+		// what follows — that the parser rejects outright. The capture is
+		// lost, which is the safe direction and is documented in command.go;
+		// the row is here so a change to that path is visible.
+		{"a line the parser rejects", "echo `echo \"$\\\"`; semgrep --json .", false},
 		// What a wrapper's own arguments look like: a flag that takes a value,
 		// an operand of the wrapper's own, and a flag after which nothing runs.
 		{"a wrapper flag taking a value", `sudo -u ci semgrep .`, true},
@@ -630,6 +635,15 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"yarn from another directory", `yarn --cwd sub semgrep .`, true},
 		{"command -v reports, it does not run", `command -v semgrep`, false},
 		{"builtin command -v reports too", `builtin command -v semgrep`, false},
+		// The long spellings and the subcommands' own flags: an entry filed
+		// under the top-level program was never reached once `wrapper`
+		// followed the chain to `run`.
+		{"a long-form wrapper flag", `sudo --user ci semgrep .`, true},
+		{"an xargs count flag", `xargs -L 1 semgrep`, true},
+		{"an xargs long count flag", `xargs --max-procs 4 semgrep`, true},
+		{"a subcommand flag", `uv run --with x semgrep .`, true},
+		{"poetry run from a directory", `poetry run --directory dir semgrep .`, true},
+		{"a flag carrying its own value", `npm --loglevel=verbose run semgrep`, true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -1016,5 +1030,21 @@ func TestFromHook_aCleanStructuredRunIsNotRecorded(t *testing.T) {
 		`"tool_response":{"stdout":"The auth package looks right; nothing to flag this round."}}`
 	if _, _, ok := FromHook([]byte(prose), ws, fixed); !ok {
 		t.Error("a prose review with no parsed findings still has something to say")
+	}
+}
+
+// A wrapper's flag values are not programs. `sudo --user semgrep eslint .`
+// runs eslint as the user "semgrep", and reading the username as the program
+// filed eslint's findings under a semgrep designation — a review attributed to
+// a tool that never ran, which this path treats as the worst outcome.
+func TestMatch_aFlagValueIsNotTheProgram(t *testing.T) {
+	semgrep := watchers(t, "semgrep:tool")
+	eslint := watchers(t, "eslint:tool")
+	const cmd = `sudo --user semgrep eslint .`
+	if Match(semgrep, "Bash", "", cmd) != nil {
+		t.Errorf("the username was read as the program: %q", invocations(cmd))
+	}
+	if Match(eslint, "Bash", "", cmd) == nil {
+		t.Errorf("the program itself was missed: %q", invocations(cmd))
 	}
 }

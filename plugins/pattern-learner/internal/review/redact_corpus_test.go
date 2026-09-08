@@ -63,6 +63,14 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a colon with no space", `password:hunter2trustno1`, "hunter2trustno1", "password"},
 	{"an indented pem", "private_key: |\n  -----BEGIN RSA PRIVATE KEY-----\n  MIIEowIBAAKCAQEAy8Dbv8prpJ\n  -----END RSA PRIVATE KEY-----\n", "MIIEowIBAAKCAQEA", "private_key"},
 	{"a pem inside a JSON string", `{"path":"deploy/key.pem","lines":"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAy8Dbv8prpJ\n-----END RSA PRIVATE KEY-----"}`, "MIIEowIBAAKCAQEA", "deploy/key.pem"},
+	// A credential is judged by what encloses it, not by its own shape, so
+	// these no longer depend on the value looking a particular way.
+	{"a quoted value with a space", `password: "p@ss w0rd"`, "p@ss w0rd", "password"},
+	{"a single-quoted value with a space", `secret: 'p@ss w0rd'`, "p@ss w0rd", "secret"},
+	{"a slashed value ending in an extension", `aws_secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLE.key`, "wJalrXUtnFEMI", "aws_secret_access_key"},
+	{"a config line echoed inside JSON", `{"results":[{"extra":{"lines":"  aws_secret_access_key: wJalrXUtnFEMI/K7MDENG"}}]}`, "wJalrXUtnFEMI", "results"},
+	{"a config line echoed beside a message", `{"results":[{"extra":{"lines":"password: hunter2trustno1"},"m":"Do not commit"}]}`, "hunter2trustno1", "Do not commit"},
+	{"a yaml list item", "- password: hunter2trustno1", "hunter2trustno1", "password"},
 }
 
 // mustNotRedact: the reviewer's own words, untouched. Every one of these was
@@ -97,6 +105,12 @@ var proseCorpus = []struct{ name, in string }{
 	// One unbalanced quote after a secret-ish name deleted every finding up to
 	// the next quote in the review.
 	{"an unbalanced quote after a name", "## Findings\n\n### 1. Hardcoded password: \"admin — see the note\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nUse a \"token bucket\" here.\n\n### 3. Retry loop never backs off\n"},
+	// Code the reviewer quoted, and a value with words after it: an
+	// assignment's line ends at the value, a sentence's does not.
+	{"a struct field in prose", "- The struct sets Token:tokenValue without validation"},
+	{"a section name after a colon", "Note the password:overview section"},
+	{"a code fragment with prose after it", "apiKey:process.env.API_KEY is read at startup"},
+	{"a short value", "token: yes"},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
 	{"a heading ending in a colon", "## Findings\n\n### 1. Hardcoded credential:\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nThe endpoint is unbounded.\n"},
@@ -128,6 +142,8 @@ var jsonCorpus = []string{
 	// A credential in the middle of a nested string, with report text after
 	// it: a value class that ate the escaped quote deleted everything between.
 	`{"results":[{"extra":{"lines":"{\"api_key\": \"abc123def\", \"note\": \"this is the finding text\"}"}}],"version":"1.55"}`,
+	`{"results":[{"extra":{"lines":"  password: hunter2trustno1"},"m":"x"}]}`,
+	`{"api_key":"abc def"}`,
 }
 
 func TestRedactSecrets_removesCredentials(t *testing.T) {
