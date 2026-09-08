@@ -150,9 +150,12 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	// reports and the work of every mining run. `capture-review --file` still
 	// records whatever it is handed: there someone asked for it.
 	//
-	// Prose is exempt. A markdown review's whole content is its text, so
-	// "no parsed findings" says nothing about whether it has anything to say.
-	if len(art.Findings) == 0 && art.Format != FormatMarkdown {
+	// Prose is exempt, but only when there is prose. A response that is just
+	// the runner's account of the call — `{"cwd":"/home/me/client-project",
+	// "exit_code":0}` — sniffs as markdown because no parser claims it, so
+	// exempting every markdown capture wrote one content-free artifact per run
+	// into the repository forever, private paths included.
+	if len(art.Findings) == 0 && (art.Format != FormatMarkdown || isOnlyBookkeeping(text)) {
 		return Artifact{}, state.Watcher{}, false
 	}
 	return art, *matched, true
@@ -390,13 +393,16 @@ func valueText(v interface{}, depth int) string {
 		// stderr prose into the grounding corpus two lines after ruling it out
 		// as review text.
 		if report == "" {
-			// A map carrying a `findings` key is a review payload by
-			// construction, even when its vocabulary is one the findings
-			// parser does not know — Snyk, Trivy and Security Hub all use the
-			// key with fields of their own. Refusing it as prose recorded
-			// nothing at all for a designated run of any of them.
-			_, named := t["findings"]
-			consider(reportPayload(t), named)
+			// Offered as prose as well as as a report. A decoded payload may
+			// use a vocabulary the parsers do not know — Snyk, Trivy and
+			// Security Hub all spell findings their own way, and one may sit
+			// a level down under a key of the runner's choosing — and
+			// refusing all of that recorded nothing at all for a designated
+			// run of any of them. What is left after the runner's own fields
+			// are dropped is either a report or nothing; nothing marshals to
+			// "" and is not considered, and isOnlyBookkeeping backstops the
+			// rest at the end of FromHook.
+			consider(reportPayload(t), true)
 		}
 
 		switch {
@@ -440,38 +446,77 @@ func marshalText(v interface{}) string {
 // it, an argv under one key was stripped while the same array under another
 // was not, and re-encoding what it kept reordered keys, escaped angle brackets
 // and rewrote large integers in text this package documents as byte-for-byte.
-// A pattern over the text has none of those failure modes: JSON, JSON Lines,
-// a truncated document, prose quoting a config, a nested log — all the same.
+// A pattern over the text has none of those failure modes: JSON, JSON Lines, a
+// truncated document, prose quoting a config, a nested log — all the same.
 //
-// What it catches is a name that says "secret" beside its value, and the token
-// shapes that are recognisable on their own. That is a list, and a list is
-// never complete; it is a backstop, not a guarantee, which is why the label a
-// capture records still names the reviewer and never the command line.
+// It has the opposite risk, and the patterns are written against it: matching
+// the reviewer's own words. A rule that fired on any word containing "token"
+// followed by a colon rewrote `- The credential: check is missing` into a
+// finding that said something else, in the text verify-grounding matches a
+// signal's quote against. So a name is only a credential's name where the
+// syntax says it is holding a value — `NAME=`, or a quoted JSON key — and a
+// value that is a container or a number is left alone, which also keeps the
+// document valid for the parser that reads it next.
+//
+// What it catches is a list, and a list is never complete; it is a backstop,
+// not a guarantee, which is why the label a capture records still names the
+// reviewer and never the command line.
 func redactSecrets(text string) string {
+	// One scan to decide whether any pattern can match. Each replacement below
+	// copies the whole text whether or not it changes anything, and this runs
+	// after every matching tool call, on output that can be megabytes.
+	if !reSecretHint.MatchString(text) {
+		return text
+	}
 	for _, re := range secretPatterns {
-		text = re.ReplaceAllString(text, "${1}[redacted]")
+		text = re.ReplaceAllString(text, "${1}[redacted]${2}")
 	}
 	return reBareSecret.ReplaceAllString(text, "[redacted]")
 }
 
+// secretName is the part of a field name that says what the field holds.
+const secretName = `(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential)`
+
+// reSecretHint is the cheap pre-filter: if none of these appears, no pattern
+// below can match.
+var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
+	`|authorization|\bsk-|\bghp_|\bgho_|\bgithub_pat_|\bxox|\bAKIA|\bAIza|BEGIN [A-Z ]*PRIVATE KEY`)
+
+// Each pattern keeps group 1 (the name and the syntax that introduces the
+// value) and group 2 (the closing quote, where there is one), replacing only
+// what lies between them.
 var secretPatterns = []*regexp.Regexp{
 	// An Authorization header, whose value is the credential itself. First,
-	// because the generic rule below would stop at the scheme word and leave
-	// the credential after it.
-	regexp.MustCompile(`(?i)(authorization\s*[:=]\s*["']?(?:bearer|basic|token)?\s*)[^\s"',;)\]}]+`),
-	// NAME=value, "NAME": "value", NAME: value — however the payload spells
-	// it, for a name that announces what it holds.
-	regexp.MustCompile(`(?i)(["']?[A-Za-z0-9_.-]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)[A-Za-z0-9_.-]*["']?\s*[:=]\s*["']?)[^\s"',;)\]}]+`),
+	// because the name rules below would stop at the scheme word and leave the
+	// credential after it. The name may be quoted, as it is in a JSON object.
+	regexp.MustCompile(`(?i)(["']?authorization["']?\s*[:=]\s*")(?:bearer |basic |token )?[^"]*(")`),
+	// Unquoted, the scheme word is required: without it, `- Authorization: the
+	// middleware is skipped` is a sentence, and redacting its next word
+	// rewrote the reviewer's finding into a different one.
+	regexp.MustCompile(`(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic|token) )[^\s"',;)\]}]+()`),
+	// A quoted value, whose end is its closing quote rather than the first
+	// space: `MY_PASSWORD='p@ss w0rd'` leaked everything after the space.
+	regexp.MustCompile(`(?i)(["']?[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["']?\s*[:=]\s*")[^"]*(")`),
+	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*\s*[:=]\s*')[^']*(')`),
+	// An unquoted shell assignment. The `=` is what marks it as one: a bare
+	// colon in prose is not, and treating it as one rewrote the review.
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*=)[^\s"',;)\]}]+()`),
 	// A flag naming the value that follows it.
-	regexp.MustCompile(`(?i)(--?(?:token|password|secret|api[_-]?key|access[_-]?key)[= ])[^\s"',;)\]}]+`),
+	regexp.MustCompile(`(?i)(--?(?:token|password|secret|api[_-]?key|access[_-]?key)[= ])[^\s"',;)\]}]+()`),
 }
 
 // reBareSecret matches the token shapes that identify themselves without a
-// name beside them — an argv entry, a line of a traceback, a URL.
+// name beside them — an argv entry, a line of a traceback, a URL — and the
+// body of a PEM key, which is the credential rather than its header.
+//
+// Each is anchored on a word boundary: `sk-` with none matched inside
+// `task-scheduler`, rewriting a finding's own file path into one that does not
+// exist.
 var reBareSecret = regexp.MustCompile(
-	`(?:sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}` +
-		`|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{30,}` +
-		`|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
+	`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)` +
+		`|\bsk-[A-Za-z0-9_-]{8,}|\bghp_[A-Za-z0-9]{16,}|\bgho_[A-Za-z0-9]{16,}` +
+		`|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}` +
+		`|\bAKIA[0-9A-Z]{16}\b|\bAIza[A-Za-z0-9_-]{30,}`)
 
 // envelopeKeys are what a tool runner wraps a result in: what tool it was, how
 // it ended, what it was told to do. A map carrying them describes a call
@@ -480,11 +525,29 @@ var reBareSecret = regexp.MustCompile(
 // level down: `description` is the advisory text in Snyk, Grype and Checkov
 // findings, and `file_path` is a finding's location.
 var envelopeKeys = map[string]bool{
-	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
+	"command": true, "cmd": true, "argv": true, "args": true,
 	"env": true, "environment": true, "cwd": true, "file_path": true,
 	"description": true, "tool_name": true, "tool_input": true,
 	"tool_use_id": true, "is_error": true, "interrupted": true,
 	"exit_code": true, "exitCode": true, "sandbox": true,
+}
+
+// noiseKeys are dropped at every level of a decoded response, not just the
+// top. They are the runner's account of the call rather than any part of the
+// report, and stderr is among them for the reason valueText spends a branch
+// on: a crash message is not a review, and carrying it in the payload put one
+// into the grounding corpus by the back door.
+//
+// The ambiguous names are deliberately absent: `description` is the advisory
+// text in a Snyk or Checkov finding, `file_path` is a finding's location, and
+// `input` may be the report itself. Those are bookkeeping only at the top
+// level of a response, which is what envelopeKeys is for.
+var noiseKeys = map[string]bool{
+	"command": true, "cmd": true, "argv": true, "args": true,
+	"env": true, "environment": true, "stderr": true,
+	"tool_name": true, "tool_input": true, "tool_use_id": true,
+	"is_error": true, "interrupted": true, "exit_code": true,
+	"exitCode": true, "sandbox": true,
 }
 
 // reportPayload renders a decoded response as a candidate review: the map with
@@ -497,9 +560,37 @@ func reportPayload(t map[string]interface{}) string {
 		if envelopeKeys[key] || isResponseTextKey(key) {
 			continue
 		}
-		rest[key] = val
+		rest[key] = pruneNoise(val, 0)
 	}
 	return marshalText(rest)
+}
+
+// pruneNoise drops the runner's own fields from a decoded response at every
+// level. It is not the credential defence — redactSecrets is, and covers the
+// shapes no key list can reach — but a nested stderr or command belongs in the
+// artifact no more than a top-level one does.
+func pruneNoise(v interface{}, depth int) interface{} {
+	if depth > 32 {
+		return v
+	}
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for key, val := range t {
+			if noiseKeys[key] {
+				continue
+			}
+			out[key] = pruneNoise(val, depth+1)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = pruneNoise(e, depth+1)
+		}
+		return out
+	}
+	return v
 }
 
 func isResponseTextKey(key string) bool {
@@ -509,4 +600,40 @@ func isResponseTextKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// isOnlyBookkeeping reports whether a response is the runner's account of the
+// call and nothing else. Such a payload sniffs as markdown, because no parser
+// claims it, so without this every one of them was exempt from the clean-run
+// guard and written into the repository as a content-free artifact — one per
+// run, forever, private paths included.
+func isOnlyBookkeeping(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var doc map[string]interface{}
+	if json.Unmarshal([]byte(trimmed), &doc) != nil {
+		return false
+	}
+	for key, val := range doc {
+		if envelopeKeys[key] || noiseKeys[key] {
+			continue
+		}
+		switch t := val.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				return false
+			}
+		case []interface{}:
+			if len(t) > 0 {
+				return false
+			}
+		case map[string]interface{}:
+			if len(t) > 0 {
+				return false
+			}
+		}
+	}
+	return true
 }

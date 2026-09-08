@@ -574,6 +574,19 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"a substitution nested in arithmetic", `echo $(( $(semgrep --count) + 1 ))`, true},
 		{"an unbalanced process id", `echo $$(semgrep .`, false},
 		{"an escaped dollar before a substitution", `echo "\$$(semgrep .)"`, true},
+		// A substitution's text is scanned beside the line, not spliced into
+		// it, so a locally-installed tool named through one is still in
+		// command position — the `$(…)/bin/tool` form every CI script uses.
+		{"a tool under a substituted path", `cd /tmp && $(pwd)/bin/semgrep --json .`, true},
+		{"a tool under a backticked path", "`dirname $0`/semgrep --json .", true},
+		{"a backtick substitution after another substitution", "echo $(date +%Y)`semgrep .`", true},
+		// And the words around a substitution are arguments, not commands.
+		{"a word after a substitution and a colon", `echo Ran $(date +%Y): semgrep found 3`, false},
+		{"a word after a substitution and a space", `echo $(date) semgrep`, false},
+		{"a word after a quoted substitution and a space", `echo "$(date)" semgrep`, false},
+		{"a word joined across a continuation", "echo $(date +%Y)x\\\nsemgrep .", false},
+		// A paren that never closes is a line bash refuses outright.
+		{"an unbalanced arithmetic command", "((semgrep .", false},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -865,10 +878,13 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		{"banner before the JSON", `{"stdout":"> pkg@1.0.0 lint\n> semgrep --json .\n\n{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
 		{"summary after the JSON", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}\\nran in 3s"}`, true, "sk-secret", "check_id"},
 		{"JSON lines", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}]}\\n{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
-		// A payload that is nothing but an echoed invocation keeps its shape —
-		// the command line is not itself secret — but never its credential.
-		{"a payload that is only a command", `{"stdout":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}"}`, true, "sk-secret", "semgrep --json ."},
-		{"a payload that is only an env", `{"stdout":"{\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, true, "sk-secret", ""},
+		// A payload that is nothing but the runner's account of the call
+		// records nothing. It sniffs as markdown, because no parser claims it,
+		// so exempting every markdown capture wrote one content-free artifact
+		// per run into the repository — private paths included.
+		{"a payload that is only a command", `{"stdout":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}"}`, false, "", ""},
+		{"a payload that is only an env", `{"stdout":"{\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, false, "", ""},
+		{"a payload that is only a cwd", `{"stdout":"{\"cwd\":\"/home/me/private-client-project\",\"exit_code\":0}"}`, false, "", ""},
 		// `input` names a command line when it is text and a report when it is
 		// not, so a name-only rule deleted the review.
 		{"a report under an input key survives", `{"stdout":"{\"input\":{\"findings\":[{\"file\":\"a.go\",\"summary\":\"Use the shared client everywhere.\"}]}}"}`, true, "", "shared client"},
