@@ -495,6 +495,21 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		// joined — the raw newline made this `#` a comment.
 		{"hash after a continuation", "echo hello\\\n#1 && semgrep --config r.yml .", true},
 		{"run inside a subshell", "(cd x && semgrep .)", true},
+		// A command substitution runs its own command. Blanking the paren left
+		// `echo` as the only command position on the line.
+		{"run inside a substitution", "echo $(semgrep --version)", true},
+		// An escaped character is still a character, so a `#` after one is
+		// mid-word: `echo a\b#c` prints `ab#c`.
+		{"hash after an escaped character", `echo a\b#c && semgrep .`, true},
+		// A backslash inside a quoted delimiter is literal; stripping it left
+		// the terminator unmatchable and swallowed the rest of the script.
+		{"quoted delimiter holding a backslash", "cat <<'EO\\F'\nx; semgrep bad\nEO\\F\ntrue", false},
+		// bash's delimiter word carries the CR on a CRLF script.
+		{"CRLF here-document", "cat <<EOF\r\nbody\r\nEOF\r\nsemgrep .", true},
+		// `<<''` is legal: the terminator is a blank line.
+		{"empty delimiter body", "cat <<''\nsemgrep bad\n\ntrue", false},
+		{"empty delimiter ended by a blank line", "cat <<''\n\nsemgrep .", true},
+		{"nested arithmetic", "n=$(( (1 << 2) + 3 ))\nsemgrep .", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -731,57 +746,48 @@ func TestFromHook_reportOnStderrIsStillAReview(t *testing.T) {
 }
 
 // Which field of a response is the review is decided by what the field holds,
-// not by which key happens to be checked first. Every case here had the wrong
-// candidate win at some point: a runner's bookkeeping beating a report, an
-// empty report beating a prose write-up, an envelope's punctuation beating
-// nothing at all.
-func TestFromHook_theReviewWinsOverWhateverSitsBesideIt(t *testing.T) {
+// not by which key happens to be checked first, and what reaches the artifact
+// is only ever the review. Every case here had the wrong candidate win at some
+// point — a runner's bookkeeping beating a report, an empty report beating a
+// prose write-up, an echoed command line carrying a token into a file inside
+// the repository.
+func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 	ws := watchers(t, "semgrep:tool")
-	report := `{"check_id":"py.no-requests","path":"svc/c.py","extra":{"message":"Use the shared http client."}}`
 	cases := []struct {
 		name, response string
-		wantFindings   int
+		wantOK         bool
+		wantAbsent     string
 		wantContains   string
 	}{
-		{"report beside bookkeeping in one map",
-			`{"results":[` + report + `],"message":"Command exited with code 1"}`, 1, "py.no-requests"},
-		{"report beside a null stderr",
-			`{"results":[` + report + `],"stderr":null}`, 1, "py.no-requests"},
-		{"structured stderr beats a message field",
-			`{"stdout":"","message":"Command exited with code 1","stderr":` +
-				string(mustJSON(`{"results":[`+report+`]}`)) + `}`, 1, "py.no-requests"},
-		{"an empty report does not shadow prose",
-			`{"stdout":"## Review\n\n- Use the shared http client everywhere.\n","stderr":"{\"results\":[]}"}`,
-			1, "shared http client"},
-		{"an empty findings array does not shadow prose",
-			`{"content":"## Review\n\n- Use the shared http client everywhere.\n","stdout":"{\"findings\":[]}"}`,
-			1, "shared http client"},
+		{"foreign findings vocabulary", `{"findings":[{"id":"SNYK-JS-1","title":"Prototype pollution","severity":"high"}]}`, true, "", "SNYK-JS-1"},
+		{"nested foreign findings", `{"stdout":{"findings":[{"id":"SNYK-JS-1","title":"Prototype pollution"}]}}`, true, "", "SNYK-JS-1"},
+		{"echoed command with a token is never persisted", `{"stdout":"","results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}`, false, "sk-secret", ""},
+		{"stderr prose stays out of the corpus", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"stderr":"Traceback: token sk-secret-abc123 rejected"}`, true, "sk-secret", "check_id"},
+		{"prose review beats a bookkeeping line", `{"output":"Command exited with code 1","body":"## Review\n\n- Use the shared http client."}`, true, "", "shared http client"},
+		{"report beside bookkeeping", `{"results":[{"check_id":"py.no-requests","path":"a.py","extra":{"message":"Use the shared client."}}],"message":"Command exited with code 1"}`, true, "", "py.no-requests"},
+		{"empty report does not shadow prose", `{"stdout":"## Review\n\n- Use the shared http client.\n","stderr":"{\"results\":[]}"}`, true, "", "shared http client"},
+		{"bookkeeping only", `{"interrupted":false}`, false, "", ""},
+		{"error bookkeeping", `{"is_error":true,"tool_use_id":"toolu_01ABC"}`, false, "", ""},
+		{"null stderr", `{"stderr":null}`, false, "", ""},
+		{"clean structured run", `{"results":[],"paths":{"scanned":["a.py"]}}`, false, "", ""},
+		{"stderr diagnostic", `{"stdout":"","stderr":"semgrep: error: unrecognized argument"}`, false, "", ""},
+		{"plain prose with no headings", `{"stdout":"the auth package looks right, nothing to flag"}`, true, "", "auth package"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
-				`"tool_response":` + tc.response + `}`
+			payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},"tool_response":` + tc.response + `}`
 			a, _, ok := FromHook([]byte(payload), ws, fixed)
-			if !ok {
-				t.Fatal("the review should have been captured")
+			if ok != tc.wantOK {
+				t.Fatalf("ok: want %v got %v (raw %q)", tc.wantOK, ok, a.RawText)
 			}
-			if len(a.Findings) != tc.wantFindings {
-				t.Errorf("findings: want %d got %d (raw %q)", tc.wantFindings, len(a.Findings), a.RawText)
+			if tc.wantAbsent != "" && strings.Contains(a.RawText, tc.wantAbsent) {
+				t.Errorf("%q leaked into the artifact: %q", tc.wantAbsent, a.RawText)
 			}
-			if !strings.Contains(a.RawText+findingText(a), tc.wantContains) {
-				t.Errorf("the wrong candidate won: %q", a.RawText)
+			if tc.wantContains != "" && !strings.Contains(a.RawText, tc.wantContains) {
+				t.Errorf("raw %q does not contain %q", a.RawText, tc.wantContains)
 			}
 		})
 	}
-}
-
-func findingText(a Artifact) string {
-	var b strings.Builder
-	for _, f := range a.Findings {
-		b.WriteString(f.Title)
-		b.WriteString(f.Body)
-	}
-	return b.String()
 }
 
 // A response envelope that says nothing must not be recorded whatever shape

@@ -323,30 +323,39 @@ func valueText(v interface{}, depth int) string {
 		//     `{"results":[]}` on stderr used to shadow a prose write-up on
 		//     stdout, and FromHook's clean-run guard then dropped the empty
 		//     report — losing the review entirely.
-		//   - The map itself is a candidate: a response handed over as a
-		//     decoded object is a report, not an envelope around one.
+		//   - Prose that reads as a review — one with sections — beats prose
+		//     that does not, for the same reason: `"output":"Command exited
+		//     with code 1"` is not the write-up under `"body"`.
 		//   - Prose on stderr is not a candidate at all. A usage error and a
 		//     write-up share that stream and nothing tells them apart; mining
 		//     standing conventions out of a crash message is the worse
 		//     mistake.
-		var report, prose, empty string
+		var report, prose, aside, empty string
 		consider := func(text string, allowProse bool) {
 			if strings.TrimSpace(text) == "" {
 				return
 			}
 			format := Detect([]byte(text))
-			if format == FormatMarkdown {
-				if allowProse && prose == "" {
-					prose = text
-				}
-				return
-			}
-			if findings, err := parse(format, []byte(text)); err == nil && len(findings) > 0 {
+			findings, err := parse(format, []byte(text))
+			structured := format != FormatMarkdown
+			switch {
+			case structured && err == nil && len(findings) > 0:
 				if report == "" {
 					report = text
 				}
-			} else if empty == "" {
-				empty = text
+			case structured:
+				if empty == "" {
+					empty = text
+				}
+			case !allowProse:
+			case err == nil && len(findings) > 0:
+				if prose == "" {
+					prose = text
+				}
+			default:
+				if aside == "" {
+					aside = text
+				}
 			}
 		}
 		for _, key := range responseTextKeys {
@@ -355,14 +364,34 @@ func valueText(v interface{}, depth int) string {
 				continue
 			}
 			consider(valueText(inner, depth+1), key != "stderr")
+			if report != "" {
+				break
+			}
 		}
-		consider(marshalText(v), false)
+		// The map itself may be the report rather than an envelope around one.
+		// It is offered stripped of the fields already considered above and
+		// only when it carries none of the runner's own bookkeeping: handing
+		// the whole object over wrote a `command` field — `SEMGREP_APP_TOKEN=…
+		// semgrep --json .` — into an artifact inside the repository, and put
+		// stderr prose into the grounding corpus two lines after ruling it out
+		// as review text.
+		if report == "" {
+			// A map carrying a `findings` key is a review payload by
+			// construction, even when its vocabulary is one the findings
+			// parser does not know — Snyk, Trivy and Security Hub all use the
+			// key with fields of their own. Refusing it as prose recorded
+			// nothing at all for a designated run of any of them.
+			_, named := t["findings"]
+			consider(reportPayload(t), named)
+		}
 
 		switch {
 		case report != "":
 			return report
 		case prose != "":
 			return prose
+		case aside != "":
+			return aside
 		default:
 			// An empty structured report is still what the tool said. It
 			// reaches FromHook's clean-run guard, which is where "the tool
@@ -384,4 +413,40 @@ func marshalText(v interface{}) string {
 		return s
 	}
 	return ""
+}
+
+// envelopeKeys are the fields a tool runner adds around a result. Their
+// presence means this map describes a call rather than being a report, and
+// several of them routinely carry a command line — which is where credentials
+// live, and why hookLabel refuses to record one.
+var envelopeKeys = map[string]bool{
+	"command": true, "cwd": true, "file_path": true, "description": true,
+	"tool_name": true, "tool_input": true, "tool_use_id": true,
+	"is_error": true, "interrupted": true, "exit_code": true, "sandbox": true,
+}
+
+// reportPayload renders a decoded response as a candidate review: the map
+// without the fields already considered on their own, and nothing at all when
+// it carries a runner's bookkeeping.
+func reportPayload(t map[string]interface{}) string {
+	rest := make(map[string]interface{}, len(t))
+	for key, val := range t {
+		if envelopeKeys[key] {
+			return ""
+		}
+		if isResponseTextKey(key) {
+			continue
+		}
+		rest[key] = val
+	}
+	return marshalText(rest)
+}
+
+func isResponseTextKey(key string) bool {
+	for _, known := range responseTextKeys {
+		if key == known {
+			return true
+		}
+	}
+	return false
 }

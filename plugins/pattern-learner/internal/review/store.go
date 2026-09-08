@@ -207,13 +207,19 @@ func Select(all []Artifact, ids []string, since string) []Artifact {
 	for _, a := range all {
 		t := capturedTime(a.CapturedAt)
 		if t.IsZero() {
-			// Neither silently skipped nor silently included: including it
-			// re-mines it on every run and, if it is the newest selected, its
-			// unparseable stamp becomes the next watermark and stalls the
-			// whole path. Say so instead, once, where the run can see it.
+			// Included, not skipped. A stamp that does not parse is not a
+			// position on this line, so skipping it made the artifact
+			// permanently unselectable the moment a watermark existed — a
+			// review lost for good, reported as "everything has been mined".
+			// Including it re-mines that one artifact on every run until the
+			// file is fixed, which the unchanged-emerging pre-pass already
+			// suppresses at the prompt and which the warning explains. The
+			// watermark itself never takes this stamp; see ExtractLeanFrom.
 			fmt.Fprintf(os.Stderr,
-				"warn: %s has an unreadable captured_at (%q) and is skipped; re-capture it or fix the stamp\n",
+				"warn: %s has an unreadable captured_at (%q) and is re-read on every run; "+
+					"re-capture it or fix the stamp\n",
 				a.ReviewID, a.CapturedAt)
+			out = append(out, a)
 			continue
 		}
 		if t.After(mark) {
@@ -283,11 +289,10 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 // and the run says once what it could not read, so the file can be repaired or
 // deleted.
 //
-// An artifact whose captured_at does not parse is not reported here. It is
-// mined normally on a run with no watermark, and Select warns about it by name
-// on every run that has one; adding it to this list instead reported a loss on
-// every routine "nothing new" run, for an artifact that had already been
-// mined, and gave two answers to a question Select already answers.
+// An artifact whose captured_at does not parse is not reported here, because
+// it is not lost: Select keeps offering it (and warns by name) until the stamp
+// is fixed. Listing it here instead announced a loss on every routine "nothing
+// new" run, for an artifact that had in fact been mined.
 func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))

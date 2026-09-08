@@ -241,6 +241,9 @@ func sanitizeCommand(command string) string {
 	// inside a word and carries no comment, while `(true)#note` closes a
 	// subshell and does.
 	var parens []parenKind
+	// arith counts the open `$(( ))` frames on the stack, so the here-document
+	// guard is a comparison rather than a scan of the whole stack.
+	arith := 0
 	// prev is the previous character as the shell sees it — after line
 	// continuations are joined, and never a character inside quotes. Reading
 	// the raw text instead made the `#` in `echo hello\<newline>#1` a comment
@@ -330,20 +333,31 @@ func sanitizeCommand(command string) string {
 				i++
 				if runes[i] != '\n' {
 					b.WriteRune(neutralize(runes[i]))
-					prev = ' '
+					// The escaped character is still a character: `echo a\b#c`
+					// prints `ab#c`, so the `#` is mid-word. Recording a space
+					// here made it a word start and dropped the rest of the
+					// line, `&&` and all.
+					prev = runes[i]
 				}
 			}
 			continue
 		case r == '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(':
 			parens = append(parens, parenArith)
+			arith++
 			b.WriteString("  ")
 			i += 2
 		case r == '$' && i+1 < len(runes) && runes[i+1] == '(':
+			// The paren is kept: `$(semgrep --version)` runs semgrep, and the
+			// separator split is what gives the substitution its own command
+			// position. Blanking it left `echo` as the only command on the
+			// line and a designated run inside went uncaptured. Only the `$`
+			// is dropped, and the stack remembers what this paren was.
 			parens = append(parens, parenSubstitution)
-			b.WriteRune(' ')
+			b.WriteString(" (")
 			i++
 		case r == '(' && i+1 < len(runes) && runes[i+1] == '(':
 			parens = append(parens, parenArith)
+			arith++
 			b.WriteString("  ")
 			i++
 		case r == '(':
@@ -355,16 +369,24 @@ func sanitizeCommand(command string) string {
 				kind = parens[n-1]
 				parens = parens[:n-1]
 			}
+			// A `)` that closed a command substitution leaves the scan
+			// mid-word — `echo $(date +%Y)#1` prints `2026#1` — while one that
+			// closed a subshell starts a new word, and `(true)#note` really is
+			// a comment.
 			closedSubshell = kind != parenSubstitution
-			if kind == parenArith && i+1 < len(runes) && runes[i+1] == ')' {
-				b.WriteString("  ")
-				i++
+			if kind == parenArith {
+				arith--
+				b.WriteRune(' ')
+				if i+1 < len(runes) && runes[i+1] == ')' {
+					b.WriteRune(' ')
+					i++
+				}
 			} else {
 				b.WriteRune(r)
 			}
 			prev = ')'
 			continue
-		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && !inArithmetic(parens):
+		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && arith == 0:
 			// A here-document operator, because we are outside quotes and
 			// outside `$(( ))` — where `<<` is a left shift, and reading its
 			// operand as a delimiter discarded everything after it.
@@ -400,15 +422,6 @@ const (
 	parenArith
 )
 
-func inArithmetic(parens []parenKind) bool {
-	for _, k := range parens {
-		if k == parenArith {
-			return true
-		}
-	}
-	return false
-}
-
 // startsWord reports whether a `#` following prev opens a comment.
 //
 // bash starts a comment at the beginning of a word: after whitespace, after a
@@ -421,7 +434,7 @@ func startsWord(prev rune, closedSubshell bool) bool {
 	switch prev {
 	case 0:
 		return true
-	case ';', '|', '&', '(', '<', '>', '\n':
+	case ';', '|', '&', '(', '<', '>':
 		return true
 	case ')':
 		return closedSubshell
@@ -473,7 +486,10 @@ func skipHeredocBody(runes []rune, start int, h heredoc) int {
 		// bash strips leading tabs from the terminator only for `<<-`, and
 		// never strips spaces. Comparing a trimmed line let an indented `EOF`
 		// inside a plain here-document end it, and the body after it was then
-		// scanned as commands.
+		// scanned as commands. A trailing CR is not indentation: on a CRLF
+		// script bash's delimiter word carries it too, and dropping the trim
+		// altogether left the terminator unmatchable.
+		line = strings.TrimSuffix(line, "\r")
 		if h.dashed {
 			line = strings.TrimLeft(line, "\t")
 		}
@@ -512,16 +528,30 @@ func parseHeredoc(runes []rune, i int) (heredoc, bool) {
 	if end > len(runes) {
 		end = len(runes)
 	}
-	m := reHeredoc.FindStringSubmatch(string(runes[i:end]))
-	if m == nil {
+	window := string(runes[i:end])
+	loc := reHeredoc.FindStringSubmatchIndex(window)
+	if loc == nil {
 		return heredoc{}, false
 	}
-	for _, word := range m[2:] {
-		if word != "" {
-			// A backslash quotes the next character in an unquoted delimiter;
-			// the terminator line carries the bare word.
-			return heredoc{delimiter: strings.ReplaceAll(word, `\`, ""), dashed: m[1] == "-"}, true
+	dashed := loc[2] >= 0 && loc[3] > loc[2]
+	// Group order: single-quoted, double-quoted, bare. Which one participated
+	// is read from the indices rather than from emptiness, because `<<''` is a
+	// legal here-document whose terminator is a blank line — treating its
+	// empty match as "no delimiter" left the body to be scanned as commands.
+	for group := 2; group <= 4; group++ {
+		lo, hi := loc[2*group], loc[2*group+1]
+		if lo < 0 {
+			continue
 		}
+		word := window[lo:hi]
+		if group == 4 {
+			// A backslash quotes the next character in an *unquoted*
+			// delimiter, so `<<\EOF` terminates at `EOF`. Inside quotes a
+			// backslash is literal, and stripping it there left the terminator
+			// of `<<'EO\F'` unmatchable.
+			word = strings.ReplaceAll(word, `\`, "")
+		}
+		return heredoc{delimiter: word, dashed: dashed}, true
 	}
 	return heredoc{}, false
 }
