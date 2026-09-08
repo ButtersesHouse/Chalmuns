@@ -1375,7 +1375,11 @@ func confidenceHeading(c string) string {
 }
 
 func writeSourceLine(b *strings.Builder, r state.Rule, watermark int) {
-	prOrigin := r.Origin == "" || r.Origin == "pr-review"
+	// A rule a watched reviewer has flagged since is not stale, whatever its
+	// last PR number says — the same judgement classify makes when it exempts
+	// such a rule from the recency downgrade. Telling the reader to re-verify
+	// a convention two fresh reviews just confirmed would contradict it.
+	prOrigin := (r.Origin == "" || r.Origin == "pr-review") && !hasReviewSource(r.Sources)
 	if prOrigin && watermark > 0 && r.LastSeenPR > 0 && watermark-r.LastSeenPR >= staleAfterPRs {
 		b.WriteString(fmt.Sprintf("_Source: %s_ _(last seen: PR #%d — verify this convention is still current)_\n\n",
 			sourceLabel(r), r.LastSeenPR))
@@ -1588,11 +1592,18 @@ func sourceLabel(r state.Rule) string {
 	case "code-review":
 		// Name the reviewers: which tool flagged a convention is what tells a
 		// reader whether to trust it, and two different tools agreeing is a
-		// stronger claim than one repeating itself.
-		if tools := reviewerNames(r.Sources); tools != "" {
-			return "code review (" + tools + ")"
+		// stronger claim than one repeating itself. Only the review sources
+		// are named — a code-review rule can later absorb a PR signal through
+		// Step 8C, and listing that human's login among the tools would
+		// present them as one, while dropping their PR from the citation.
+		label := "code review"
+		if tools := reviewerNames(reviewSources(r.Sources)); tools != "" {
+			label += " (" + tools + ")"
 		}
-		return "code review"
+		if prs := prList(r.Sources); prs != "" {
+			label += " and PRs " + prs
+		}
+		return label
 	default:
 		// A PR-origin rule can hold review signals too: Step 8C merges an
 		// equivalent review candidate into the existing rule and keeps that
@@ -1615,12 +1626,18 @@ func sourceLabel(r state.Rule) string {
 
 // hasReviewSource reports whether any signal was mined from a captured review.
 func hasReviewSource(sources []state.Signal) bool {
+	return len(reviewSources(sources)) > 0
+}
+
+// reviewSources returns just the signals mined from captured reviews.
+func reviewSources(sources []state.Signal) []state.Signal {
+	var out []state.Signal
 	for _, s := range sources {
 		if s.ReviewID != "" {
-			return true
+			out = append(out, s)
 		}
 	}
-	return false
+	return out
 }
 
 // reviewerNames lists the distinct reviewers behind a rule, for the source

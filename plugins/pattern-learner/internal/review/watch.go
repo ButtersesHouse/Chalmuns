@@ -103,17 +103,6 @@ func RemoveWatcher(ws []state.Watcher, id string) ([]state.Watcher, bool) {
 	return out, found
 }
 
-// FindWatcher returns the watcher with this id or name.
-func FindWatcher(ws []state.Watcher, idOrName string) (state.Watcher, bool) {
-	want := WatcherID(idOrName)
-	for _, w := range ws {
-		if w.ID == want {
-			return w, true
-		}
-	}
-	return state.Watcher{}, false
-}
-
 // Match picks the watcher a tool invocation belongs to, given the tool name
 // the hook reported, the skill name it invoked (empty when it was not a skill
 // invocation), and the command line it ran (empty when it was not a command).
@@ -235,88 +224,88 @@ func matchesCommand(name, command string) bool {
 // review. That breaks the invariant this whole path exists to hold: nothing is
 // captured from a tool that was not designated.
 func sanitizeCommand(command string) string {
-	// Heredoc bodies go first, on the raw text: the delimiter is itself
-	// usually quoted (`<<'EOF'`), so blanking quotes first would erase the
-	// very word the terminator has to be matched against.
-	command = stripHeredocBodies(command)
-
-	var b strings.Builder
-	b.Grow(len(command))
-	var quote rune
-	escaped := false
-	for _, r := range command {
-		switch {
-		case escaped:
-			// The character after a backslash is literal, whatever it is. A
-			// `\"` inside a double-quoted string does not end the string, and
-			// treating it as if it did re-exposed the rest of the argument as
-			// command positions: `git commit -m "fix \"; semgrep noise\""`
-			// then counted as a run of semgrep.
-			escaped = false
-			b.WriteRune(quoteMask(r, quote))
-		case r == '\\' && quote != '\'':
-			// Single quotes take no escapes; everywhere else a backslash
-			// quotes the next character.
-			escaped = true
-			b.WriteRune(quoteMask(r, quote))
-		case quote != 0:
-			// Inside quotes: keep the length, drop the meaning.
-			if r == quote {
-				quote = 0
-			}
-			b.WriteRune(quoteMask(r, quote))
-		case r == '\'' || r == '"':
-			quote = r
-			b.WriteRune(' ')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-// quoteMask blanks a character that is inside quotes, keeping newlines so line
-// structure survives for the heredoc scan.
-func quoteMask(r rune, quote rune) rune {
-	if r == '\n' {
-		return '\n'
-	}
-	return ' '
-}
-
-// stripHeredocBodies removes the body of each here-document, which is input to
-// a command rather than more commands, and keeps everything after it.
-//
-// Truncating at the first heredoc instead threw away the rest of the script,
-// so a designated tool run after one — `cat <<EOF > rules.yaml … EOF` then
-// `semgrep --config rules.yaml .` — was never captured, silently.
-func stripHeredocBodies(s string) string {
-	lines := strings.Split(s, "\n")
-	var out []string
+	var out strings.Builder
+	out.Grow(len(command))
+	lines := strings.Split(command, "\n")
 	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		out = append(out, line)
-		delim := heredocDelimiter(line)
+		masked, delim := maskLine(lines[i])
+		out.WriteString(masked)
+		out.WriteByte('\n')
 		if delim == "" {
 			continue
 		}
-		// Skip to the terminator line, then carry on scanning after it.
+		// A here-document's body is input to a command, not more commands.
+		// Skip to its terminator and carry on scanning after it — truncating
+		// the script there instead meant a designated tool run later in the
+		// same call was never captured.
 		for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != delim {
 			i++
 		}
 		if i+1 < len(lines) {
-			i++ // consume the terminator itself
+			i++
 		}
 	}
-	return strings.Join(out, "\n")
+	return out.String()
 }
 
-// reHeredoc matches a here-document operator and its delimiter word, quoted
-// or not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator.
-var reHeredoc = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+// maskLine blanks the quoted spans of one line and reports the here-document
+// delimiter the line opens, if any.
+//
+// The two jobs share one scan because they depend on each other: a `<<` inside
+// a quoted string is text, not an operator, and a delimiter written `<<'EOF'`
+// is itself quoted. Doing either pass first gets the other wrong — masking
+// first erases the delimiter, scanning first treats quoted text as an opener
+// and swallows every line after it.
+func maskLine(line string) (masked, delimiter string) {
+	var b strings.Builder
+	b.Grow(len(line))
+	runes := []rune(line)
+	var quote rune
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case quote == 0 && (r == '\'' || r == '"'):
+			quote = r
+			b.WriteRune(' ')
+		case quote != 0 && r == '\\' && quote != '\'':
+			// The character after a backslash is literal, so an escaped quote
+			// does not end the string. Treating it as if it did re-exposed the
+			// rest of the argument as command positions.
+			b.WriteRune(' ')
+			if i+1 < len(runes) {
+				i++
+				b.WriteRune(' ')
+			}
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+			b.WriteRune(' ')
+		case r == '\\':
+			b.WriteRune(' ')
+			if i+1 < len(runes) {
+				i++
+				b.WriteRune(' ')
+			}
+		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && delimiter == "":
+			// An operator, because we are outside quotes. Read its delimiter
+			// from the raw text, where its own quotes are still intact.
+			delimiter = heredocDelimiter(string(runes[i:]))
+			b.WriteString("<<")
+			i++
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String(), delimiter
+}
 
-func heredocDelimiter(line string) string {
-	if m := reHeredoc.FindStringSubmatch(line); m != nil {
+// reHeredoc matches a here-document operator and its delimiter word, quoted or
+// not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator.
+var reHeredoc = regexp.MustCompile(`^<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+func heredocDelimiter(s string) string {
+	if m := reHeredoc.FindStringSubmatch(s); m != nil {
 		return m[1]
 	}
 	return ""

@@ -365,6 +365,10 @@ func looksLikeFinding(m map[string]interface{}) bool {
 }
 
 func parse(format string, data []byte) ([]Finding, error) {
+	// Detect strips a byte-order mark before sniffing, so the parsers must see
+	// the same bytes it judged — otherwise a report written on Windows sniffs
+	// as JSON and then fails to parse, losing every finding it held.
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	switch format {
 	case FormatFindings:
 		return parseFindings(data)

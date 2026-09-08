@@ -3313,3 +3313,57 @@ func TestWriteMergedReviewSignalDoesNotCitePRZero(t *testing.T) {
 		t.Errorf("a mixed-provenance rule should name both; got:\n%s", content)
 	}
 }
+
+// A code-review rule can absorb a PR signal through Step 8C, which keeps the
+// rule's origin. Listing that human's login among the review tools presented
+// them as one, and dropped their PR from the citation entirely — the mirror of
+// the "PRs #0" bug on the default branch.
+func TestWriteCodeReviewRuleThatGainedAPRSignal(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_mixed", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "code-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "explicit"},
+			{PRNumber: 481, Reviewer: "alice", Snippet: "we wrap with %w", Strength: "explicit"},
+		},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: code review (code-review) and PRs #481_") {
+		t.Errorf("want both provenances, neither conflated; got:\n%s", content)
+	}
+	if strings.Contains(content, "alice") {
+		t.Error("a human PR reviewer must not be listed as a review tool")
+	}
+}
+
+// A rule a watched reviewer has flagged since is not stale, whatever its last
+// PR number says — classify exempts exactly this rule from the recency
+// downgrade, so telling the reader to re-verify it would contradict that.
+func TestWriteReviewConfirmedRuleIsNotMarkedStale(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_confirmed", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "established", Origin: "pr-review",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{PRNumber: 480, Reviewer: "alice", Snippet: "wrap with %w", Strength: "explicit"},
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+		LastSeenPR: 480,
+	}
+	s := stateWith(r)
+	s.LastExtractedPRNumber = 700 // far past staleAfterPRs
+
+	if err := Write(s, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if strings.Contains(content, "verify this convention is still current") {
+		t.Errorf("a rule fresh reviews have confirmed is not stale; got:\n%s", content)
+	}
+}

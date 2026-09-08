@@ -123,6 +123,35 @@ func ListArtifacts(cacheDir string) ([]Artifact, error) {
 	return out, nil
 }
 
+// ListArtifactMeta returns only what a status tally needs, without decoding
+// each artifact's RawText — which is the bulk of the file and can be megabytes
+// apiece. `watch --list` runs on the routine status path and has no use for
+// the review bodies.
+func ListArtifactMeta(cacheDir string) ([]Artifact, error) {
+	matches, err := filepath.Glob(filepath.Join(cacheDir, artifactGlob))
+	if err != nil {
+		return nil, err
+	}
+	var out []Artifact
+	for _, path := range matches {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue
+		}
+		var meta struct {
+			ReviewID   string `json:"review_id"`
+			Source     string `json:"source"`
+			CapturedAt string `json:"captured_at"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		out = append(out, Artifact{ReviewID: meta.ReviewID, Source: meta.Source, CapturedAt: meta.CapturedAt})
+	}
+	sortArtifacts(out)
+	return out, nil
+}
+
 // sortArtifacts orders by capture time, then ID so the order is total and
 // stable — two artifacts captured in the same instant must not swap between
 // runs, or a watermark could step over one of them.

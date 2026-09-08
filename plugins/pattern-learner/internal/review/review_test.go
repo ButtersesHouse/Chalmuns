@@ -609,25 +609,42 @@ func TestCapture_findingOrderDoesNotChangeTheReviewID(t *testing.T) {
 // not that the review is unusable. A BOM or one mistyped field would otherwise
 // lose the whole review — silently under the hook.
 func TestCapture_sniffedParseFailureFallsBackToProse(t *testing.T) {
-	cases := map[string]string{
-		"BOM before the array":  "\xef\xbb\xbf" + `[{"file":"a.go","summary":"Use the shared logger everywhere."}]`,
-		"wrong type in a field": `{"findings":[{"file":"a.go","line":"42","summary":"Use the shared logger."}]}`,
+	body := `{"findings":[{"file":"a.go","line":"42","summary":"Use the shared logger."}]}`
+	a, err := Capture(Input{Data: []byte(body), Source: "code-review", Format: FormatAuto, Now: fixed})
+	if err != nil {
+		t.Fatalf("a sniffed guess that fails to parse should degrade, not error: %v", err)
 	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			a, err := Capture(Input{Data: []byte(body), Source: "code-review", Format: FormatAuto, Now: fixed})
-			if err != nil {
-				t.Fatalf("a sniffed guess that fails to parse should degrade, not error: %v", err)
-			}
-			if !strings.Contains(Lean([]Artifact{a})[0].Text, "shared logger") {
-				t.Error("the reviewer's words must still reach the extraction step")
-			}
-		})
+	if !strings.Contains(Lean([]Artifact{a})[0].Text, "shared logger") {
+		t.Error("the reviewer's words must still reach the extraction step")
 	}
 	// An explicit format is the caller asserting a shape, so it still errors.
 	bad := `{"findings":[{"file":"a.go","line":"42","summary":"x"}]}`
 	if _, err := Capture(Input{Data: []byte(bad), Source: "x", Format: FormatFindings, Now: fixed}); err == nil {
 		t.Error("an explicitly-requested format should report the parse failure")
+	}
+}
+
+// A report written on Windows carries a byte-order mark. Detect strips it
+// before sniffing, so the parsers must see the same bytes — otherwise the
+// shape is recognised and then fails to parse, and every finding it held
+// (file, line, the before/after code) is lost to the prose fallback.
+func TestCapture_byteOrderMarkIsStrippedBeforeParsing(t *testing.T) {
+	const bom = "\xef\xbb\xbf"
+	cases := map[string]string{
+		"findings array":   bom + `[{"file":"a.go","line":9,"summary":"Use the shared logger everywhere."}]`,
+		"findings wrapper": bom + `{"findings":[{"file":"a.go","line":9,"summary":"Use the shared logger everywhere."}]}`,
+		"semgrep":          bom + `{"results":[{"check_id":"c","path":"a.py","start":{"line":4},"extra":{"message":"Use the shared client."}}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := capture(t, "code-review", FormatAuto, body)
+			if len(a.Findings) != 1 {
+				t.Fatalf("want the findings parsed, got %d (format %q)", len(a.Findings), a.Format)
+			}
+			if a.Findings[0].File == "" || a.Findings[0].Line == 0 {
+				t.Errorf("location lost: %+v", a.Findings[0])
+			}
+		})
 	}
 }
 
@@ -663,5 +680,17 @@ func TestCapture_droppedFenceDoesNotLabelTheNextOne(t *testing.T) {
 		if strings.Contains(f.CodeBefore, "Currently") || strings.Contains(f.CodeAfter, "Currently") {
 			t.Errorf("prose stored as code: before=%q after=%q", f.CodeBefore, f.CodeAfter)
 		}
+	}
+}
+
+// A fence must be closed by its own character, so a line of the *other* fence
+// character inside a block is content — not a sign the writer forgot a closer.
+// Treating it as nested dropped the block and lost the reviewer's example.
+func TestCapture_foreignFenceCharacterInsideABlockIsContent(t *testing.T) {
+	a := capture(t, "code-review", FormatMarkdown,
+		"## A finding\n\nPrefer:\n\n```go\nfmt.Println(\"~~~\")\n~~~\nx()\n```\n")
+	f := a.Findings[0]
+	if !strings.Contains(f.CodeAfter, "x()") {
+		t.Errorf("the block should survive a foreign fence marker; after=%q", f.CodeAfter)
 	}
 }

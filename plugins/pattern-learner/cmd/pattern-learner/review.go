@@ -100,7 +100,7 @@ func runWatch(args []string) error {
 	if cacheDir == "" {
 		cacheDir = filepath.Join(projectDir(statePath), reviewCacheRel)
 	}
-	artifacts, err := review.ListArtifacts(cacheDir)
+	artifacts, err := review.ListArtifactMeta(cacheDir)
 	if err != nil {
 		// A missing cache is simply "nothing captured yet", which is the
 		// state every designation starts in.
@@ -287,7 +287,19 @@ func runExtractReview(args []string) error {
 		}
 	}
 
-	lean, err := review.ExtractLean(cacheDir, ids, cliflags.Value(args, "--since", ""))
+	// A watermark that does not parse would compare as the zero time and so
+	// select every artifact — re-mining the whole cache on every run, silently
+	// re-presenting conventions the user already decided on. It is written by
+	// hand into state, so refuse a malformed one by name.
+	since := cliflags.Value(args, "--since", "")
+	if since != "" {
+		if _, err := time.Parse(time.RFC3339Nano, since); err != nil {
+			return fmt.Errorf("--since %q is not an RFC3339 timestamp: %w "+
+				"(it comes from state.last_ingested_review_at, which Step 11 writes)", since, err)
+		}
+	}
+
+	lean, err := review.ExtractLean(cacheDir, ids, since)
 	if err != nil {
 		return err
 	}

@@ -241,7 +241,9 @@ func TestRunCaptureReview_hookIsFailOpenAndDesignationGated(t *testing.T) {
 	}
 
 	const findings = `{"findings":[{"file":"a.go","line":1,"summary":"Use the shared logger everywhere."}]}`
-	skillCall := `{"tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":` + findings + `}`
+	// /code-review reports through ReportFindings, so that call — not its own
+	// Skill call — is the one carrying the review.
+	skillCall := `{"tool_name":"ReportFindings","tool_input":` + findings + `}`
 
 	// Nothing designated yet: a matching tool call is still not recorded.
 	run(t, skillCall)
@@ -429,4 +431,18 @@ func withStdin(t *testing.T, body string, fn func()) {
 	}()
 	defer func() { os.Stdin = saved; r.Close() }()
 	fn()
+}
+
+// The watermark is written by hand into state, and one that does not parse
+// would compare as the zero time and select every artifact — silently
+// re-mining the whole cache and re-presenting settled conventions on every run.
+func TestRunExtractReview_rejectsAMalformedWatermark(t *testing.T) {
+	_, _, cacheDir := projectFixture(t)
+	err := runExtractReview([]string{"--cache-dir", cacheDir, "--since", "2026-01-15 10:04"})
+	if err == nil || !strings.Contains(err.Error(), "RFC3339") {
+		t.Errorf("want an error naming the expected format; got %v", err)
+	}
+	if err := runExtractReview([]string{"--cache-dir", cacheDir, "--since", "2026-01-15T10:04:00Z"}); err != nil {
+		t.Errorf("a well-formed watermark should be accepted: %v", err)
+	}
 }

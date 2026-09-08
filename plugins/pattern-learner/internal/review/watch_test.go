@@ -172,15 +172,15 @@ func TestStatus_countsFromTheCache(t *testing.T) {
 const hookFindings = `{"findings":[{"file":"a.go","line":1,"summary":"Wrap errors with %w so callers can errors.Is them."}]}`
 
 func TestFromHook_capturesDesignatedSources(t *testing.T) {
-	ws := watchers(t, "code-review:skill", "semgrep:tool")
+	ws := watchers(t, "house-review:skill", "semgrep:tool")
 
 	t.Run("skill invocation", func(t *testing.T) {
-		payload := `{"tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":` + hookFindings + `}`
+		payload := `{"tool_name":"Skill","tool_input":{"skill":"house-review"},"tool_response":` + hookFindings + `}`
 		a, w, ok := FromHook([]byte(payload), ws, fixed)
 		if !ok {
 			t.Fatal("designated skill output should be captured")
 		}
-		if w.ID != "code-review" || a.Source != "code-review" {
+		if w.ID != "house-review" || a.Source != "house-review" {
 			t.Errorf("attribution wrong: watcher=%q source=%q", w.ID, a.Source)
 		}
 		// A structured response must reach the findings parser whole rather
@@ -188,7 +188,7 @@ func TestFromHook_capturesDesignatedSources(t *testing.T) {
 		if a.Format != FormatFindings || len(a.Findings) != 1 {
 			t.Errorf("format=%q findings=%d", a.Format, len(a.Findings))
 		}
-		if !strings.Contains(a.Label, "/code-review") {
+		if !strings.Contains(a.Label, "/house-review") {
 			t.Errorf("label should name what produced it; got %q", a.Label)
 		}
 	})
@@ -206,7 +206,7 @@ func TestFromHook_capturesDesignatedSources(t *testing.T) {
 	})
 
 	t.Run("content blocks are joined", func(t *testing.T) {
-		payload := `{"tool_name":"Skill","tool_input":{"skill":"code-review"},` +
+		payload := `{"tool_name":"Skill","tool_input":{"skill":"house-review"},` +
 			`"tool_response":[{"type":"text","text":"## A finding\n\nUse the shared logger everywhere."}]}`
 		a, _, ok := FromHook([]byte(payload), ws, fixed)
 		if !ok {
@@ -221,7 +221,7 @@ func TestFromHook_capturesDesignatedSources(t *testing.T) {
 // Nothing is captured from a tool nobody designated — that is what makes the
 // hook a designation rather than surveillance.
 func TestFromHook_ignoresUndesignated(t *testing.T) {
-	ws := watchers(t, "code-review:skill")
+	ws := watchers(t, "house-review:skill")
 	payload := `{"tool_name":"Bash","tool_input":{"command":"go test ./..."},"tool_response":{"stdout":"ok"}}`
 	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
 		t.Error("an undesignated tool must not be captured")
@@ -238,7 +238,7 @@ func TestFromHook_noWatchersCapturesNothing(t *testing.T) {
 // The hook runs inside someone's tool call. Every malformed input has to be a
 // quiet no-op, never a panic and never an error the session would surface.
 func TestFromHook_failsOpen(t *testing.T) {
-	ws := watchers(t, "code-review:skill")
+	ws := watchers(t, "house-review:skill")
 	payloads := []string{
 		"",
 		"not json at all",
@@ -246,9 +246,9 @@ func TestFromHook_failsOpen(t *testing.T) {
 		"[]",
 		`{"tool_name":"Skill"}`,
 		`{"tool_name":"Skill","tool_input":{"skill":"code-review"}}`,                       // no response
-		`{"tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":""}`,    // empty response
-		`{"tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":{}}`,    // empty object
-		`{"tool_name":"Skill","tool_input":{"skill":"code-review"},"tool_response":null}`,  // null
+		`{"tool_name":"Skill","tool_input":{"skill":"house-review"},"tool_response":""}`,   // empty response
+		`{"tool_name":"Skill","tool_input":{"skill":"house-review"},"tool_response":{}}`,   // empty object
+		`{"tool_name":"Skill","tool_input":{"skill":"house-review"},"tool_response":null}`, // null
 		`{"tool_name":"Skill","tool_input":"a string, not an object","tool_response":"x"}`, // wrong type
 		`{"tool_name":123,"tool_input":{"skill":456},"tool_response":"some text"}`,         // wrong types
 	}
@@ -269,9 +269,9 @@ func TestFromHook_failsOpen(t *testing.T) {
 // The result field's name is the one thing about the payload this repository
 // cannot verify, so capture must read whichever field actually carries text.
 func TestFromHook_findsOutputUnderAnyKnownKey(t *testing.T) {
-	ws := watchers(t, "code-review:skill")
+	ws := watchers(t, "house-review:skill")
 	for _, key := range responseKeys {
-		payload := `{"tool_name":"Skill","tool_input":{"skill":"code-review"},"` + key + `":` + hookFindings + `}`
+		payload := `{"tool_name":"Skill","tool_input":{"skill":"house-review"},"` + key + `":` + hookFindings + `}`
 		if _, _, ok := FromHook([]byte(payload), ws, fixed); !ok {
 			t.Errorf("output under %q was not found", key)
 		}
@@ -323,8 +323,8 @@ func TestFromHook_reportFindingsIsNotMisattributed(t *testing.T) {
 // For a non-reporting tool the input is the request, not the review. Capturing
 // it would file what someone asked for as what the reviewer said.
 func TestFromHook_ordinaryToolInputIsNotAReview(t *testing.T) {
-	ws := watchers(t, "code-review:skill")
-	payload := `{"tool_name":"Skill","tool_input":{"skill":"code-review","prompt":"review the diff for bugs"}}`
+	ws := watchers(t, "house-review:skill")
+	payload := `{"tool_name":"Skill","tool_input":{"skill":"house-review","prompt":"review the diff for bugs"}}`
 	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
 		t.Error("a call with no response carries no review")
 	}
@@ -334,13 +334,13 @@ func TestFromHook_ordinaryToolInputIsNotAReview(t *testing.T) {
 // designated --kind skill — which is what the docs recommend for /code-review
 // — matched nothing, forever, with no error to show for it.
 func TestFromHook_slashCommandMatchesASkillWatcher(t *testing.T) {
-	ws := watchers(t, "code-review:skill")
-	payload := `{"tool_name":"SlashCommand","tool_input":{"command":"/code-review --fix"},` +
+	ws := watchers(t, "house-review:skill")
+	payload := `{"tool_name":"SlashCommand","tool_input":{"command":"/house-review --fix"},` +
 		`"tool_response":"## A finding\n\nUse the shared logger everywhere."}`
 	if _, _, ok := FromHook([]byte(payload), ws, fixed); !ok {
 		t.Error("a skill watcher must match its slash-command invocation")
 	}
-	if Match(ws, "SlashCommand", "", "/code-review --fix") == nil {
+	if Match(ws, "SlashCommand", "", "/house-review --fix") == nil {
 		t.Error("Match should resolve the slash command to the skill")
 	}
 	// A different slash command is still not this reviewer.
@@ -463,5 +463,58 @@ func TestStatus_lastCapturedComparesTimes(t *testing.T) {
 	})
 	if got[0].LastCapturedAt != "2026-01-15T12:00:05.5Z" {
 		t.Errorf("last captured should be the later time; got %q", got[0].LastCapturedAt)
+	}
+}
+
+// One review must produce one artifact. /code-review reports through
+// ReportFindings, so the hook sees two calls for a single review — and
+// capturing both recorded it twice, as two ids, which reads downstream as two
+// independent reviews agreeing and defeats the single-review hold-back exactly
+// where it matters. Its own Skill call carries prompt text, not findings.
+func TestFromHook_oneReviewIsCapturedOnce(t *testing.T) {
+	ws := watchers(t, "code-review:any")
+	skillCall := `{"tool_name":"Skill","tool_input":{"skill":"code-review"},` +
+		`"tool_response":"## Contents\n\n## Review Step R1\n\nsome skill prose"}`
+	reportCall := `{"tool_name":"ReportFindings","tool_input":` + hookFindings + `}`
+
+	if _, _, ok := FromHook([]byte(skillCall), ws, fixed); ok {
+		t.Error("a reporting skill's own call carries prompt text, not a review")
+	}
+	a, _, ok := FromHook([]byte(reportCall), ws, fixed)
+	if !ok || a.Format != FormatFindings {
+		t.Errorf("the ReportFindings call is the review; ok=%v format=%q", ok, a.Format)
+	}
+	// The slash-command route is the same call by another name.
+	slashCall := `{"tool_name":"SlashCommand","tool_input":{"command":"/code-review"},"tool_response":"prose"}`
+	if _, _, ok := FromHook([]byte(slashCall), ws, fixed); ok {
+		t.Error("the slash-command form must not double-capture either")
+	}
+}
+
+// With another review skill designated, nothing in a ReportFindings payload
+// says which one reported. Skipping beats guessing: a review filed under a
+// tool that never ran corrupts provenance, and `capture-review --file` records
+// it with the source named explicitly.
+func TestFromHook_ambiguousReporterIsSkipped(t *testing.T) {
+	payload := `{"tool_name":"ReportFindings","tool_input":` + hookFindings + `}`
+
+	if _, _, ok := FromHook([]byte(payload), watchers(t, "code-review:any", "security-review:skill"), fixed); ok {
+		t.Error("two designated review skills make the reporter ambiguous")
+	}
+	// A command-line tool cannot report through a skill's tool, so it does not
+	// make the attribution ambiguous.
+	if _, w, ok := FromHook([]byte(payload), watchers(t, "code-review:any", "semgrep:tool"), fixed); !ok || w.ID != "code-review" {
+		t.Errorf("a tool designation should not block attribution; ok=%v watcher=%q", ok, w.ID)
+	}
+}
+
+// A "<<" inside a quoted string is text, not a here-document operator. Reading
+// it as one meant the terminator was never found and every remaining line of
+// the script was swallowed, so a designated tool run after it vanished.
+func TestMatch_heredocOperatorInsideQuotesIsText(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	cmd := "git commit -m \"note << EOF style\"\nsemgrep --json ."
+	if Match(ws, "Bash", "", cmd) == nil {
+		t.Errorf("the run after the quoted text should still match\n  sanitized: %q", sanitizeCommand(cmd))
 	}
 }

@@ -45,6 +45,21 @@ var reportingTools = map[string]string{
 	"ReportFindings": "code-review",
 }
 
+// reportingSkills are the skills whose findings arrive through a reporting
+// tool rather than as their own call's result. Their Skill/SlashCommand call
+// is deliberately NOT captured: that call's response is the skill's own
+// instructions, not a review, and capturing both routes recorded one review
+// twice — as two artifacts with two ids, which reads downstream as two
+// independent reviews agreeing and so defeats the single-review hold-back
+// exactly where it matters most.
+var reportingSkills = map[string]bool{}
+
+func init() {
+	for _, skill := range reportingTools {
+		reportingSkills[skill] = true
+	}
+}
+
 // textKeys are the fields that may carry text inside a structured response.
 var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
 
@@ -68,6 +83,12 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		skill = reporter
 	}
 
+	// A skill that reports through a reporting tool is captured from that tool
+	// alone; its own call carries prompt text, not findings.
+	if !isReporting && reportingSkills[strings.ToLower(strings.TrimPrefix(skill, "/"))] {
+		return Artifact{}, state.Watcher{}, false
+	}
+
 	// A reporting tool's payload is review output but names no skill of its
 	// own, so it is attributed through reportingTools above and nowhere else.
 	// Falling back to "some designated skill watcher" instead filed
@@ -75,6 +96,16 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	// semgrep designation, say — so the artifact claimed a tool that never ran
 	// and the rules it produced cited it. A missed capture is recoverable; a
 	// review attributed to the wrong reviewer corrupts provenance silently.
+	//
+	// For the same reason the mapping is only trusted when it is unambiguous.
+	// If another review skill is also designated, any of them could have been
+	// the one that reported, and there is nothing in the payload to say which:
+	// skip rather than guess, and let `capture-review --file` record it with
+	// the source named explicitly.
+	if isReporting && ambiguousReporter(watchers, reporter) {
+		return Artifact{}, state.Watcher{}, false
+	}
+
 	matched := Match(watchers, toolName, skill, command)
 	if matched == nil {
 		return Artifact{}, state.Watcher{}, false
@@ -96,6 +127,20 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		return Artifact{}, state.Watcher{}, false
 	}
 	return art, *matched, true
+}
+
+// ambiguousReporter reports whether some designated watcher other than the
+// reporting tool's own skill could also have produced this report.
+func ambiguousReporter(ws []state.Watcher, reporter string) bool {
+	for _, w := range ws {
+		if w.Kind == KindTool {
+			continue // a command line does not report through a skill's tool
+		}
+		if !strings.EqualFold(w.Name, reporter) {
+			return true
+		}
+	}
+	return false
 }
 
 // invocation pulls the skill name and command line out of a payload's

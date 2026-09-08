@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -x \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" ]; then \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" capture-review --hook 2>/dev/null || true; fi"
+            "command": "if [ -s \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/state.json\" ] && grep -q '\"watchers\"' \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/state.json\" 2>/dev/null && [ -x \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" ]; then \"$CLAUDE_PROJECT_DIR/.claude/pattern-learner/bin/pattern-learner\" capture-review --hook 2>/dev/null || true; fi"
           }
         ]
       }

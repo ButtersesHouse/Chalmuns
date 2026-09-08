@@ -354,7 +354,11 @@ func fenceBlocks(s string) []fenceBlock {
 			out = append(out, block)
 			open = false
 		case open:
-			if isFence {
+			// Only a fence of the *same* character could have been meant as a
+			// closer, so only that one signals a forgotten one. A ``` line
+			// inside a ~~~ block is content, as the closing check above
+			// already says.
+			if fenceChar == marker {
 				nested = true
 			}
 			buf.WriteString(line)
