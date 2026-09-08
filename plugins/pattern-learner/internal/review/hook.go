@@ -115,7 +115,10 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		return Artifact{}, state.Watcher{}, false
 	}
 
-	text := responseText(doc, isReporting)
+	// Scrubbed here rather than at the Capture call, so a response that was
+	// nothing but the runner's bookkeeping falls out as "no review" instead of
+	// being recorded as whatever was left of it.
+	text := scrubJSON(responseText(doc, isReporting))
 	if strings.TrimSpace(text) == "" {
 		return Artifact{}, state.Watcher{}, false
 	}
@@ -130,7 +133,7 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	}
 
 	art, err := Capture(Input{
-		Data:   []byte(scrubJSON(text)),
+		Data:   []byte(text),
 		Source: matched.Name,
 		Format: matched.Format,
 		Label:  hookLabel(matched.Name, toolName, skill),
@@ -440,13 +443,34 @@ func marshalText(v interface{}) string {
 // prose out as review text, and carrying it in the payload instead would put a
 // crash message into the grounding corpus by the back door.
 var invocationKeys = map[string]bool{
-	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
-	"env": true, "environment": true, "cwd": true, "tool_input": true,
-	"stderr": true,
+	"command": true, "cmd": true, "argv": true, "args": true,
+	"env": true, "environment": true, "tool_input": true, "stderr": true,
 }
 
-// envelopeKeys are what a tool runner wraps a result in: where it ran and how
-// it ended. They are stripped only at the top level, because the same words
+// textInvocationKeys are stripped at every level too, but only when they hold
+// a string. `input` and `cwd` name a command line and a directory when they
+// are text — `{"run":{"input":"SEMGREP_APP_TOKEN=… semgrep"}}` — and a report
+// when they are not: a reviewer delivering findings under an `input` key had
+// the whole review deleted by a name-only rule.
+var textInvocationKeys = map[string]bool{
+	"input": true, "cwd": true,
+}
+
+// isInvocation reports whether a field is the runner's account of what was
+// run, at any level of the document.
+func isInvocation(key string, val interface{}) bool {
+	if invocationKeys[key] {
+		return true
+	}
+	if !textInvocationKeys[key] {
+		return false
+	}
+	_, isText := val.(string)
+	return isText
+}
+
+// envelopeKeys are what a tool runner wraps a result in: what tool it was and
+// how it ended. They are stripped only at the top level, because the same words
 // are report content one level down — `description` is the advisory text in
 // Snyk, Grype and Checkov findings, and `file_path` is a finding's location.
 // Stripping them everywhere deleted the reviewer's own prose from the corpus.
@@ -472,7 +496,7 @@ var envelopeKeys = map[string]bool{
 func reportPayload(t map[string]interface{}) string {
 	rest := make(map[string]interface{}, len(t))
 	for key, val := range t {
-		if envelopeKeys[key] || invocationKeys[key] || isResponseTextKey(key) {
+		if envelopeKeys[key] || isInvocation(key, val) || isResponseTextKey(key) {
 			continue
 		}
 		rest[key], _ = scrub(val, 0)
@@ -500,7 +524,7 @@ func scrub(v interface{}, depth int) (interface{}, bool) {
 		var out map[string]interface{}
 		for key, val := range t {
 			scrubbed, changed := interface{}(nil), false
-			if invocationKeys[key] {
+			if isInvocation(key, val) {
 				changed = true
 			} else {
 				scrubbed, changed = scrub(val, depth+1)
@@ -515,7 +539,7 @@ func scrub(v interface{}, depth int) (interface{}, bool) {
 			if out == nil {
 				continue
 			}
-			if invocationKeys[key] {
+			if isInvocation(key, val) {
 				delete(out, key)
 			} else {
 				out[key] = scrubbed
@@ -551,26 +575,83 @@ func scrub(v interface{}, depth int) (interface{}, bool) {
 // container and every invocation field in it — `{"results":[…],"command":
 // "SEMGREP_APP_TOKEN=… semgrep"}` — went into the artifact verbatim.
 //
-// The original bytes are returned untouched unless something was actually
-// removed, because they are the grounding corpus and re-marshalling reorders
-// keys and drops the tool's own formatting for no reason.
+// It scrubs the JSON documents *inside* the text rather than requiring the
+// whole string to be one. `npm run lint` prints a banner first, a runner may
+// add a timing line after, and some tools emit JSON Lines — and demanding one
+// clean document turned the scrub off entirely for all three, which is the
+// same leak with a wrapper around it.
+//
+// The original bytes come back untouched when nothing was removed: RawText is
+// the grounding corpus, and re-encoding reorders keys and rewrites numbers for
+// no reason. An empty string means the text was nothing but the runner's
+// bookkeeping and there is no review left to record.
 func scrubJSON(text string) string {
-	trimmed := strings.TrimSpace(text)
-	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+	rest := text
+	var out strings.Builder
+	changedAny := false
+	for {
+		start := strings.IndexAny(rest, "{[")
+		if start < 0 {
+			break
+		}
+		value, end, ok := decodeJSONPrefix(rest[start:])
+		if !ok {
+			// Not the start of a document after all; keep looking past it.
+			out.WriteString(rest[:start+1])
+			rest = rest[start+1:]
+			continue
+		}
+		scrubbed, changed := scrub(value, 0)
+		out.WriteString(rest[:start])
+		if changed {
+			changedAny = true
+			out.WriteString(encodeJSON(scrubbed))
+		} else {
+			out.WriteString(rest[start : start+end])
+		}
+		rest = rest[start+end:]
+	}
+	if !changedAny {
 		return text
 	}
-	var doc interface{}
-	if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
-		return text
+	out.WriteString(rest)
+	if strings.TrimSpace(out.String()) == "{}" {
+		// Everything the document held was bookkeeping.
+		return ""
 	}
-	scrubbed, changed := scrub(doc, 0)
-	if !changed {
-		return text
+	return out.String()
+}
+
+// decodeJSONPrefix decodes the JSON value at the start of s, returning it and
+// how many bytes it spans. Decoding a prefix rather than the whole string is
+// what lets a report survive a banner line before it or a summary after it.
+func decodeJSONPrefix(s string) (value interface{}, end int, ok bool) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	// Numbers are kept as written. Round-tripping them through float64 moved
+	// a large line number and rewrote `1.0` as `1`, in text documented as
+	// byte-for-byte.
+	dec.UseNumber()
+	if err := dec.Decode(&value); err != nil {
+		return nil, 0, false
 	}
-	if out := marshalText(scrubbed); out != "" {
-		return out
+	switch value.(type) {
+	case map[string]interface{}, []interface{}:
+		return value, int(dec.InputOffset()), true
 	}
-	return text
+	return nil, 0, false
+}
+
+// encodeJSON renders a scrubbed value without the HTML escaping json.Marshal
+// applies by default, which would rewrite a reviewer's `a < b && c > d` as
+// escape sequences in the corpus a signal has to quote verbatim.
+func encodeJSON(v interface{}) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return ""
+	}
+	return strings.TrimRight(buf.String(), "\n")
 }
 
 func isResponseTextKey(key string) bool {

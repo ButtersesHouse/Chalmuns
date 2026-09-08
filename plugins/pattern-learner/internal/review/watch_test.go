@@ -544,6 +544,20 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"nested quotes around a variable", `out="$(semgrep --json "$dir")"`, true},
 		{"nested quoted data is not a run", `sudo "$(x "semgrep ." y)"`, false},
 		{"a separator in a nested quoted format string", `echo "$(git log --format="%s; semgrep noise")"`, false},
+		// What follows a substitution inside the same quoted word is part of
+		// that word, not a program name of its own.
+		{"a tail after a substitution", `echo "$(date)semgrep"`, false},
+		{"a tail after a substitution in an assignment", `X="$(git rev-parse HEAD)semgrep"`, false},
+		// `$((…))` is arithmetic and `$$(` is the process id: neither opens a
+		// substitution, and reading them as one put their text in command
+		// position.
+		{"quoted arithmetic is not a substitution", `echo "$(( semgrep ))"`, false},
+		{"quoted process id", `echo "$$(semgrep .)"`, false},
+		{"unquoted process id", `echo $$(semgrep .)`, false},
+		// The older backtick spelling runs commands too, quoted or not.
+		{"quoted backticks", "echo \"`semgrep .`\"", true},
+		{"unquoted backticks", "echo `semgrep .`", true},
+		{"backticked prose is not a run", "echo \"`git log --format='x; semgrep noise'`\"", false},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -826,6 +840,24 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		// An `input` and a `cwd` are what was run and where, wherever they sit.
 		{"a nested input is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"input":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}}`, true, "sk-secret", "check_id"},
 		{"a nested cwd is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"cwd":"/home/secret-project"}}`, true, "secret-project", "check_id"},
+		// A report is scrubbed wherever it sits in the output: `npm run lint`
+		// prints a banner first, a runner may add a timing line after, and
+		// some tools emit JSON Lines. Requiring one clean document turned the
+		// scrub off for all three — the same leak with a wrapper around it.
+		{"banner before the JSON", `{"stdout":"> pkg@1.0.0 lint\n> semgrep --json .\n\n{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
+		{"summary after the JSON", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}\\nran in 3s"}`, true, "sk-secret", "check_id"},
+		{"JSON lines", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}]}\\n{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
+		// A payload that was nothing but bookkeeping records nothing. Falling
+		// back to the original text when the scrub emptied the document wrote
+		// the credential out whole.
+		{"a payload that is only a command", `{"stdout":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}"}`, false, "", ""},
+		{"a payload that is only an env", `{"stdout":"{\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, false, "", ""},
+		// `input` names a command line when it is text and a report when it is
+		// not, so a name-only rule deleted the review.
+		{"a report under an input key survives", `{"stdout":"{\"input\":{\"findings\":[{\"file\":\"a.go\",\"summary\":\"Use the shared client everywhere.\"}]}}"}`, true, "", "shared client"},
+		// Re-encoding must not rewrite the corpus a signal has to quote.
+		{"angle brackets survive the scrub", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"prefer a < b && c > d\"}}],\"command\":\"TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "prefer a < b && c > d"},
+		{"a large line number survives the scrub", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"start\":{\"line\":9007199254740993},\"extra\":{\"message\":\"m\"}}],\"command\":\"TOKEN=sk-secret\"}"}`, true, "sk-secret", "9007199254740993"},
 		// Prose is never re-marshalled: it is the grounding corpus verbatim.
 		{"prose is left exactly as written", `{"stdout":"## Review\n\nUse the shared client, the command was fine."}`, true, "", "the command was fine"},
 		{"a deep SARIF report survives intact", `{"runs":[{"tool":{"driver":{"rules":[{"id":"R1","fullDescription":{"text":"Use the shared client."}}]}},"results":[{"ruleId":"R1","message":{"text":"raw requests are banned"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a.py"},"region":{"startLine":42,"snippet":{"text":"requests.get()"}}}}]}]}]}`, true, "", "requests.get()"},
