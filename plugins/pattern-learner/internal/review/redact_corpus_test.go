@@ -178,6 +178,13 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a camelcase literal behind a dollar", `password: $dbHunter2pass`, "dbHunter2pass", "password"},
 	{"a leetspeak literal behind a dollar", `password: $sup3rS3cret`, "sup3rS3cret", "password"},
 	{"a hardcoded expansion default", `password: ${DB_PASSWORD:-hunter2trustno1}`, "hunter2trustno1", "password"},
+	// Rows for the leaks the thirty-third review found. Widening the container
+	// bound widened it for pieces carrying digits too, where hasWordBreak was
+	// already doing the excusing — so the corpus's own canonical credential
+	// walked out the moment a secret-ish word was appended to it.
+	{"a payload before a secret-ish tail", `{"extra":{"lines":"  api_key: hunter2trustno1.password"}}`, "hunter2trustno1", "extra"},
+	{"a camel payload before a secret-ish tail", `password: wJalr2XUtn3FEMI.secret`, "wJalr2XUtn3FEMI", "password"},
+	{"a numeric payload before a secret-ish tail", `password: 8391027465019283.password`, "8391027465019283", "password"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -347,6 +354,9 @@ var proseCorpus = []struct{ name, in string }{
 	{"a capitalised container name", `{"extra":{"lines":"  password: DatabaseSettings.Password"}}`},
 	{"an indexed reference", `{"extra":{"lines":"  password: creds[0].password"}}`},
 	{"a longer replacement template", `sed -i 's/(a)(b)/$1$2_and_more/' README.md`},
+	// PowerShell's drive separator is a colon, so the braced spelling has to
+	// agree with the bare one.
+	{"a braced powershell environment drive", `api_key: ${env:API_KEY2}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
@@ -372,6 +382,13 @@ var proseCorpus = []struct{ name, in string }{
 // sentence after the span, the name survives anyway, which the rows above
 // pin.
 var acceptedRewrites = []struct{ name, in, rewritten string }{
+	// A variable whose name mixes case and carries a digit is spelled exactly
+	// like a literal wearing a dollar sign — `$oauth2Token` and
+	// `$dbHunter2pass` differ in nothing a rule can see — and the corpus
+	// requires the literal to be redacted. Single-case names, which is how a
+	// shell variable is conventionally spelled, are unaffected: `$DB_PASSWORD`
+	// and `$dbPassword` both survive, and the proseCorpus pins them.
+	{"a camelcase variable carrying a digit", `password: $oauth2Token`, "oauth2Token"},
 	{"a constant in a bare span", "- **secret: SHA256_DIGEST**", "SHA256_DIGEST"},
 }
 

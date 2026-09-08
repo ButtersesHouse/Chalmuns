@@ -818,13 +818,13 @@ var secretPatterns = []*regexp.Regexp{
 // closing backtick of “ `api_key: abcdef` “ left the rest of the write-up
 // rendering as code.
 //
-// The one closing bracket it does take is an index, `[0]`, because a reference
-// into a collection is one value — `creds[0].password` — and stopping at the
+// The two closing braces it does take are an index, `[0]`, and an expansion,
+// `${VAR:-default}`. Both because a reference — `creds[0].password` — and stopping at the
 // bracket left `creds[0` to be judged on its own, which reads as a credential
 // and rewrote the reference into `[redacted]].password`. The index alternative
 // comes first: the engine takes the first branch that lets the whole pattern
 // succeed, and the general class matching a lone `[` was one of them.
-const bareValue = "((?:\\[[0-9]+\\]|[^\\s\"',;)\\]}\\\\])+)"
+const bareValue = "((?:\\$\\{[^}\\s]*\\}|\\[[0-9]+\\]|[^\\s\"',;)\\]}\\\\])+)"
 
 var colonForms = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*:[ \t]*` + escapedQuote + `)(` + quotedValue + `)(` + escapedQuote + `)`),
@@ -988,11 +988,20 @@ func isContainerPiece(piece string) bool {
 	if piece == "" || len([]rune(piece)) >= maxContainerRunes {
 		return false
 	}
-	// An index into a collection of them: `creds[0].password`.
+	// An index into a collection of them: `creds[0].password`. Bounded, or a
+	// nineteen-digit payload reads as one.
 	if strings.IndexFunc(piece, func(r rune) bool { return !unicode.IsDigit(r) }) < 0 {
+		return len([]rune(piece)) <= maxIndexDigits
+	}
+	if !strings.ContainsAny(piece, "0123456789") {
 		return true
 	}
-	return !strings.ContainsAny(piece, "0123456789") || hasWordBreak(piece)
+	// A piece carrying digits keeps the tighter bound. The names that needed
+	// the longer one — `databaseConfig`, `serviceAccount`, `connectionSettings`
+	// — are all digit-free, and hasWordBreak was already excusing a camelCase
+	// piece, so widening this side let the corpus's own canonical credential
+	// walk out the moment `.password` was appended to it.
+	return hasWordBreak(piece) && len([]rune(piece)) < maxDigitPieceRunes
 }
 
 // isVarExpansion reports whether a value is a variable being expanded rather
@@ -1017,7 +1026,10 @@ func isVarExpansion(value string) bool {
 		// But the default is also where a compose file keeps the password it
 		// hardcoded, so it is only ignorable while it looks like a placeholder.
 		// A digit in it says otherwise: `${DB_PASSWORD:-hunter2trustno1}`.
-		if i := strings.IndexAny(name, ":-+?"); i > 0 {
+		// PowerShell's drive separator is also a colon, and `${env:API_KEY2}`
+		// is a name rather than a name and a default — testing what follows it
+		// made the braced spelling disagree with the bare one.
+		if i := strings.IndexAny(name, ":-+?"); i > 0 && !strings.EqualFold(name[:i], "env") {
 			if strings.ContainsAny(name[i:], "0123456789") {
 				return false
 			}
@@ -1058,12 +1070,16 @@ func isVarName(name string) bool {
 
 var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
 
-// maxContainerRunes is how long the name of a thing a credential is reached
-// through may run. Twenty rather than something tighter because the names real
-// code uses are long — `databaseConfig`, `serviceAccount`, `connectionSettings`
-// — and the digit rule below is what actually separates a container from a
-// payload.
-const maxContainerRunes = 20
+// How long the name of a thing a credential is reached through may run.
+// maxContainerRunes is twenty because the names real code uses are long —
+// `databaseConfig`, `serviceAccount`, `connectionSettings` — and every one of
+// them is digit-free; a piece that carries digits keeps the tighter bound, and
+// an index is bounded shorter still.
+const (
+	maxContainerRunes  = 20
+	maxDigitPieceRunes = 13
+	maxIndexDigits     = 4
+)
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
 // rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
