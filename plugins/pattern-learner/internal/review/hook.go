@@ -656,21 +656,15 @@ func (s *jsonScrub) value(v interface{}, key string, depth int) (interface{}, bo
 			// really is a list of credentials, and dropping the key committed
 			// them. So the name is carried in and the element is taken on its
 			// own shape: an opaque token is a credential, a rule name is not.
-			if str, ok := e.(string); ok && reSecretKey.MatchString(key) {
-				switch {
-				case looksOpaque(str):
-					out[i], changed = redactedMarker, true
-					continue
-				case namesSomething(str):
-					// The key says the list holds credentials and the element
-					// says it is a name, so the judgement is made and the prose
-					// rules do not get to make it again: they found a
-					// `name: value` inside the rule id
-					// `gitleaks:generic-api-key:v8.18.0` and rewrote its
-					// version.
-					out[i] = str
-					continue
-				}
+			//
+			// An element that is not opaque still goes through the patterns
+			// below. Short-circuiting it here — the key and the shape have
+			// spoken, let the value be — lost every credential embedded in a
+			// longer string: `["Hardcoded key AKIA… in app.py"]` is what a
+			// scanner's list of findings actually looks like.
+			if str, ok := e.(string); ok && reSecretKey.MatchString(key) && looksOpaque(str) {
+				out[i], changed = redactedMarker, true
+				continue
 			}
 			// A nested array is the same list one level down, so it keeps the
 			// name; anything else is a value of its own and starts afresh.
@@ -890,6 +884,12 @@ func isAssignedCredential(text string, loc []int) bool {
 		// file that does not exist, in the text grounding checks against.
 		return false
 	}
+	if namesSomething(value) {
+		// Likewise a name: `cfg.OAuth2Token`, `SHA256_DIGEST`, a scanner's own
+		// rule id. The same test the array branch uses, so a value is judged
+		// the same way wherever it turns up.
+		return false
+	}
 	if beginsItsUnit(text, loc[0]) {
 		// An assignment. What follows is an annotation — `# rotate this`,
 		// `(line 4)`, the punctuation closing a field — unless it is a word,
@@ -903,14 +903,9 @@ func isAssignedCredential(text string, loc []int) bool {
 	// describing it, and reading "is committed" as words after the value left
 	// the credential in the artifact.
 	//
-	// Dropping those words leaves the value to settle it alone, so here — and
-	// only here, where nothing else can — a value that reads as a name the
-	// reviewer quoted is not taken. Everywhere else the surroundings still
-	// decide, which is what keeps `Using api_key: wJalrXUtnFEMI` redacted.
+	// Dropping those words leaves the value to settle it alone, which is safe
+	// only because a value that names something has already been let go above.
 	if end := markdownSpanEnd(text, loc[0]); end >= loc[4]+len(value) {
-		if namesSomething(value) {
-			return false
-		}
 		rest = text[loc[4]+len(value) : end]
 	}
 	// A name with words before it is prose. Only a value that could be
@@ -923,29 +918,53 @@ func isAssignedCredential(text string, loc []int) bool {
 }
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
-// rather than as a credential: a dotted expression (`cfg.OAuth2Token`,
-// `process.env.API_KEY`, `gitleaks:generic-api-key:v8.18.0`, a URL), a
-// CONSTANT_NAME (`SHA256_DIGEST`, `OAUTH2_CLIENT_ID`), or a camelCase one
-// (`sessionToken`).
+// rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
+// `OAUTH2_CLIENT_ID`), or a qualified one whose pieces are all short
+// (`cfg.OAuth2Token`, `process.env.API_KEY`, `gitleaks:generic-api-key:v8.18.0`).
 //
-// It is a weak test and is used only where the alternative is no test at all:
-// where a value has been cut off from the sentence that would otherwise judge
-// it. A credential shaped like an identifier survives it — which is the same
-// trade isFileReference makes, and made for the same reason: of the two
-// errors, rewriting a name the reviewer cited is the one that leaves the
-// finding describing something that does not exist, in the text grounding
-// checks against.
+// Both halves are bounded on purpose. "Looks like camelCase" was the first
+// attempt and it is not a test at all: more than 999 in 1000 random base64
+// strings contain a lowercase letter followed by an uppercase one, so it
+// excused nearly every credential it was shown. What a name has and a payload
+// does not is *joints* — it is short pieces with separators between them, and
+// a run of sixteen unbroken characters is not a piece of a name. That is what
+// keeps a JWT, whose dots make it look qualified, on the credential side.
+//
+// A URL is excluded outright: `postgres://admin:sup3rS3cret@db/app` has all
+// the joints of a name and a password in the middle of it.
+//
+// It is used only where the alternative is no test at all — where a value has
+// been cut off from the sentence that would otherwise judge it, or where a
+// key's own name is all there is. A credential shaped like a short qualified
+// name survives it; that is the same trade isFileReference makes, for the same
+// reason.
 func namesSomething(value string) bool {
-	if strings.Contains(value, ".") {
-		return true
+	if strings.Contains(value, "://") && strings.Contains(value, "@") {
+		// Userinfo, which is where a URL keeps its password. A plain endpoint
+		// has all the joints of a name and is one.
+		return false
 	}
 	if strings.Contains(value, "_") && value == strings.ToUpper(value) {
 		return true
 	}
-	return reCamelHump.MatchString(value)
+	if !strings.Contains(value, ".") {
+		return false
+	}
+	for _, piece := range strings.FieldsFunc(value, isNameSeparator) {
+		if len([]rune(piece)) >= maxNamePieceRunes {
+			return false
+		}
+	}
+	return true
 }
 
-var reCamelHump = regexp.MustCompile(`[a-z][A-Z]`)
+func isNameSeparator(r rune) bool {
+	return strings.ContainsRune("._-:/@", r)
+}
+
+// maxNamePieceRunes is how long one piece of a qualified name runs before it
+// stops being a word and starts being a payload.
+const maxNamePieceRunes = 16
 
 // beginsItsUnit reports whether the match at i starts its line or its string,
 // give or take the punctuation a list item, a heading, a fence or an indent
@@ -1069,6 +1088,13 @@ func hasLetter(s string) bool {
 // extension. A total-length ceiling could not tell those apart: the secret
 // above and the Java path are four runes apart.
 //
+// A long segment is allowed when it carries no digits, because that is what a
+// long *name* looks like: `AuthenticationTokenProviderTest.java` is routine in
+// a Java or TypeScript test suite, while the base64 chunk this bound is for —
+// `AKIAIOSFODNN7EXAMPLEwJalrXUtn.key` — has digits mixed through it. Bounding
+// long segments outright rewrote the first; allowing them outright kept the
+// second.
+//
 // Known limitation: a base64 secret whose slashes happen to fall often enough
 // to keep every piece short is read as a path. The two are not separable by
 // shape there, and reading a cited path as a credential is the error that
@@ -1081,7 +1107,8 @@ func isFileReference(value string) bool {
 		return len([]rune(value)) < maxUnbrokenPathRunes
 	}
 	for _, seg := range strings.Split(value, "/") {
-		if len([]rune(seg)) >= maxPathSegmentRunes {
+		if n := len([]rune(seg)); n >= maxLongSegmentRunes ||
+			(n >= maxPathSegmentRunes && strings.ContainsAny(seg, "0123456789")) {
 			return false
 		}
 	}
@@ -1091,11 +1118,13 @@ func isFileReference(value string) bool {
 // How long a piece of a path may run. maxUnbrokenPathRunes is the stricter
 // bound for a value with no separator at all, where the whole thing is one file
 // name and nothing but the extension says "path"; it is what tells a JWT's last
-// dotted segment from a real extension. maxPathSegmentRunes bounds each
-// directory or file name in a value that does have separators.
+// dotted segment from a real extension. The other two bound one directory or
+// file name: maxPathSegmentRunes where it carries digits, maxLongSegmentRunes
+// where it is letters all the way.
 const (
 	maxUnbrokenPathRunes = 24
 	maxPathSegmentRunes  = 32
+	maxLongSegmentRunes  = 64
 )
 
 var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)

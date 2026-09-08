@@ -102,6 +102,20 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	// The ceiling on isFileReference: past it no path a review cites is that
 	// long, so a separator and an extension stop excusing the value.
 	{"a long slashed value with a dotted tail", `secret: wJalrXUtnFEMI/K7MDENGbPxRfiCYEXAMPLEKEY/AKIAIOSFODNN7EXAMPLEwJalrXUtn.key`, "wJalrXUtnFEMI", "secret"},
+	// Rows for the leaks the twenty-sixth review found. "Looks like camelCase"
+	// excused more than 999 random base64 strings in 1000, so every one of
+	// these came back verbatim. A name has short pieces with separators between
+	// them; sixteen unbroken characters is a payload.
+	{"a capitalised array credential", `{"passwords":["aB8f3d9e2c1b47f60"]}`, "aB8f3d9e2c1b47f60", "passwords"},
+	{"a slashed array credential", `{"passwords":["wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]}`, "wJalrXUtnFEMI", "passwords"},
+	{"a jwt in an array", `{"tokens":["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc"]}`, "eyJhbGciOiJIUzI1NiJ9", "tokens"},
+	{"a jwt in a span", "- **api_key: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc** is hardcoded", "eyJhbGciOiJIUzI1NiJ9", "is hardcoded"},
+	{"a url with a password in a span", `- **token: https://user:s3cr3tpassw0rd@example.com/repo** is committed`, "s3cr3tpassw0rd", "is committed"},
+	// An array element that is not itself a credential still goes through the
+	// patterns: a scanner's list of findings is sentences with credentials in
+	// them.
+	{"a credential inside a listed sentence", `{"secrets":["Hardcoded key AKIAIOSFODNN7EXAMPLE in app.py"]}`, "AKIAIOSFODNN7EXAMPLE", "app.py"},
+	{"a connection string in a list", `{"credentials":["postgres://admin:sup3rS3cret@db.internal:5432/app"]}`, "sup3rS3cret", "credentials"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -134,11 +148,13 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
-	// A credential shaped like a name survives where the sentence around it
-	// cannot be consulted — inside a markdown span the write-up continues past.
-	// See namesSomething: the alternative rewrote every identifier a review
-	// quotes that happens to carry a digit.
-	{"an identifier-shaped credential in a span", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7"},
+	// A credential shaped like a qualified name survives: dotted, with every
+	// piece under sixteen runes and no userinfo in it. The bound is what the
+	// class is — a secret can be spelled that way and a name has to be, and
+	// the alternative rewrote every identifier a review quotes that happens to
+	// carry a digit. See namesSomething.
+	{"a short qualified credential", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7"},
+	{"a chunked credential", `secret: aB3xY9zQ7wE.rT5yU8iO2p.aS4dF7gH1j`, "aB3xY9zQ7wE"},
 	// Past the depth bound the structural pass hands the whole text to the
 	// patterns, and the patterns have no equivalent of the array rule — a name
 	// followed by `[` is not a `name: value`. Nothing but nesting built to
@@ -219,6 +235,11 @@ var proseCorpus = []struct{ name, in string }{
 	{"variable names listed under a secret-ish key", `{"secrets":["OAUTH2_CLIENT_ID","DB_PASSWORD","STRIPE_KEY"]}`},
 	{"a versioned rule id listed under a secret-ish key", `{"secrets":["gitleaks:generic-api-key:v8.18.0"]}`},
 	{"an endpoint listed under a secret-ish key", `{"tokens":["https://api.example.com/v2/tokens"]}`},
+	// A long file name is a name; what makes a long path segment a payload is
+	// digits mixed through it. Bounding every long segment rewrote the test
+	// classes a Java or TypeScript suite is full of.
+	{"a long cited test file", "- The private_key: src/test/AuthenticationTokenProviderTest.java is committed"},
+	{"a long cited chunk file", "- The token: dist/static/js/VendorAuthenticationBundleChunk.js reads it"},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.

@@ -64,8 +64,10 @@ func ValidFormat(f string) bool {
 // capture at a narrower review instead.
 const maxArtifactBytes = 4 << 20 // 4 MiB
 
-// checkSize refuses a capture that would not fit. It is applied to the input
-// and again to the redacted text, which is what actually becomes RawText.
+// checkSize refuses a capture that would not fit. It is applied to what the
+// caller offered and not again afterwards: redaction can grow the text by up
+// to about half, so the stored RawText may pass the cap by that much. See the
+// call in Capture for why that is the better of the two errors.
 func checkSize(n int) error {
 	if n <= maxArtifactBytes {
 		return nil
