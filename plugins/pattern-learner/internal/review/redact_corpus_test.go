@@ -186,6 +186,14 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a camel payload before a secret-ish tail", `password: wJalr2XUtn3FEMI.secret`, "wJalr2XUtn3FEMI", "password"},
 	{"a numeric payload before a secret-ish tail", `password: 8391027465019283.password`, "8391027465019283", "password"},
 
+	// Rows for the leaks the thirty-fifth review found. Reading a sequence of
+	// expansions made `$` into glue, and a crypt hash is exactly a chain of
+	// `$name` runs — so the rule written to catch them started excusing them.
+	{"an apr1 hash", `password: $apr1$saltsalt$hashhashhashhashhash`, "saltsalt", "password"},
+	{"a bcrypt-named hash", `password: $bcrypt$saltsaltsalt$hashhashhashhash`, "saltsaltsalt", "password"},
+	// And the sequence has to be the whole value, not the end of one.
+	{"a literal with an expansion appended", `password: changeme${DB}`, "changeme", "password"},
+	{"a passphrase with a variable appended", `password: correcthorsebatterystaple$FOO`, "correcthorse", "password"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -220,6 +228,11 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// The rate is low — a key is base64 or hex, and both carry digits — and the
 	// alternative rewrote `validatingwebhookconfiguration.go`, a real file.
 	{"a digit-free lowercase payload in a path", `secret: uploads/wjalrxutnfemikmdengbpxrficyexamplekey.key`, "wjalrxutnfemi"},
+	// A payload just under the digit-carrying container bound reads as the
+	// thing a credential is reached through. The bound has to clear
+	// `oauth2_config` and its kind, and nothing separates a thirteen-rune
+	// container name from a thirteen-rune payload with a word break in it.
+	{"a payload at the container bound", `password: wJalr2XUtn3FE.password`, "wJalr2XUtn3FE"},
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
@@ -378,7 +391,7 @@ var proseCorpus = []struct{ name, in string }{
 	// The expansion alternative in the value class excludes what the general
 	// class excludes, or an unclosed `${` runs to a brace further down the line
 	// and eats the quote that ends the enclosing JSON string.
-	{"an unclosed expansion inside JSON", `{"results":[{"m":"ok"}],"lines":"password: ${DB_PASSWORD"}`},
+	{"an unclosed expansion in a truncated report", `{"results":[{"m":"ok"}],"lines":"password: ${DB_PASSWORD"`},
 	{"an unclosed expansion before an escape", `{"cmd":"password: ${DB_PASS\"},\"x\":1"}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header

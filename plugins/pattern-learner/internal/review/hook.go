@@ -1015,12 +1015,26 @@ func isContainerPiece(piece string) bool {
 // besides. What this accepts is what a shell, a compose file or PowerShell
 // actually writes, defaults included.
 func isVarExpansion(value string) bool {
-	rest, saw := value, false
+	if !strings.HasPrefix(value, "$") {
+		// The sequence has to *be* the value, not end it. Without this a
+		// digit-free literal with any variable appended walked out whole:
+		// `password: changeme${DB}`, `correcthorsebatterystaple$FOO`.
+		return false
+	}
+	rest, saw, bare := value, false, false
 	for {
 		i := strings.IndexByte(rest, '$')
 		if i < 0 {
 			break
 		}
+		if bare && i == 0 {
+			// One unbraced expansion running straight into the next is not a
+			// composition, it is a crypt hash: `$apr1$saltsalt$hashhash`,
+			// `$argon2id$salt$hash`. No compose file writes `$A$B`; every
+			// composition worth reading uses braces.
+			return false
+		}
+		bare = !strings.HasPrefix(rest[i:], "${")
 		// The literal text joining two expansions. A composed value is still an
 		// expansion — `${DB_USER}:${DB_PASS}`, `${VAR}-suffix`, `${PREFIX}${SUFFIX}`
 		// — as long as what joins them is not itself carrying a secret. Reading
@@ -1139,7 +1153,7 @@ var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.m
 // an index is bounded shorter still.
 const (
 	maxContainerRunes  = 20
-	maxDigitPieceRunes = 15 // `oauth2_config`, `my_db2_config`, `api_v2_config`
+	maxDigitPieceRunes = 14 // `oauth2_config`, `my_db2_config`, `api_v2_config`
 	maxIndexDigits     = 4
 )
 
