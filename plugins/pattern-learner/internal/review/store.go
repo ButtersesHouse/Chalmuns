@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ButtersesHouse/Chalmuns/internal/fsatomic"
 )
 
 // The review cache mirrors the PR raw-cache: one JSON file per captured
@@ -44,31 +46,8 @@ func WriteArtifact(cacheDir string, a Artifact) (written bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	// The temp file must be unique per writer, not per artifact. A fixed
-	// "<path>.tmp" is shared by every process writing that ReviewID, and two
-	// captures of one review are entirely ordinary — the hook firing while the
-	// user runs `capture-review --file` on the same report, or two parallel
-	// calls of a watched tool whose output is identical. Two writers of
-	// different lengths interleaving on one temp file left a permanently
-	// corrupt artifact: the early-return above means no later capture ever
-	// repairs it, ListArtifacts skips it with a warning, and the review is
-	// never mined.
-	tmp, err := os.CreateTemp(cacheDir, a.ReviewID+".*.tmp")
-	if err != nil {
-		return false, err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return false, err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+	// One atomic write, shared with state.Write — see internal/fsatomic.
+	if err := fsatomic.WriteFile(path, data); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -220,11 +199,18 @@ func Select(all []Artifact, ids []string, since string) []Artifact {
 	mark := capturedTime(since)
 	var out []Artifact
 	for _, a := range all {
-		// An unparseable stamp is included rather than dropped. It sorts
-		// first, so it is visible at the head of the batch — whereas skipping
-		// it makes the review captured, counted by `watch --list`, and
-		// permanently unmineable with nothing to explain the silence.
-		if t := capturedTime(a.CapturedAt); t.IsZero() || t.After(mark) {
+		t := capturedTime(a.CapturedAt)
+		if t.IsZero() {
+			// Neither silently skipped nor silently included: including it
+			// re-mines it on every run and, if it is the newest selected, its
+			// unparseable stamp becomes the next watermark and stalls the
+			// whole path. Say so instead, once, where the run can see it.
+			fmt.Fprintf(os.Stderr,
+				"warn: %s has an unreadable captured_at (%q) and is skipped; re-capture it or fix the stamp\n",
+				a.ReviewID, a.CapturedAt)
+			continue
+		}
+		if t.After(mark) {
 			out = append(out, a)
 		}
 	}
@@ -258,13 +244,57 @@ func Lean(as []Artifact) []LeanReview {
 	return out
 }
 
-// ExtractLean reads cacheDir and returns the lean views a run should mine.
-func ExtractLean(cacheDir string, ids []string, since string) ([]LeanReview, error) {
-	all, err := ListArtifacts(cacheDir)
+// ExtractLean reads cacheDir and returns the lean views a run should mine,
+// plus the watermark a watermark-driven run should advance to.
+//
+// Selection happens on metadata alone and only the chosen artifacts' bodies
+// are read. A watermark run typically wants one or two of hundreds, and each
+// artifact carries its whole review text — decoding the entire cache to throw
+// almost all of it away was the bulk of the work on a path that runs on every
+// review-mode invocation.
+func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview, watermark string, err error) {
+	meta, err := ListArtifactMeta(cacheDir)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return Lean(Select(all, ids, since)), nil
+	chosen := Select(meta, ids, since)
+	if len(ids) > 0 {
+		// An explicit id run mines out of order on purpose, so it has no
+		// watermark to hand back: advancing past reviews it skipped would make
+		// them unmineable for good.
+		watermark = ""
+	} else {
+		watermark = Newest(chosen)
+	}
+
+	full := make([]Artifact, 0, len(chosen))
+	for _, m := range chosen {
+		a, err := ReadArtifact(cacheDir, m.ReviewID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", m.ReviewID, err)
+			continue
+		}
+		full = append(full, a)
+	}
+	return Lean(full), watermark, nil
+}
+
+// MissingIDs returns the requested ids that name no artifact in the cache.
+// An unknown id selects nothing, and "nothing" is the same answer as "already
+// mined" — so a typo would be reported to the user as a review already
+// consumed, when in fact none was looked at.
+func MissingIDs(all []Artifact, ids []string) []string {
+	have := map[string]bool{}
+	for _, a := range all {
+		have[a.ReviewID] = true
+	}
+	var missing []string
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" && !have[id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 // Newest returns the capture timestamp of the last artifact in an ordered

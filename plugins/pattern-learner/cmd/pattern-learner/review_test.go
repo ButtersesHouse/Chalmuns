@@ -296,9 +296,13 @@ func TestRunExtractReview_selectsAndShapesForTheSubagent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var lean []review.LeanReview
-	if err := json.Unmarshal([]byte(out), &lean); err != nil {
-		t.Fatalf("extract-review output is not the documented JSON array: %v\n%s", err, out)
+	var res extractReviewResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("extract-review output is not the documented JSON object: %v\n%s", err, out)
+	}
+	lean := res.Reviews
+	if res.NextWatermark == "" {
+		t.Error("a watermark run should hand back the watermark to store")
 	}
 	if len(lean) != 2 {
 		t.Fatalf("want 2 lean reviews, got %d", len(lean))
@@ -317,8 +321,11 @@ func TestRunExtractReview_selectsAndShapesForTheSubagent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out) != "[]" {
-		t.Errorf("empty cache should print []; got %q", strings.TrimSpace(out))
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Reviews) != 0 {
+		t.Errorf("empty cache should yield no reviews; got %d", len(res.Reviews))
 	}
 
 	if err := runExtractReview([]string{}); err == nil {
@@ -333,8 +340,8 @@ func TestRunExtractReview_sinceWatermark(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, a := range []review.Artifact{
-		{ReviewID: "rev-old", Source: "code-review", Format: review.FormatFindings, CapturedAt: "2026-01-01T00:00:00Z", RawText: "x"},
-		{ReviewID: "rev-new", Source: "code-review", Format: review.FormatFindings, CapturedAt: "2026-01-05T00:00:00Z", RawText: "y"},
+		{ReviewID: "rev-000000000001", Source: "code-review", Format: review.FormatFindings, CapturedAt: "2026-01-01T00:00:00Z", RawText: "x"},
+		{ReviewID: "rev-000000000005", Source: "code-review", Format: review.FormatFindings, CapturedAt: "2026-01-05T00:00:00Z", RawText: "y"},
 	} {
 		if _, err := review.WriteArtifact(cacheDir, a); err != nil {
 			t.Fatal(err)
@@ -347,26 +354,41 @@ func TestRunExtractReview_sinceWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var lean []review.LeanReview
-	if err := json.Unmarshal([]byte(out), &lean); err != nil {
+	var res extractReviewResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
 		t.Fatal(err)
 	}
-	if len(lean) != 1 || lean[0].ReviewID != "rev-new" {
-		t.Errorf("watermark should exclude the already-mined review; got %+v", lean)
+	if len(res.Reviews) != 1 || res.Reviews[0].ReviewID != "rev-000000000005" {
+		t.Errorf("watermark should exclude the already-mined review; got %+v", res.Reviews)
+	}
+	if res.NextWatermark != "2026-01-05T00:00:00Z" {
+		t.Errorf("watermark should advance to the newest mined review; got %q", res.NextWatermark)
 	}
 
 	// An explicit id list overrides the watermark.
+	res = extractReviewResult{}
 	out, err = captureStdout(t, func() error {
-		return runExtractReview([]string{"--cache-dir", cacheDir, "--reviews", "rev-old"})
+		return runExtractReview([]string{"--cache-dir", cacheDir, "--reviews", "rev-000000000001"})
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal([]byte(out), &lean); err != nil {
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
 		t.Fatal(err)
 	}
-	if len(lean) != 1 || lean[0].ReviewID != "rev-old" {
-		t.Errorf("--reviews should select exactly what it names; got %+v", lean)
+	if len(res.Reviews) != 1 || res.Reviews[0].ReviewID != "rev-000000000001" {
+		t.Errorf("--reviews should select exactly what it names; got %+v", res.Reviews)
+	}
+	// An explicit id run mines out of order, so it hands back no watermark:
+	// advancing past the reviews it skipped would strand them for good.
+	if res.NextWatermark != "" {
+		t.Errorf("an explicit --reviews run must not advance the watermark; got %q", res.NextWatermark)
+	}
+
+	// A typo selects nothing, which is the same answer as "already mined" —
+	// so it is named rather than reported as consumed.
+	if err := runExtractReview([]string{"--cache-dir", cacheDir, "--reviews", "rev-typo123456"}); err == nil {
+		t.Error("an unknown review id should be refused, not silently empty")
 	}
 }
 

@@ -1584,11 +1584,23 @@ func confidenceRank(c string) int {
 // Manual, discover and code-review origin rules have no PR numbers, so they
 // get a descriptive label instead of an empty PR list.
 func sourceLabel(r state.Rule) string {
+	// Whatever a rule's origin, review corroboration it later absorbed through
+	// Step 8C is part of its provenance. Every branch here once dropped it:
+	// pr-review rendered the review signal as "PR #0", code-review dropped the
+	// PRs, and manual and discover said nothing at all — presenting a rule two
+	// reviewers had since confirmed as though no reviewer had ever seen it.
+	reviewed := ""
+	if tools := reviewerNames(reviewSources(r.Sources)); tools != "" {
+		reviewed = " and code review (" + tools + ")"
+	} else if hasReviewSource(r.Sources) {
+		reviewed = " and code review"
+	}
+
 	switch r.Origin {
 	case "manual":
-		return "manually added"
+		return "manually added" + reviewed
 	case "discover":
-		return "discovered from codebase"
+		return "discovered from codebase" + reviewed
 	case "code-review":
 		// Name the reviewers: which tool flagged a convention is what tells a
 		// reader whether to trust it, and two different tools agreeing is a
@@ -1596,9 +1608,9 @@ func sourceLabel(r state.Rule) string {
 		// are named — a code-review rule can later absorb a PR signal through
 		// Step 8C, and listing that human's login among the tools would
 		// present them as one, while dropping their PR from the citation.
-		label := "code review"
-		if tools := reviewerNames(reviewSources(r.Sources)); tools != "" {
-			label += " (" + tools + ")"
+		label := strings.TrimPrefix(reviewed, " and ")
+		if label == "" {
+			label = "code review"
 		}
 		if prs := prList(r.Sources); prs != "" {
 			label += " and PRs " + prs
@@ -1611,14 +1623,11 @@ func sourceLabel(r state.Rule) string {
 		// render as "PR #0" — a citation to a pull request that does not
 		// exist, on exactly the rules the review path is meant to strengthen.
 		prs := prList(r.Sources)
-		reviewed := hasReviewSource(r.Sources)
 		switch {
-		case prs != "" && reviewed:
-			return "PRs " + prs + " and code review"
 		case prs != "":
-			return "PRs " + prs
-		case reviewed:
-			return "code review"
+			return "PRs " + prs + reviewed
+		case reviewed != "":
+			return strings.TrimPrefix(reviewed, " and ")
 		}
 		return "—"
 	}

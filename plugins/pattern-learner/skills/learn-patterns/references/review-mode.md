@@ -37,10 +37,21 @@ $BIN extract-review --cache-dir .claude/pattern-learner/review-cache [--since <l
 Omit `--since` on a first run to mine everything captured so far; pass it
 otherwise so a re-run does not re-mine reviews already turned into rules. To
 mine specific reviews regardless of the watermark, pass
-`--reviews <id1,id2>`.
+`--reviews <id1,id2>`; an id naming no captured review is an error, not an
+empty result.
 
-If the output is an empty array, stop here and tell the user plainly which case
-it is:
+The output is an object:
+
+```json
+{ "reviews": [ ...lean review views... ], "next_watermark": "2026-01-15T10:04:00.123Z" }
+```
+
+`next_watermark` is the value Step R5.4 stores as `last_ingested_review_at`.
+Take it from here rather than computing it — it is empty after a `--reviews`
+run, because advancing past the reviews such a run deliberately skipped would
+make them unmineable for good.
+
+If `reviews` is empty, stop here and tell the user plainly which case it is:
 
 - **No watchers designated** (`$BIN watch --state … --list` prints `[]`) →
   "Nothing is being watched yet. Designate a reviewer with
@@ -57,7 +68,7 @@ Release the run-lock in every one of these cases before stopping.
 
 ## Review Step R2: Batch the lean views
 
-`extract-review` returns a JSON array of lean review views, ready to insert
+`extract-review` returns the lean review views under `reviews`, ready to insert
 into the subagent prompt below. Each element:
 
 ```json
@@ -280,14 +291,14 @@ and run Steps 8 through 13 as written, with these five differences:
    provenance line in the generated skill (`_Source: code review (code-review)_`)
    and keeps it out of the PR-watermark staleness check, which would otherwise
    mark every review rule stale.
-4. **Step 11 also sets `last_ingested_review_at`** to the `captured_at` of the
-   newest review mined this run (the last element of the `extract-review`
-   output) — but **only on a watermark run**. Leave it untouched after an
-   explicit `--reviews <ids>` run: that run deliberately mined out of order,
-   and advancing the mark past reviews it skipped would make them unmineable
-   for good, with R1 then reporting them as already consumed. Leave
-   `last_extracted_pr_number` untouched in either case — this mode does not
-   read PRs.
+4. **Step 11 also sets `last_ingested_review_at`** to `next_watermark` from the
+   `extract-review` output — verbatim, and only when it is non-empty. It is
+   empty after an explicit `--reviews <ids>` run, because that run deliberately
+   mined out of order and advancing the mark past the reviews it skipped would
+   make them unmineable for good, with R1 then reporting them as already
+   consumed. Do not compute the value yourself; the subcommand already applied
+   that rule. Leave `last_extracted_pr_number` untouched in either case — this
+   mode does not read PRs.
 5. **Step 13's summary** replaces the PR counters with the Review Mode block
    below.
 

@@ -77,6 +77,10 @@ func RunClassify(args []string) error {
 //   - Implicit (all sources implicit or empty):
 //     5+ signals → "established"; 1–4 → "emerging"
 //
+// For a candidate whose evidence is all from captured reviews, the count is of
+// distinct reviews rather than signals: one review reporting one finding in
+// five files is one piece of evidence, not five.
+//
 // Recency downgrade (implicit-only, and only for candidates with at least one
 // PR source):
 //
@@ -118,9 +122,11 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 		maxSourcePR := 0
 		hasPRSource := false
 		hasReviewSource := false
+		reviews := map[string]bool{}
 		for _, src := range c.Sources {
 			if src.ReviewID != "" {
 				hasReviewSource = true
+				reviews[src.ReviewID] = true
 			}
 			if src.Strength == "explicit" {
 				isExplicit = true
@@ -133,6 +139,15 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 			}
 		}
 		n := len(c.Sources)
+		// Review evidence is counted in reviews, not signals. One run of a
+		// linter tripping the same check in five files is five sources and one
+		// review, and grading that "established" puts a rule nobody has read
+		// into the top tier — which the approval UI then sanctions bulk-
+		// approving by tier. triage holds the same line for --auto; this is
+		// the same judgement for the interactive path.
+		if len(reviews) > 0 && !hasPRSource {
+			n = len(reviews)
+		}
 
 		// Assign initial confidence.
 		var confidence string

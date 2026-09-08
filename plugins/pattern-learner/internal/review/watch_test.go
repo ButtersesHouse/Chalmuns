@@ -491,21 +491,56 @@ func TestFromHook_oneReviewIsCapturedOnce(t *testing.T) {
 	}
 }
 
-// With another review skill designated, nothing in a ReportFindings payload
-// says which one reported. Skipping beats guessing: a review filed under a
-// tool that never ran corrupts provenance, and `capture-review --file` records
-// it with the source named explicitly.
-func TestFromHook_ambiguousReporterIsSkipped(t *testing.T) {
+// Designating a second reviewer must not disable capture. An earlier attempt
+// treated any other non-tool watcher as a competing reporter, which meant the
+// documented default kind ("any") silently switched the house format off as
+// soon as anything else was watched. ReportFindings belongs to the skill that
+// owns it; nothing else reports through it.
+func TestFromHook_reportFindingsSurvivesOtherDesignations(t *testing.T) {
 	payload := `{"tool_name":"ReportFindings","tool_input":` + hookFindings + `}`
+	for _, ws := range [][]string{
+		{"code-review:any"},
+		{"code-review:any", "semgrep:any"},
+		{"semgrep:any", "code-review:any"},
+		{"code-review:skill", "security-review:skill"},
+	} {
+		_, w, ok := FromHook([]byte(payload), watchers(t, ws...), fixed)
+		if !ok || w.ID != "code-review" {
+			t.Errorf("designations %v: ok=%v watcher=%q", ws, ok, w.ID)
+		}
+	}
+	// With no review skill designated there is nothing to attribute it to.
+	if _, _, ok := FromHook([]byte(payload), watchers(t, "semgrep:tool"), fixed); ok {
+		t.Error("a tool-only designation must not absorb a skill's findings")
+	}
+}
 
-	if _, _, ok := FromHook([]byte(payload), watchers(t, "code-review:any", "security-review:skill"), fixed); ok {
-		t.Error("two designated review skills make the reporter ambiguous")
+// A skill's own body is not a review. Some review skills report through a tool
+// and return their instructions as the call's result; mining that would build
+// standing conventions out of a prompt, and it grounds perfectly because the
+// text really is in the artifact.
+func TestFromHook_skillDefinitionIsNotAReview(t *testing.T) {
+	ws := watchers(t, "security-review:skill")
+	body := "---\nname: security-review\ndescription: Review the diff for vulnerabilities\n---\n\n" +
+		"## Contents\n\n## Step 1\n\nDo the thing."
+	payload := `{"tool_name":"Skill","tool_input":{"skill":"security-review"},"tool_response":` +
+		string(mustJSON(body)) + `}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("a skill definition must not be captured as review output")
 	}
-	// A command-line tool cannot report through a skill's tool, so it does not
-	// make the attribution ambiguous.
-	if _, w, ok := FromHook([]byte(payload), watchers(t, "code-review:any", "semgrep:tool"), fixed); !ok || w.ID != "code-review" {
-		t.Errorf("a tool designation should not block attribution; ok=%v watcher=%q", ok, w.ID)
+
+	// A genuine prose review from the same skill still is.
+	real := "## Never log tokens\n\nEverywhere else the token is redacted before logging."
+	payload = `{"tool_name":"Skill","tool_input":{"skill":"security-review"},"tool_response":` +
+		string(mustJSON(real)) + `}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); !ok {
+		t.Error("a real review from a watched skill should still be captured")
 	}
+}
+
+func mustJSON(s string) []byte {
+	b, _ := json.Marshal(s)
+	return b
 }
 
 // A "<<" inside a quoted string is text, not a here-document operator. Reading

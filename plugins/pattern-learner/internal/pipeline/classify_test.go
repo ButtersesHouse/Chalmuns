@@ -324,3 +324,31 @@ func TestClassify_reviewEvidenceKeepsAnOldPRRuleAlive(t *testing.T) {
 		t.Error("a rule two reviews have flagged since is not stale")
 	}
 }
+
+// One review reporting one finding in five files is one piece of evidence, not
+// five. Grading it "established" puts a rule nobody has read into the top tier
+// — which the approval UI then sanctions bulk-approving by tier.
+func TestClassify_reviewEvidenceIsCountedInReviews(t *testing.T) {
+	type src struct {
+		PRNumber int    `json:"pr_number"`
+		Strength string `json:"strength,omitempty"`
+		ReviewID string `json:"review_id,omitempty"`
+	}
+	build := func(ids ...string) json.RawMessage {
+		var ss []src
+		for _, id := range ids {
+			ss = append(ss, src{Strength: "implicit", ReviewID: id})
+		}
+		b, _ := json.Marshal(map[string]interface{}{"title": "r", "sources": ss})
+		return b
+	}
+
+	one := build("rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001", "rev-000000000001")
+	if got := classifyOne(t, one, 0, 0); got["confidence"] != "emerging" {
+		t.Errorf("five findings from one review is one review; got %v", got["confidence"])
+	}
+	five := build("rev-000000000001", "rev-000000000002", "rev-000000000003", "rev-000000000004", "rev-000000000005")
+	if got := classifyOne(t, five, 0, 0); got["confidence"] != "established" {
+		t.Errorf("five separate reviews agreeing is established; got %v", got["confidence"])
+	}
+}

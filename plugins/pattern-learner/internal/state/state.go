@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/ButtersesHouse/Chalmuns/internal/fsatomic"
 )
 
 const SchemaVersion = "1"
@@ -241,31 +242,9 @@ func Write(path string, s State) error {
 		return err
 	}
 
-	// A per-writer temp file, not a fixed "<path>.tmp". state.json now has two
-	// independent writers — the pipeline's state-write and the watch
-	// subcommand — and two of them interleaving on one shared temp name can
-	// leave a truncated or mixed file, which is the file holding every rule,
-	// designation and watermark.
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
+	// One atomic write, shared with the review store — see internal/fsatomic
+	// for why a per-writer temp name and an explicit mode both matter here.
+	return fsatomic.WriteFile(path, data)
 }
 
 func newRuleID() string {

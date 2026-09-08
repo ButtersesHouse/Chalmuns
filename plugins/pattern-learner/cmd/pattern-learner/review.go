@@ -265,6 +265,17 @@ func captureFromHook(args []string) {
 	_, _ = review.WriteArtifact(cacheDir, art)
 }
 
+// extractReviewResult is what extract-review prints. next_watermark is the
+// value a watermark-driven run should store as last_ingested_review_at, and is
+// empty after an explicit --reviews run: advancing past reviews that run
+// skipped on purpose would make them unmineable for good. Emitting it here
+// rather than asking the model to pick "the last element" keeps the
+// bookkeeping deterministic, which is what the tooling policy requires of it.
+type extractReviewResult struct {
+	Reviews       []review.LeanReview `json:"reviews"`
+	NextWatermark string              `json:"next_watermark,omitempty"`
+}
+
 // runExtractReview prints the lean views of captured reviews for the
 // extraction subagent — the review path's extract-lean.
 //
@@ -299,7 +310,19 @@ func runExtractReview(args []string) error {
 		}
 	}
 
-	lean, err := review.ExtractLean(cacheDir, ids, since)
+	// An unknown id selects nothing, and "nothing" is the same answer the
+	// watermark path gives for "already mined" — so a typo would be reported
+	// to the user as a review already consumed. Name it instead.
+	if len(ids) > 0 {
+		all, listErr := review.ListArtifactMeta(cacheDir)
+		if listErr == nil {
+			if missing := review.MissingIDs(all, ids); len(missing) > 0 {
+				return fmt.Errorf("no captured review with id %s in %s", strings.Join(missing, ", "), cacheDir)
+			}
+		}
+	}
+
+	lean, watermark, err := review.ExtractLean(cacheDir, ids, since)
 	if err != nil {
 		return err
 	}
@@ -309,5 +332,5 @@ func runExtractReview(args []string) error {
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(lean)
+	return enc.Encode(extractReviewResult{Reviews: lean, NextWatermark: watermark})
 }

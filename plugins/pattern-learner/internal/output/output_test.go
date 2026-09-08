@@ -3309,7 +3309,7 @@ func TestWriteMergedReviewSignalDoesNotCitePRZero(t *testing.T) {
 	if strings.Contains(content, "#0") {
 		t.Errorf("a rule must never cite PR #0; got:\n%s", content)
 	}
-	if !strings.Contains(content, "_Source: PRs #480 and code review_") {
+	if !strings.Contains(content, "_Source: PRs #480 and code review (code-review)_") {
 		t.Errorf("a mixed-provenance rule should name both; got:\n%s", content)
 	}
 }
@@ -3365,5 +3365,29 @@ func TestWriteReviewConfirmedRuleIsNotMarkedStale(t *testing.T) {
 	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
 	if strings.Contains(content, "verify this convention is still current") {
 		t.Errorf("a rule fresh reviews have confirmed is not stale; got:\n%s", content)
+	}
+}
+
+// Review corroboration a rule absorbed through Step 8C is part of its
+// provenance whatever the rule's origin. The manual and discover branches once
+// dropped it entirely, presenting a rule two reviewers had since confirmed as
+// though no reviewer had ever seen it.
+func TestWriteManualRuleKeepsReviewCorroboration(t *testing.T) {
+	dir := t.TempDir()
+	r := state.Rule{
+		ID: "rule_manual2", Title: "Wrap errors with %w", Rule: "Always wrap propagated errors with %w",
+		Status: "approved", Confidence: "stated", Origin: "manual",
+		Target: state.Target{Location: "api"},
+		Sources: []state.Signal{
+			{Reviewer: "mryave", Snippet: "always wrap with %w", Strength: "explicit"},
+			{ReviewID: "rev-abc123def456", Reviewer: "code-review", Snippet: "wrap with %w", Strength: "implicit"},
+		},
+	}
+	if err := Write(stateWith(r), dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	content := readFile(t, filepath.Join(dir, ".claude", "skills", "api", "SKILL.md"))
+	if !strings.Contains(content, "_Source: manually added and code review (code-review)_") {
+		t.Errorf("want both provenances; got:\n%s", content)
 	}
 }

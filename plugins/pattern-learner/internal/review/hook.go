@@ -3,6 +3,7 @@ package review
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"time"
 
@@ -52,6 +53,11 @@ var reportingTools = map[string]string{
 // twice — as two artifacts with two ids, which reads downstream as two
 // independent reviews agreeing and so defeats the single-review hold-back
 // exactly where it matters most.
+//
+// Only the skills whose reporting tool is known belong here. Any other skill
+// that behaves the same way is caught structurally instead, by
+// looksLikeSkillDefinition — guessing at a list would be how the wrong review
+// gets attributed.
 var reportingSkills = map[string]bool{}
 
 func init() {
@@ -97,15 +103,6 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	// and the rules it produced cited it. A missed capture is recoverable; a
 	// review attributed to the wrong reviewer corrupts provenance silently.
 	//
-	// For the same reason the mapping is only trusted when it is unambiguous.
-	// If another review skill is also designated, any of them could have been
-	// the one that reported, and there is nothing in the payload to say which:
-	// skip rather than guess, and let `capture-review --file` record it with
-	// the source named explicitly.
-	if isReporting && ambiguousReporter(watchers, reporter) {
-		return Artifact{}, state.Watcher{}, false
-	}
-
 	matched := Match(watchers, toolName, skill, command)
 	if matched == nil {
 		return Artifact{}, state.Watcher{}, false
@@ -115,12 +112,21 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	if strings.TrimSpace(text) == "" {
 		return Artifact{}, state.Watcher{}, false
 	}
+	// A skill's own body is not a review. Some review skills deliver findings
+	// through a reporting tool and return their instructions as the call's
+	// result; capturing that would mine standing conventions out of a prompt,
+	// and it grounds perfectly because the text really is in the artifact.
+	// The check is structural rather than a guess: only a skill or command
+	// definition opens with that frontmatter.
+	if looksLikeSkillDefinition(text) {
+		return Artifact{}, state.Watcher{}, false
+	}
 
 	art, err := Capture(Input{
 		Data:   []byte(text),
 		Source: matched.Name,
 		Format: matched.Format,
-		Label:  hookLabel(matched.Name, toolName, skill, command),
+		Label:  hookLabel(matched.Name, toolName, skill),
 		Now:    now,
 	})
 	if err != nil {
@@ -129,18 +135,12 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 	return art, *matched, true
 }
 
-// ambiguousReporter reports whether some designated watcher other than the
-// reporting tool's own skill could also have produced this report.
-func ambiguousReporter(ws []state.Watcher, reporter string) bool {
-	for _, w := range ws {
-		if w.Kind == KindTool {
-			continue // a command line does not report through a skill's tool
-		}
-		if !strings.EqualFold(w.Name, reporter) {
-			return true
-		}
-	}
-	return false
+// reSkillFrontmatter matches the opening of a skill or slash-command
+// definition: a YAML block naming the skill, which no review output has.
+var reSkillFrontmatter = regexp.MustCompile(`(?s)\A\s*---\r?\n.*?\bname:\s*\S`)
+
+func looksLikeSkillDefinition(text string) bool {
+	return reSkillFrontmatter.MatchString(text)
 }
 
 // invocation pulls the skill name and command line out of a payload's
@@ -207,7 +207,7 @@ func PayloadCWD(payload []byte) string {
 // inside the repository, where it can be committed and shared. The command adds
 // nothing the watcher's name does not already say, so recording it is all risk
 // and no benefit.
-func hookLabel(watcher, toolName, skill, command string) string {
+func hookLabel(watcher, toolName, skill string) string {
 	switch {
 	case skill != "":
 		return "hook capture: /" + strings.TrimPrefix(skill, "/")
