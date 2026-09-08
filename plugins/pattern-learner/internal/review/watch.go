@@ -261,11 +261,15 @@ func sanitize(command string, depth int) string {
 
 	var quote rune
 	var span []rune
-	// spanTainted records that a substitution was emitted inside the quoted
-	// word being scanned, so what follows it in the same word is not a program
-	// name of its own: `echo "$(date)semgrep"` is one argument, and treating
-	// the tail as a bare word read it as a run of semgrep.
-	spanTainted := false
+	// inSubWord records that the word being scanned already contains a command
+	// substitution, so nothing else in that word is a program name of its own.
+	// A substitution is emitted with parens so the separator split can see the
+	// command inside it, and those parens then made the *adjacent* text look
+	// like a command too: `echo $(date)semgrep`, `` echo `date`semgrep `` and
+	// `echo "$(date)"semgrep` are each one argument that bash hands to echo,
+	// and each read as a run of semgrep. The flag survives the quote around a
+	// word, because `echo "$(date)"'semgrep'` is one argument as well.
+	inSubWord := false
 	// pending holds the here-documents opened on the current line, in the
 	// order bash reads their bodies. One slot was not enough: with
 	// `cat <<A <<B`, B's body was scanned as commands, so a body line reading
@@ -281,6 +285,10 @@ func sanitize(command string, depth int) string {
 	// the raw text instead made the `#` in `echo hello\<newline>#1` a comment
 	// and dropped the rest of the joined command.
 	var prev rune
+	// spanPrev is prev's counterpart inside a quoted span: an escaped `$` is a
+	// literal dollar, not the first half of a `$$`, so `"\$$(semgrep .)"` is a
+	// real substitution and reading the raw text made it look like a pid.
+	var spanPrev rune
 	closedSubshell := false
 
 	// closeSpan decides what a finished quoted span was. A span is a program
@@ -293,7 +301,7 @@ func sanitize(command string, depth int) string {
 	// name, which is silence, so neither extreme will do.
 	closeSpan := func(closed bool) {
 		switch {
-		case closed && !spanTainted && isBareWord(span):
+		case closed && !inSubWord && isBareWord(span):
 			b.WriteString(string(span))
 		default:
 			b.WriteRune(' ')
@@ -315,6 +323,19 @@ func sanitize(command string, depth int) string {
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 
+		// A word that already holds a substitution is finished as far as
+		// command position goes: blank the rest of it, quotes included, until
+		// a real word break arrives.
+		if inSubWord && quote == 0 {
+			if isWordBreak(r) {
+				inSubWord = false
+			} else if r != '\'' && r != '"' {
+				b.WriteRune(' ')
+				prev = midWord
+				continue
+			}
+		}
+
 		// Quote state is carried across newlines, because a shell string is:
 		// `git commit -m "fix things<newline>semgrep now runs on every PR"` is
 		// one argument, and scanning each line from a clean state read its
@@ -332,20 +353,29 @@ func sanitize(command string, depth int) string {
 				// process id followed by literal parens. Neither opens a
 				// substitution, and reading them as one put their operands in
 				// command position.
-				if r == '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(' {
+				if r == '$' && spanPrev != '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(' {
 					if end, ok := matchSubstitution(runes, i); ok {
 						closeSpan(false)
-						spanTainted = true
-						b.WriteRune(' ')
+						inSubWord = true
+						// Arithmetic is a value, not a command, so its
+						// operands must not land in command position —
+						// `echo "$(( semgrep ))"` reads a variable. But a
+						// substitution nested inside it really does run, so
+						// the interior is kept for those alone.
+						b.WriteString(substitutionsOnly(string(runes[i+3:end-2]), depth))
 						i = end - 1
+						prev = midWord
 						continue
 					}
 				}
-				if opensSubstitution(runes, i) {
+				// Inside a span prev is not maintained — it tracks the word
+				// structure outside quotes — so the `$$` test reads the raw
+				// text here, where a span holds no continuations to see past.
+				if opensSubstitution(runes, i, spanPrev) {
 					if end, ok := matchSubstitution(runes, i); ok {
 						// Whatever preceded it in the span is still data.
 						closeSpan(false)
-						spanTainted = true
+						inSubWord = true
 						b.WriteString(" (")
 						b.WriteString(sanitize(string(runes[i+2:end-1]), depth+1))
 						b.WriteString(") ")
@@ -356,7 +386,7 @@ func sanitize(command string, depth int) string {
 				if r == '`' {
 					if end, ok := matchBacktick(runes, i); ok {
 						closeSpan(false)
-						spanTainted = true
+						inSubWord = true
 						b.WriteString(" (")
 						b.WriteString(sanitize(string(runes[i+1:end-1]), depth+1))
 						b.WriteString(") ")
@@ -375,6 +405,8 @@ func sanitize(command string, depth int) string {
 					i++
 					span = append(span, ' ')
 				}
+				spanPrev = midWord
+				continue
 			case r == quote:
 				closeSpan(true)
 				quote = 0
@@ -382,6 +414,7 @@ func sanitize(command string, depth int) string {
 			default:
 				span = append(span, r)
 			}
+			spanPrev = r
 			continue
 		}
 
@@ -397,7 +430,7 @@ func sanitize(command string, depth int) string {
 			continue
 		case r == '\'' || r == '"':
 			quote = r
-			spanTainted = false
+			spanPrev = 0
 			continue
 		case r == '\\':
 			// A backslash-newline is a line continuation: bash joins the two
@@ -430,18 +463,32 @@ func sanitize(command string, depth int) string {
 			b.WriteString("  ")
 			i++
 			if i+1 < len(runes) && runes[i+1] == '(' {
-				if end, ok := matchSubstitution(runes, i); ok {
-					for j := i + 1; j < end; j++ {
-						b.WriteRune(' ')
-					}
-					i = end - 1
+				end, ok := matchSubstitution(runes, i)
+				if !ok {
+					// bash refuses the line outright; nothing after it runs.
+					end = len(runes)
 				}
+				for j := i + 1; j < end; j++ {
+					b.WriteRune(' ')
+				}
+				i = end - 1
 			}
-		case r == '$' && notDollar(runes, i) && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(':
+		case r == '$' && prev != '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(':
+			// Consumed whole: the operands of `$(( 1 << x ))` are neither
+			// commands nor a here-document operator — `echo $(( semgrep ))`
+			// reads a variable — and only a substitution nested inside really
+			// runs. `$((…))` is an expansion, so the word continues after it.
+			if end, ok := matchSubstitution(runes, i); ok {
+				b.WriteString(substitutionsOnly(string(runes[i+3:end-2]), depth))
+				i = end - 1
+				inSubWord = true
+				prev = midWord
+				continue
+			}
 			parens = append(parens, parenArithExpansion)
 			b.WriteString("  ")
 			i += 2
-		case r == '$' && notDollar(runes, i) && i+1 < len(runes) && runes[i+1] == '(':
+		case r == '$' && prev != '$' && i+1 < len(runes) && runes[i+1] == '(':
 			// The paren is kept: `$(semgrep --version)` runs semgrep, and the
 			// separator split is what gives the substitution its own command
 			// position. Blanking it left `echo` as the only command on the
@@ -451,6 +498,13 @@ func sanitize(command string, depth int) string {
 			b.WriteString(" (")
 			i++
 		case r == '(' && i+1 < len(runes) && runes[i+1] == '(':
+			// `((…))` is a command rather than an expansion, so it ends the
+			// word it is in; its interior is arithmetic all the same.
+			if end, ok := matchParens(runes, i); ok {
+				b.WriteString(substitutionsOnly(string(runes[i+2:end-2]), depth))
+				i = end - 1
+				continue
+			}
 			parens = append(parens, parenArithCommand)
 			b.WriteString("  ")
 			i++
@@ -471,6 +525,9 @@ func sanitize(command string, depth int) string {
 			// `echo $((1+2))#1` prints `3#1` and carries no comment. `(…)` and
 			// `((…))` are commands, and `(true)#note` really is a comment.
 			closedSubshell = kind == parenSubshell || kind == parenArithCommand
+			if kind == parenSubstitution {
+				inSubWord = true
+			}
 			if kind == parenArithExpansion || kind == parenArithCommand {
 				b.WriteRune(' ')
 				if i+1 < len(runes) && runes[i+1] == ')' {
@@ -501,6 +558,8 @@ func sanitize(command string, depth int) string {
 				b.WriteString(sanitize(string(runes[i+1:end-1]), depth+1))
 				b.WriteString(") ")
 				i = end - 1
+				inSubWord = true
+				prev = midWord
 				continue
 			}
 			b.WriteRune(' ')
@@ -756,9 +815,15 @@ func Status(ws []state.Watcher, artifacts []Artifact) []WatcherStatus {
 // around it is quoted, and an unbalanced one means bash would reject the line
 // rather than run anything in it.
 func matchSubstitution(runes []rune, i int) (int, bool) {
+	return matchParens(runes, i+1)
+}
+
+// matchParens returns the index just past the `)` matching an opening paren at
+// or after i, carrying its own quote state.
+func matchParens(runes []rune, i int) (int, bool) {
 	depth := 0
 	var quote rune
-	for j := i + 1; j < len(runes); j++ {
+	for j := i; j < len(runes); j++ {
 		r := runes[j]
 		if quote != 0 {
 			switch {
@@ -789,16 +854,23 @@ func matchSubstitution(runes []rune, i int) (int, bool) {
 // opensSubstitution reports whether the `$` at i begins a command
 // substitution. `$$(` is the process id followed by literal parens, not a
 // substitution, and reading it as one put its contents in command position.
-func opensSubstitution(runes []rune, i int) bool {
-	return runes[i] == '$' && notDollar(runes, i) &&
+func opensSubstitution(runes []rune, i int, prev rune) bool {
+	return runes[i] == '$' && prev != '$' &&
 		i+1 < len(runes) && runes[i+1] == '(' &&
 		!(i+2 < len(runes) && runes[i+2] == '(')
 }
 
-// notDollar reports whether the character before i is not itself a `$`, which
-// is what separates `$(cmd)` from `$$(cmd)`.
-func notDollar(runes []rune, i int) bool {
-	return i == 0 || runes[i-1] != '$'
+// priorRune is the character before i, or 0 at the start of the command.
+func priorRune(runes []rune, i int) rune {
+	if i == 0 {
+		return 0
+	}
+	return runes[i-1]
+}
+
+// isWordBreak reports whether a character ends a shell word.
+func isWordBreak(r rune) bool {
+	return unicode.IsSpace(r) || neutralize(r) == ' '
 }
 
 // matchBacktick returns the index just past the backtick closing the
@@ -814,4 +886,39 @@ func matchBacktick(runes []rune, i int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// substitutionsOnly blanks a stretch of text except for the command
+// substitutions inside it, which are emitted with their parens and their own
+// sanitized text. It is what arithmetic gets: `$(( semgrep ))` reads a
+// variable and must not look like a run, while `$(( $(semgrep --count) + 1 ))`
+// really does run one and must.
+func substitutionsOnly(text string, depth int) string {
+	runes := []rune(text)
+	var b strings.Builder
+	b.Grow(len(runes) + 2)
+	for i := 0; i < len(runes); i++ {
+		var end int
+		var ok bool
+		switch {
+		case opensSubstitution(runes, i, priorRune(runes, i)):
+			if end, ok = matchSubstitution(runes, i); ok {
+				b.WriteString(" (")
+				b.WriteString(sanitize(string(runes[i+2:end-1]), depth+1))
+				b.WriteString(") ")
+			}
+		case runes[i] == '`':
+			if end, ok = matchBacktick(runes, i); ok {
+				b.WriteString(" (")
+				b.WriteString(sanitize(string(runes[i+1:end-1]), depth+1))
+				b.WriteString(") ")
+			}
+		}
+		if ok {
+			i = end - 1
+			continue
+		}
+		b.WriteRune(' ')
+	}
+	return b.String()
 }

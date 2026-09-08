@@ -115,10 +115,9 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		return Artifact{}, state.Watcher{}, false
 	}
 
-	// Scrubbed here rather than at the Capture call, so a response that was
-	// nothing but the runner's bookkeeping falls out as "no review" instead of
-	// being recorded as whatever was left of it.
-	text := scrubJSON(responseText(doc, isReporting))
+	// Redacted here rather than at the Capture call, so nothing downstream —
+	// the artifact, the label, the lean view — ever sees the credential.
+	text := redactSecrets(responseText(doc, isReporting))
 	if strings.TrimSpace(text) == "" {
 		return Artifact{}, state.Watcher{}, false
 	}
@@ -312,11 +311,7 @@ func valueText(v interface{}, depth int) string {
 		if blocks && len(parts) > 0 {
 			return strings.Join(parts, "\n")
 		}
-		// Scrubbed like a map is: eslint's native shape is an array, so a
-		// response that decodes to one reached the artifact unscrubbed and a
-		// credential in it was written straight into the repository.
-		scrubbed, _ := scrub(v, 0)
-		return marshalText(scrubbed)
+		return marshalText(v)
 	case map[string]interface{}:
 		// One pass over everything in this map that could be the review, then
 		// the best of it, in a fixed order of preference. Returning the first
@@ -434,224 +429,77 @@ func marshalText(v interface{}) string {
 	return ""
 }
 
-// invocationKeys carry what was run and with what — a command line, an
-// argument vector, an environment. They are stripped at every level, because
-// that is where credentials live and one level is not where nesting stops:
-// `{"results":[…],"metadata":{"command":"SEMGREP_APP_TOKEN=… semgrep"}}` put a
-// token into an artifact inside the repository just as surely as a top-level
-// `command` did. stderr is here for a different reason: valueText rules stderr
-// prose out as review text, and carrying it in the payload instead would put a
-// crash message into the grounding corpus by the back door.
-var invocationKeys = map[string]bool{
-	"command": true, "cmd": true, "argv": true, "args": true,
-	"env": true, "environment": true, "tool_input": true, "stderr": true,
-}
-
-// textInvocationKeys are stripped at every level too, but only when they hold
-// a string. `input` and `cwd` name a command line and a directory when they
-// are text — `{"run":{"input":"SEMGREP_APP_TOKEN=… semgrep"}}` — and a report
-// when they are not: a reviewer delivering findings under an `input` key had
-// the whole review deleted by a name-only rule.
-var textInvocationKeys = map[string]bool{
-	"input": true, "cwd": true,
-}
-
-// isInvocation reports whether a field is the runner's account of what was
-// run, at any level of the document.
-func isInvocation(key string, val interface{}) bool {
-	if invocationKeys[key] {
-		return true
+// redactSecrets removes credentials from review text, in place, leaving every
+// other byte exactly as the reviewer wrote it.
+//
+// It works on the text rather than on a decoded document, and that is the
+// whole point. A structural scrub — delete the fields that hold an invocation
+// — has to be right about the shape of every payload it will ever see, and it
+// never was: a report truncated mid-document was skipped entirely, an
+// invocation log carried as a string field inside the report was invisible to
+// it, an argv under one key was stripped while the same array under another
+// was not, and re-encoding what it kept reordered keys, escaped angle brackets
+// and rewrote large integers in text this package documents as byte-for-byte.
+// A pattern over the text has none of those failure modes: JSON, JSON Lines,
+// a truncated document, prose quoting a config, a nested log — all the same.
+//
+// What it catches is a name that says "secret" beside its value, and the token
+// shapes that are recognisable on their own. That is a list, and a list is
+// never complete; it is a backstop, not a guarantee, which is why the label a
+// capture records still names the reviewer and never the command line.
+func redactSecrets(text string) string {
+	for _, re := range secretPatterns {
+		text = re.ReplaceAllString(text, "${1}[redacted]")
 	}
-	if !textInvocationKeys[key] {
-		return false
-	}
-	_, isText := val.(string)
-	return isText
+	return reBareSecret.ReplaceAllString(text, "[redacted]")
 }
 
-// envelopeKeys are what a tool runner wraps a result in: what tool it was and
-// how it ended. They are stripped only at the top level, because the same words
-// are report content one level down — `description` is the advisory text in
-// Snyk, Grype and Checkov findings, and `file_path` is a finding's location.
-// Stripping them everywhere deleted the reviewer's own prose from the corpus.
+var secretPatterns = []*regexp.Regexp{
+	// An Authorization header, whose value is the credential itself. First,
+	// because the generic rule below would stop at the scheme word and leave
+	// the credential after it.
+	regexp.MustCompile(`(?i)(authorization\s*[:=]\s*["']?(?:bearer|basic|token)?\s*)[^\s"',;)\]}]+`),
+	// NAME=value, "NAME": "value", NAME: value — however the payload spells
+	// it, for a name that announces what it holds.
+	regexp.MustCompile(`(?i)(["']?[A-Za-z0-9_.-]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)[A-Za-z0-9_.-]*["']?\s*[:=]\s*["']?)[^\s"',;)\]}]+`),
+	// A flag naming the value that follows it.
+	regexp.MustCompile(`(?i)(--?(?:token|password|secret|api[_-]?key|access[_-]?key)[= ])[^\s"',;)\]}]+`),
+}
+
+// reBareSecret matches the token shapes that identify themselves without a
+// name beside them — an argv entry, a line of a traceback, a URL.
+var reBareSecret = regexp.MustCompile(
+	`(?:sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{16,}|gho_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}` +
+		`|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{30,}` +
+		`|-----BEGIN [A-Z ]*PRIVATE KEY-----)`)
+
+// envelopeKeys are what a tool runner wraps a result in: what tool it was, how
+// it ended, what it was told to do. A map carrying them describes a call
+// rather than being a report, so they are dropped before the map is offered as
+// one — at the top level only, because the same words are report content one
+// level down: `description` is the advisory text in Snyk, Grype and Checkov
+// findings, and `file_path` is a finding's location.
 var envelopeKeys = map[string]bool{
-	"file_path": true, "description": true, "tool_name": true,
+	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
+	"env": true, "environment": true, "cwd": true, "file_path": true,
+	"description": true, "tool_name": true, "tool_input": true,
 	"tool_use_id": true, "is_error": true, "interrupted": true,
 	"exit_code": true, "exitCode": true, "sandbox": true,
 }
 
 // reportPayload renders a decoded response as a candidate review: the map with
 // the runner's bookkeeping removed, and without the fields already considered
-// on their own.
-//
-// Removing rather than refusing. Bailing out on any bookkeeping key threw away
-// a real report that happened to sit beside an `exit_code` — and a linter
-// exits non-zero precisely when it has findings, so that is the ordinary
-// shape, not the exception.
-//
-// Removing at every level, because one level is not where credentials stop:
-// `{"results":[…],"metadata":{"command":"SEMGREP_APP_TOKEN=… semgrep"}}` put
-// the token into an artifact inside the repository just as surely as a
-// top-level `command` did.
+// on their own. Credentials are not this function's job — redactSecrets covers
+// every shape, including the ones no key list can reach.
 func reportPayload(t map[string]interface{}) string {
 	rest := make(map[string]interface{}, len(t))
 	for key, val := range t {
-		if envelopeKeys[key] || isInvocation(key, val) || isResponseTextKey(key) {
+		if envelopeKeys[key] || isResponseTextKey(key) {
 			continue
 		}
-		rest[key], _ = scrub(val, 0)
+		rest[key] = val
 	}
 	return marshalText(rest)
-}
-
-// scrub removes the invocation fields from a decoded value at every level. It
-// reports whether it removed anything, and returns the value itself when it
-// did not — which is the overwhelmingly common case, and rebuilding every
-// container regardless meant a second full copy of a document that can be
-// megabytes, on a path that runs after every matching tool call.
-//
-// Past the depth bound the value is dropped rather than passed through. The
-// bound is set where no report reaches — a SARIF result's location and snippet
-// sit around ten levels down, and a bound tight enough to cut those corrupted
-// ordinary reports — so anything below it is a document shaped to get past the
-// scrub, and emitting it raw would be the leak this function exists to stop.
-func scrub(v interface{}, depth int) (interface{}, bool) {
-	if depth > 64 {
-		return nil, true
-	}
-	switch t := v.(type) {
-	case map[string]interface{}:
-		var out map[string]interface{}
-		for key, val := range t {
-			scrubbed, changed := interface{}(nil), false
-			if isInvocation(key, val) {
-				changed = true
-			} else {
-				scrubbed, changed = scrub(val, depth+1)
-			}
-			if changed && out == nil {
-				// First removal: copy what has been passed over so far.
-				out = make(map[string]interface{}, len(t))
-				for k, v := range t {
-					out[k] = v
-				}
-			}
-			if out == nil {
-				continue
-			}
-			if isInvocation(key, val) {
-				delete(out, key)
-			} else {
-				out[key] = scrubbed
-			}
-		}
-		if out == nil {
-			return v, false
-		}
-		return out, true
-	case []interface{}:
-		var out []interface{}
-		for i, e := range t {
-			scrubbed, changed := scrub(e, depth+1)
-			if changed && out == nil {
-				out = make([]interface{}, len(t))
-				copy(out, t)
-			}
-			if out != nil {
-				out[i] = scrubbed
-			}
-		}
-		if out == nil {
-			return v, false
-		}
-		return out, true
-	}
-	return v, false
-}
-
-// scrubJSON is scrub for review text that arrived as a string. It is the path
-// that matters most: a Bash hook payload delivers a linter's JSON as
-// `tool_response.stdout`, a string, so nothing in the decoded tree was ever a
-// container and every invocation field in it — `{"results":[…],"command":
-// "SEMGREP_APP_TOKEN=… semgrep"}` — went into the artifact verbatim.
-//
-// It scrubs the JSON documents *inside* the text rather than requiring the
-// whole string to be one. `npm run lint` prints a banner first, a runner may
-// add a timing line after, and some tools emit JSON Lines — and demanding one
-// clean document turned the scrub off entirely for all three, which is the
-// same leak with a wrapper around it.
-//
-// The original bytes come back untouched when nothing was removed: RawText is
-// the grounding corpus, and re-encoding reorders keys and rewrites numbers for
-// no reason. An empty string means the text was nothing but the runner's
-// bookkeeping and there is no review left to record.
-func scrubJSON(text string) string {
-	rest := text
-	var out strings.Builder
-	changedAny := false
-	for {
-		start := strings.IndexAny(rest, "{[")
-		if start < 0 {
-			break
-		}
-		value, end, ok := decodeJSONPrefix(rest[start:])
-		if !ok {
-			// Not the start of a document after all; keep looking past it.
-			out.WriteString(rest[:start+1])
-			rest = rest[start+1:]
-			continue
-		}
-		scrubbed, changed := scrub(value, 0)
-		out.WriteString(rest[:start])
-		if changed {
-			changedAny = true
-			out.WriteString(encodeJSON(scrubbed))
-		} else {
-			out.WriteString(rest[start : start+end])
-		}
-		rest = rest[start+end:]
-	}
-	if !changedAny {
-		return text
-	}
-	out.WriteString(rest)
-	if strings.TrimSpace(out.String()) == "{}" {
-		// Everything the document held was bookkeeping.
-		return ""
-	}
-	return out.String()
-}
-
-// decodeJSONPrefix decodes the JSON value at the start of s, returning it and
-// how many bytes it spans. Decoding a prefix rather than the whole string is
-// what lets a report survive a banner line before it or a summary after it.
-func decodeJSONPrefix(s string) (value interface{}, end int, ok bool) {
-	dec := json.NewDecoder(strings.NewReader(s))
-	// Numbers are kept as written. Round-tripping them through float64 moved
-	// a large line number and rewrote `1.0` as `1`, in text documented as
-	// byte-for-byte.
-	dec.UseNumber()
-	if err := dec.Decode(&value); err != nil {
-		return nil, 0, false
-	}
-	switch value.(type) {
-	case map[string]interface{}, []interface{}:
-		return value, int(dec.InputOffset()), true
-	}
-	return nil, 0, false
-}
-
-// encodeJSON renders a scrubbed value without the HTML escaping json.Marshal
-// applies by default, which would rewrite a reviewer's `a < b && c > d` as
-// escape sequences in the corpus a signal has to quote verbatim.
-func encodeJSON(v interface{}) string {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return ""
-	}
-	return strings.TrimRight(buf.String(), "\n")
 }
 
 func isResponseTextKey(key string) bool {

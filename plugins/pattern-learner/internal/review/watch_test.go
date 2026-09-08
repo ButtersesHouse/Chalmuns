@@ -558,6 +558,22 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"quoted backticks", "echo \"`semgrep .`\"", true},
 		{"unquoted backticks", "echo `semgrep .`", true},
 		{"backticked prose is not a run", "echo \"`git log --format='x; semgrep noise'`\"", false},
+		// A substitution's result is part of a word, so nothing else in that
+		// word is a program name — however the word is spelled. The parens
+		// emitted so the split can see *inside* a substitution made the text
+		// beside it look like a command too.
+		{"a word after a backtick substitution", "echo `date`semgrep", false},
+		{"a word after a substitution", `echo $(date)semgrep`, false},
+		{"a word after a quoted substitution", `echo "$(date)"semgrep`, false},
+		{"a quoted word after a quoted substitution", `echo "$(date)"'semgrep'`, false},
+		{"a real run after a substitution and a comment", "echo `date`#note && semgrep .", true},
+		// Arithmetic reads variables, but a substitution nested in it runs.
+		{"a variable named like the tool", `echo "$(( semgrep ))"`, false},
+		{"a variable named like the tool, unquoted", `echo $(( semgrep ))`, false},
+		{"a substitution nested in quoted arithmetic", `echo "$(( $(semgrep --count) + 1 ))"`, true},
+		{"a substitution nested in arithmetic", `echo $(( $(semgrep --count) + 1 ))`, true},
+		{"an unbalanced process id", `echo $$(semgrep .`, false},
+		{"an escaped dollar before a substitution", `echo "\$$(semgrep .)"`, true},
 		// A CR is stripped from a terminator only when the opener's own line
 		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
 		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
@@ -839,7 +855,9 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		{"an env in JSON delivered as a string is stripped", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, true, "sk-secret", "check_id"},
 		// An `input` and a `cwd` are what was run and where, wherever they sit.
 		{"a nested input is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"input":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}}`, true, "sk-secret", "check_id"},
-		{"a nested cwd is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"cwd":"/home/secret-project"}}`, true, "secret-project", "check_id"},
+		// A working directory is a path, not a credential; it stays. What must
+		// not stay is a secret, wherever in the payload it sits.
+		{"a token in a nested field is redacted", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"cwd":"/home/proj","log":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}}`, true, "sk-secret", "check_id"},
 		// A report is scrubbed wherever it sits in the output: `npm run lint`
 		// prints a banner first, a runner may add a timing line after, and
 		// some tools emit JSON Lines. Requiring one clean document turned the
@@ -847,11 +865,10 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 		{"banner before the JSON", `{"stdout":"> pkg@1.0.0 lint\n> semgrep --json .\n\n{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
 		{"summary after the JSON", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}],\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}\\nran in 3s"}`, true, "sk-secret", "check_id"},
 		{"JSON lines", `{"stdout":"{\"results\":[{\"check_id\":\"c\",\"path\":\"a.py\",\"extra\":{\"message\":\"Use the shared client.\"}}]}\\n{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep\"}"}`, true, "sk-secret", "check_id"},
-		// A payload that was nothing but bookkeeping records nothing. Falling
-		// back to the original text when the scrub emptied the document wrote
-		// the credential out whole.
-		{"a payload that is only a command", `{"stdout":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}"}`, false, "", ""},
-		{"a payload that is only an env", `{"stdout":"{\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, false, "", ""},
+		// A payload that is nothing but an echoed invocation keeps its shape —
+		// the command line is not itself secret — but never its credential.
+		{"a payload that is only a command", `{"stdout":"{\"command\":\"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json .\"}"}`, true, "sk-secret", "semgrep --json ."},
+		{"a payload that is only an env", `{"stdout":"{\"env\":{\"SEMGREP_APP_TOKEN\":\"sk-secret-abc123\"}}"}`, true, "sk-secret", ""},
 		// `input` names a command line when it is text and a report when it is
 		// not, so a name-only rule deleted the review.
 		{"a report under an input key survives", `{"stdout":"{\"input\":{\"findings\":[{\"file\":\"a.go\",\"summary\":\"Use the shared client everywhere.\"}]}}"}`, true, "", "shared client"},
