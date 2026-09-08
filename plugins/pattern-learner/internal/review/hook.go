@@ -740,7 +740,8 @@ const secretName = `(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|p
 // copies the whole text whether or not it changes anything, and this runs
 // after every matching tool call, on output that can be megabytes.
 var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
-	`|auth|\bsk-|\bghp_|\bgho_|\bgithub_pat_|\bxox|\bAKIA|\bAIza|BEGIN [A-Z ]*PRIVATE KEY`)
+	`|auth|\bsk-|\bghp_|\bgho_|\bgithub_pat_|\bxox|\bAKIA|\bAIza|BEGIN [A-Z ]*PRIVATE KEY` +
+	`|` + cryptPrefix)
 
 // quotedValue matches a JSON or shell string body, consuming `\"` so a quote
 // escaped inside the value does not end the match early and leave a dangling
@@ -938,7 +939,7 @@ func isAssignedCredential(text string, loc []int) bool {
 // nothing spells a literal secret `$DB_PASSWORD` — and because a config that
 // does this right is the config a scanner flags least and quotes most.
 func isIndirection(value string) bool {
-	if reVarExpansion.MatchString(value) || strings.HasPrefix(value, "{{") ||
+	if isVarExpansion(value) || strings.HasPrefix(value, "{{") ||
 		(strings.HasPrefix(value, "<") && strings.HasSuffix(value, ">")) ||
 		reEnvLookup.MatchString(value) {
 		return true
@@ -949,23 +950,93 @@ func isIndirection(value string) bool {
 	// a literal does not end in the word "password". This is the shape a
 	// scanner echoes out of source in `extra.lines`, which is the commonest
 	// text this package sees.
-	if i := strings.LastIndexAny(value, ".["); i >= 0 {
-		if last := strings.Trim(value[i+1:], `[]"'`); last != "" && reSecretKey.MatchString(last) {
-			return true
+	//
+	// The pieces in front of it have to look like a container, because this
+	// clause outranks the assignment syntax and testing the tail alone was
+	// weaker than the name test it overrules: `password:
+	// hunter2trustno1.password` and `api_key: wJalrXUtnFEM….secret` both read
+	// as references to it.
+	i := strings.LastIndexAny(value, ".[")
+	if i <= 0 {
+		return false
+	}
+	last := strings.Trim(value[i+1:], `[]"'`)
+	if last == "" || !reSecretKey.MatchString(last) {
+		return false
+	}
+	for _, piece := range strings.FieldsFunc(value[:i], func(r rune) bool {
+		return r == '.' || r == '[' || r == ']'
+	}) {
+		if !isContainerPiece(piece) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
-// A variable expansion, and not merely a value that opens with `$`. The bare
-// prefix excused every crypt-format hash there is — `$2b$12$…`, `$1$salt$…`,
-// `$argon2id$…` — which are exactly what a `password_hash` field holds, and a
-// literal that happens to start with one. A variable's name is spelled the way
-// a variable's name is spelled: one case, no punctuation but the underscore.
-var (
-	reVarExpansion = regexp.MustCompile(`^\$\{?(?:[A-Z][A-Z0-9_]*|[a-z][a-z0-9_]*)\}?$`)
-	reEnvLookup    = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
-)
+// isContainerPiece reports whether a piece names the thing a credential is
+// reached through: `cfg`, `settings`, `dbConfig`, `process`, `env`. Those are
+// short and word-shaped; `hunter2trustno1` is neither.
+func isContainerPiece(piece string) bool {
+	if piece == "" || len([]rune(piece)) >= maxContainerRunes {
+		return false
+	}
+	return !strings.ContainsAny(piece, "0123456789") || hasWordBreak(piece)
+}
+
+// isVarExpansion reports whether a value is a variable being expanded rather
+// than a literal that opens with a dollar sign. The bare `$` prefix excused
+// every crypt-format hash there is — `$2b$12$…`, `$1$salt$…`, `$argon2id$…` —
+// which are exactly what a `password_hash` field holds, and `$Tr0ub4dor3xK`
+// besides. What this accepts is what a shell, a compose file or PowerShell
+// actually writes, defaults included.
+func isVarExpansion(value string) bool {
+	if !strings.HasPrefix(value, "$") {
+		return false
+	}
+	name := value[1:]
+	if strings.HasPrefix(name, "{") {
+		// The closing brace is optional here because the unquoted value class
+		// excludes it, so what reaches this is `${POSTGRES_PASSWORD` with the
+		// brace still in the reviewer's text.
+		name = strings.TrimSuffix(name[1:], "}")
+		// `${VAR:-changeme}` and its relatives: the default belongs to the
+		// expansion, and taking the value up to it left a dangling brace.
+		if i := strings.IndexAny(name, ":-+?"); i > 0 {
+			name = name[:i]
+		}
+	}
+	// PowerShell reaches the environment through a drive prefix.
+	if len(name) > 4 && strings.EqualFold(name[:4], "env:") {
+		name = name[4:]
+	}
+	return isVarName(name)
+}
+
+// isVarName reports whether a string is spelled the way a variable's name is:
+// one case throughout, or camelCase opening in lowercase, and nothing in it but
+// letters, digits and the underscore.
+func isVarName(name string) bool {
+	if name == "" || strings.IndexFunc(name, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
+	}) >= 0 {
+		return false
+	}
+	first := []rune(name)[0]
+	if !unicode.IsLetter(first) && first != '_' {
+		return false
+	}
+	if name == strings.ToUpper(name) || name == strings.ToLower(name) {
+		return true
+	}
+	return unicode.IsLower(first) && isWordPiece(name)
+}
+
+var reEnvLookup = regexp.MustCompile(`(?i)^(?:process\.env|os\.environ|import\.meta\.env|env)[.\[]`)
+
+// maxContainerRunes is how long the name of a thing a credential is reached
+// through may run.
+const maxContainerRunes = 13
 
 // namesSomething reports whether a value reads as a name the reviewer quoted
 // rather than as a credential: a CONSTANT_NAME (`SHA256_DIGEST`,
@@ -1066,6 +1137,10 @@ func carriesAPassword(value string) bool {
 	if i := strings.Index(userinfo, "://"); i >= 0 {
 		return strings.Contains(userinfo[i+3:], ":")
 	}
+	// A scheme-relative URL has no scheme to find, and skipping the leading
+	// slashes is the difference between reading `//admin:pass@host` as a login
+	// and not reading it at all.
+	userinfo = strings.TrimPrefix(userinfo, "//")
 	// With no scheme in front of it, everything before the `@` is userinfo only
 	// if it reads like one — and userinfo is `user:pass`, exactly one colon and
 	// no path. Testing for a dot instead was one dot away from being wrong in
@@ -1281,14 +1356,17 @@ func isFileReference(value string) bool {
 // key and `wjalrxutnfemik7mdengbpxrficyexamplekey.key` reads as a word again.
 //
 // What every long file name has is word breaks — humps, hyphens, underscores —
-// and what no payload has is any. That is the rule, and it is the same one
-// isWordPiece applies to a name.
+// and what no payload has is any. Except that Go, and Kubernetes with it,
+// writes `validatingwebhookconfiguration.go`: a real 33-rune file name with no
+// break in it at all. What that convention does not do is mix digits in, and
+// what a key does is exactly that, so an unbroken stem is a payload only when
+// it carries one.
 func readsAsWords(seg string) bool {
 	stem := seg
 	if i := strings.LastIndexByte(stem, '.'); i > 0 {
 		stem = stem[:i]
 	}
-	if !hasWordBreak(stem) {
+	if !hasWordBreak(stem) && strings.ContainsAny(stem, "0123456789") {
 		return false
 	}
 	sh := shapeOf(seg)
@@ -1356,7 +1434,17 @@ var reBareSecret = regexp.MustCompile(
 		// name-and-value rules because their unquoted value class stops at a
 		// comma, and an argon2 hash has commas in its parameters — so those
 		// rules redacted the algorithm and left the salt.
-		`|\$(?:[0-9]|2[abxy]?|argon2[a-z0-9]*|scrypt|pbkdf2[a-z0-9-]*|y|gy|7|sha1)\$[^\s"'\\]+`)
+		`|` + cryptPrefix + `[^\s"'\\]{8,}`)
+
+// cryptPrefix is the `$algorithm$` a crypt-format hash announces itself with.
+// It is also what reSecretHint has to carry, or the rule above is switched off
+// for every line that does not happen to say "password" as well —
+// `hash: $2b$12$…`, or a line of /etc/shadow echoed out of a scanned file.
+//
+// The tail is required to be substantial because `$1$` on its own is also a
+// regex replacement template, and `sed -e 's/(a)(b)/$1$2/'` is a command a
+// review quotes.
+const cryptPrefix = `\$(?:[0-9]|2[abxy]?|argon2[a-z0-9]*|scrypt|pbkdf2[a-z0-9-]*|y|gy|7|sha1)\$`
 
 // envelopeKeys are what a tool runner wraps a result in: what tool it was, how
 // it ended, what it was told to do. A map carrying them describes a call

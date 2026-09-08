@@ -159,6 +159,18 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a literal starting with a dollar", `password: $Tr0ub4dor3xK`, "Tr0ub4dor3xK", "password"},
 	{"a lowercase base64 path segment", `secret: uploads/wjalrxutnfemik7mdengbpxrficyexamplekey.key`, "wjalrxutnfemi", "secret"},
 	{"an unbroken path segment echoed from a config", `{"extra":{"lines":"secret: keys/k3jd8fh2ns0dkq9emxz7pq1wbv4rt6yuz.dat"}}`, "k3jd8fh2ns0dkq", "extra"},
+	// Rows for the leaks the thirty-first review found. The crypt rule was
+	// switched off wherever the line carried no other secret-ish word — the
+	// hint has to be a superset of every pattern it gates — and the four rows
+	// above all say "password", so none of them could see it.
+	{"a crypt hash with no secret-ish name", `hash: $2b$12$eImiTXuWVxfM37uY4JANjQ9Xk0mGxYtQ`, "eImiTXuWVxfM", "hash"},
+	{"a shadow line echoed from a file", `{"extra":{"lines":"root:$6$saltsalt$L9.uJ3xYta3aEG.dfeDMgQz:19000:0:99999:7:::"}}`, "L9.uJ3xYta3aEG", "extra"},
+	// A reference is only a reference if what is in front of the credential's
+	// name reads like a container. Testing the tail alone was weaker than the
+	// name test it overrules, and it overrules the assignment syntax.
+	{"a literal ending in a secret-ish word", `password: hunter2trustno1.password`, "hunter2trustno1", "password:"},
+	{"a base64 value ending in a secret-ish word", `{"extra":{"lines":"  api_key: wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY.secret"}}`, "wJalrXUtnFEMI", "extra"},
+	{"scheme-relative userinfo", `{"credentials":["//admin:sup3rS3cret@db.internal"]}`, "sup3rS3cret", "credentials"},
 	// A document too deep to walk is handed to the patterns rather than
 	// half-scrubbed: the credential goes, and the depth is not an excuse.
 	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, maxScrubDepth+200), "hunter2trustno1", "password"},
@@ -305,6 +317,17 @@ var proseCorpus = []struct{ name, in string }{
 	{"a config struct field echoed from source", `{"extra":{"lines":"  api_key: dbConfig.password"}}`},
 	{"a settings lookup echoed from source", `{"extra":{"lines":"  secret: settings.API_KEY"}}`},
 	{"a config field in a bare span", "- `token: cfg.OAuth2Token`"},
+	// A variable expansion is what a shell, a compose file and PowerShell each
+	// write, defaults included — and the unquoted value class stops at the
+	// closing brace, so what arrives is missing it.
+	{"an expansion with a default", `password: ${DB_PASSWORD:-changeme}`},
+	{"a powershell environment drive", `api_key: $env:API_KEY`},
+	{"a camelcase variable", `password: $dbPassword`},
+	// A replacement template is a command a review quotes, not a hash.
+	{"a regex replacement template", `sed -e 's/(a)(b)/$1$2/' internal/auth/token.go`},
+	// Go and Kubernetes write long file names with no break in them at all;
+	// what that convention does not do is mix digits in.
+	{"an unbroken go file name", "private_key: k8s.io/api/admissionregistration/validatingwebhookconfiguration.go"},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
