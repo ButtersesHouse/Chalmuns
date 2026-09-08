@@ -241,9 +241,6 @@ func sanitizeCommand(command string) string {
 	// inside a word and carries no comment, while `(true)#note` closes a
 	// subshell and does.
 	var parens []parenKind
-	// arith counts the open `$(( ))` frames on the stack, so the here-document
-	// guard is a comparison rather than a scan of the whole stack.
-	arith := 0
 	// prev is the previous character as the shell sees it — after line
 	// continuations are joined, and never a character inside quotes. Reading
 	// the raw text instead made the `#` in `echo hello\<newline>#1` a comment
@@ -259,10 +256,19 @@ func sanitizeCommand(command string) string {
 	// commit -m "$MSG"` read as a run of semgrep, and git's output was filed
 	// as semgrep's review. Blanking every span instead lost the quoted program
 	// name, which is silence, so neither extreme will do.
-	closeSpan := func(closed bool) {
-		if closed && isBareWord(span) {
+	closeSpan := func(closed bool, q rune) {
+		switch {
+		case closed && isBareWord(span):
 			b.WriteString(string(span))
-		} else {
+		case q == '"' && hasSubstitution(span):
+			// `echo "$(semgrep --version)"` runs semgrep, and quoting the
+			// substitution is the *more* usual spelling of the two. Blanking
+			// the span because it holds whitespace lost the run entirely,
+			// while the unquoted form matched — one construct, two answers.
+			// Only the substitution's own text survives; the rest of the span
+			// is still data.
+			b.WriteString(substitutionText(span))
+		default:
 			b.WriteRune(' ')
 		}
 		span = span[:0]
@@ -298,8 +304,8 @@ func sanitizeCommand(command string) string {
 					span = append(span, ' ')
 				}
 			case r == quote:
+				closeSpan(true, quote)
 				quote = 0
-				closeSpan(true)
 				prev = '"'
 			default:
 				span = append(span, r)
@@ -333,17 +339,18 @@ func sanitizeCommand(command string) string {
 				i++
 				if runes[i] != '\n' {
 					b.WriteRune(neutralize(runes[i]))
-					// The escaped character is still a character: `echo a\b#c`
-					// prints `ab#c`, so the `#` is mid-word. Recording a space
-					// here made it a word start and dropped the rest of the
-					// line, `&&` and all.
-					prev = runes[i]
+					// The escaped character is still a character, whatever it
+					// is: `echo a\b#c` prints `ab#c` and `echo a\ #c` prints
+					// `a #c` — in both the `#` is mid-word. Recording a space
+					// made it a word start, and copying the character through
+					// did the same for an escaped space or separator, so the
+					// rest of the line was dropped, `&&` and all.
+					prev = midWord
 				}
 			}
 			continue
 		case r == '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(':
-			parens = append(parens, parenArith)
-			arith++
+			parens = append(parens, parenArithExpansion)
 			b.WriteString("  ")
 			i += 2
 		case r == '$' && i+1 < len(runes) && runes[i+1] == '(':
@@ -356,8 +363,7 @@ func sanitizeCommand(command string) string {
 			b.WriteString(" (")
 			i++
 		case r == '(' && i+1 < len(runes) && runes[i+1] == '(':
-			parens = append(parens, parenArith)
-			arith++
+			parens = append(parens, parenArithCommand)
 			b.WriteString("  ")
 			i++
 		case r == '(':
@@ -373,9 +379,11 @@ func sanitizeCommand(command string) string {
 			// mid-word — `echo $(date +%Y)#1` prints `2026#1` — while one that
 			// closed a subshell starts a new word, and `(true)#note` really is
 			// a comment.
-			closedSubshell = kind != parenSubstitution
-			if kind == parenArith {
-				arith--
+			// `$(…)` and `$((…))` are expansions: they sit inside a word, so
+			// `echo $((1+2))#1` prints `3#1` and carries no comment. `(…)` and
+			// `((…))` are commands, and `(true)#note` really is a comment.
+			closedSubshell = kind == parenSubshell || kind == parenArithCommand
+			if kind == parenArithExpansion || kind == parenArithCommand {
 				b.WriteRune(' ')
 				if i+1 < len(runes) && runes[i+1] == ')' {
 					b.WriteRune(' ')
@@ -386,7 +394,7 @@ func sanitizeCommand(command string) string {
 			}
 			prev = ')'
 			continue
-		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && arith == 0:
+		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && !inArithmetic(parens):
 			// A here-document operator, because we are outside quotes and
 			// outside `$(( ))` — where `<<` is a left shift, and reading its
 			// operand as a delimiter discarded everything after it.
@@ -407,7 +415,7 @@ func sanitizeCommand(command string) string {
 	// An unterminated quote runs to the end of the command. Nothing closed it,
 	// so its content was never a program name.
 	if quote != 0 {
-		closeSpan(false)
+		closeSpan(false, quote)
 	}
 	return b.String()
 }
@@ -417,10 +425,20 @@ func sanitizeCommand(command string) string {
 type parenKind int
 
 const (
-	parenSubshell parenKind = iota
-	parenSubstitution
-	parenArith
+	parenSubshell       parenKind = iota // `( … )`, a command
+	parenSubstitution                    // `$( … )`, an expansion inside a word
+	parenArithExpansion                  // `$(( … ))`, an expansion inside a word
+	parenArithCommand                    // `(( … ))`, a command
 )
+
+func inArithmetic(parens []parenKind) bool {
+	for _, k := range parens {
+		if k == parenArithExpansion || k == parenArithCommand {
+			return true
+		}
+	}
+	return false
+}
 
 // startsWord reports whether a `#` following prev opens a comment.
 //
@@ -430,6 +448,11 @@ const (
 // prints `2026#1`, while `(true)#note` really is a comment. Getting either
 // wrong costs a command: the first drops a designated run that followed a
 // `&&`, the second scans comment text for one.
+// midWord is the value prev takes for a character that carries no word-break
+// meaning of its own — an escaped one. It is not a character any command line
+// contains, so it can never collide with a real previous character.
+const midWord rune = '\uFFFF'
+
 func startsWord(prev rune, closedSubshell bool) bool {
 	switch prev {
 	case 0:
@@ -445,6 +468,17 @@ func startsWord(prev rune, closedSubshell bool) bool {
 
 // isBareWord reports whether a quoted span is a single unadorned word — the
 // only shape in which quoting a program name is ordinary.
+// openerIsCRLF reports whether the line carrying the here-document operator at
+// i ends with a carriage return, which is what makes its terminator carry one.
+func openerIsCRLF(runes []rune, i int) bool {
+	for ; i < len(runes); i++ {
+		if runes[i] == '\n' {
+			return i > 0 && runes[i-1] == '\r'
+		}
+	}
+	return false
+}
+
 func isBareWord(span []rune) bool {
 	if len(span) == 0 {
 		return false
@@ -462,6 +496,12 @@ func isBareWord(span []rune) bool {
 type heredoc struct {
 	delimiter string
 	dashed    bool
+	// crlf records that the opener's own line ended CRLF, which is the only
+	// case in which the terminator carries a CR too. Trimming one from every
+	// body line instead let a body line reading `EOF\r` inside an LF script
+	// end a here-document early, and the data after it was scanned as
+	// commands.
+	crlf bool
 }
 
 // skipHeredocBody returns the index just past the line terminating h, or the
@@ -486,10 +526,11 @@ func skipHeredocBody(runes []rune, start int, h heredoc) int {
 		// bash strips leading tabs from the terminator only for `<<-`, and
 		// never strips spaces. Comparing a trimmed line let an indented `EOF`
 		// inside a plain here-document end it, and the body after it was then
-		// scanned as commands. A trailing CR is not indentation: on a CRLF
-		// script bash's delimiter word carries it too, and dropping the trim
-		// altogether left the terminator unmatchable.
-		line = strings.TrimSuffix(line, "\r")
+		// scanned as commands. On a CRLF script bash's delimiter word carries
+		// the CR too, so it comes off there and only there.
+		if h.crlf {
+			line = strings.TrimSuffix(line, "\r")
+		}
 		if h.dashed {
 			line = strings.TrimLeft(line, "\t")
 		}
@@ -551,7 +592,7 @@ func parseHeredoc(runes []rune, i int) (heredoc, bool) {
 			// of `<<'EO\F'` unmatchable.
 			word = strings.ReplaceAll(word, `\`, "")
 		}
-		return heredoc{delimiter: word, dashed: dashed}, true
+		return heredoc{delimiter: word, dashed: dashed, crlf: openerIsCRLF(runes, i)}, true
 	}
 	return heredoc{}, false
 }
@@ -600,4 +641,44 @@ func Status(ws []state.Watcher, artifacts []Artifact) []WatcherStatus {
 		out = append(out, st)
 	}
 	return out
+}
+
+// hasSubstitution reports whether a double-quoted span contains a command
+// substitution, whose contents are commands however the span is quoted.
+func hasSubstitution(span []rune) bool {
+	for i := 0; i+1 < len(span); i++ {
+		if span[i] == '$' && span[i+1] == '(' {
+			return true
+		}
+	}
+	return false
+}
+
+// substitutionText renders a double-quoted span as the commands it runs: each
+// `$( … )` keeps its parens and its text, so the separator split sees a command
+// position, and everything around them is blanked because it is still data.
+func substitutionText(span []rune) string {
+	var b strings.Builder
+	b.Grow(len(span))
+	depth := 0
+	for i := 0; i < len(span); i++ {
+		r := span[i]
+		switch {
+		case depth == 0 && r == '$' && i+1 < len(span) && span[i+1] == '(':
+			depth = 1
+			b.WriteString(" (")
+			i++
+		case depth > 0 && r == '(':
+			depth++
+			b.WriteRune(r)
+		case depth > 0 && r == ')':
+			depth--
+			b.WriteRune(r)
+		case depth > 0:
+			b.WriteRune(r)
+		default:
+			b.WriteRune(' ')
+		}
+	}
+	return b.String()
 }

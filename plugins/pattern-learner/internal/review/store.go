@@ -131,7 +131,25 @@ func ListArtifactMeta(cacheDir string) ([]Artifact, error) {
 			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", path, err)
 			continue
 		}
-		out = append(out, Artifact{ReviewID: meta.ReviewID, Source: meta.Source, CapturedAt: meta.CapturedAt})
+		captured := meta.CapturedAt
+		if capturedTime(captured).IsZero() {
+			// A stamp that does not parse is not a position on the watermark
+			// line, and every way of handling that downstream is bad: skipping
+			// the artifact loses the review the moment a watermark exists,
+			// keeping it re-mines it on every run forever. The file's
+			// modification time is a position — it is when the artifact
+			// appeared — so the stamp is repaired here and the rest of the
+			// path never has to know.
+			repaired := "?"
+			if fi, statErr := os.Stat(path); statErr == nil {
+				repaired = fi.ModTime().UTC().Format(time.RFC3339Nano)
+				captured = repaired
+			}
+			fmt.Fprintf(os.Stderr,
+				"warn: %s has an unreadable captured_at (%q); using the file's timestamp (%s)\n",
+				meta.ReviewID, meta.CapturedAt, repaired)
+		}
+		out = append(out, Artifact{ReviewID: meta.ReviewID, Source: meta.Source, CapturedAt: captured})
 	}
 	sortArtifacts(out)
 	return out, nil
@@ -207,19 +225,14 @@ func Select(all []Artifact, ids []string, since string) []Artifact {
 	for _, a := range all {
 		t := capturedTime(a.CapturedAt)
 		if t.IsZero() {
-			// Included, not skipped. A stamp that does not parse is not a
-			// position on this line, so skipping it made the artifact
-			// permanently unselectable the moment a watermark existed — a
-			// review lost for good, reported as "everything has been mined".
-			// Including it re-mines that one artifact on every run until the
-			// file is fixed, which the unchanged-emerging pre-pass already
-			// suppresses at the prompt and which the warning explains. The
-			// watermark itself never takes this stamp; see ExtractLeanFrom.
+			// Unreachable through ListArtifactMeta, which repairs a stamp it
+			// cannot parse rather than handing one on. Kept because Select is
+			// exported and takes a caller's slice: without it, one such
+			// artifact sorts first, is never after any watermark, and vanishes
+			// with no warning at all.
 			fmt.Fprintf(os.Stderr,
-				"warn: %s has an unreadable captured_at (%q) and is re-read on every run; "+
-					"re-capture it or fix the stamp\n",
+				"warn: %s has an unreadable captured_at (%q) and is skipped\n",
 				a.ReviewID, a.CapturedAt)
-			out = append(out, a)
 			continue
 		}
 		if t.After(mark) {
@@ -290,9 +303,9 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 // deleted.
 //
 // An artifact whose captured_at does not parse is not reported here, because
-// it is not lost: Select keeps offering it (and warns by name) until the stamp
-// is fixed. Listing it here instead announced a loss on every routine "nothing
-// new" run, for an artifact that had in fact been mined.
+// it is not lost: ListArtifactMeta repairs the stamp from the file's timestamp
+// and warns, so the artifact is mined once like any other and the watermark
+// moves past it.
 func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))

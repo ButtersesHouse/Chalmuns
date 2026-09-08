@@ -510,6 +510,21 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"empty delimiter body", "cat <<''\nsemgrep bad\n\ntrue", false},
 		{"empty delimiter ended by a blank line", "cat <<''\n\nsemgrep .", true},
 		{"nested arithmetic", "n=$(( (1 << 2) + 3 ))\nsemgrep .", true},
+		// `$(( ))` is an expansion and sits inside a word; `(( ))` is a
+		// command and ends one, so only the second can be followed by a
+		// comment.
+		{"hash after an arithmetic expansion", "echo $((1+2))#1 && semgrep .", true},
+		{"hash after an arithmetic command", "((1+2))#note; semgrep .", false},
+		// An escaped character carries no word-break meaning, whatever it is.
+		{"hash after an escaped space", `echo a\ #c && semgrep .`, true},
+		{"hash after an escaped separator", `echo a\;#c && semgrep .`, true},
+		// Quoting a command substitution is the more usual spelling of the two.
+		{"quoted substitution", `echo "$(semgrep --version)"`, true},
+		{"quoted substitution inside a sentence", `echo "pre $(semgrep .) post"`, true},
+		{"a dollar in quoted prose is not a substitution", `echo "cost is $5; semgrep noise"`, false},
+		// A CR is stripped from a terminator only when the opener's own line
+		// ended CRLF; a body line spelled `EOF\r` in an LF script is data.
+		{"CR line inside an LF heredoc", "cat <<EOF\nEOF\r\nsemgrep bad\nEOF\ntrue", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -761,7 +776,16 @@ func TestFromHook_theReviewWinsAndNothingElseIsPersisted(t *testing.T) {
 	}{
 		{"foreign findings vocabulary", `{"findings":[{"id":"SNYK-JS-1","title":"Prototype pollution","severity":"high"}]}`, true, "", "SNYK-JS-1"},
 		{"nested foreign findings", `{"stdout":{"findings":[{"id":"SNYK-JS-1","title":"Prototype pollution"}]}}`, true, "", "SNYK-JS-1"},
-		{"echoed command with a token is never persisted", `{"stdout":"","results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}`, false, "sk-secret", ""},
+		// The report is kept and the credential is not. Asserting the whole
+		// capture away instead proved nothing: FromHook returns a zero
+		// Artifact when ok is false, so the token check passed vacuously.
+		{"echoed command with a token is stripped", `{"stdout":"","results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}`, true, "sk-secret", "check_id"},
+		{"a nested command with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"metadata":{"command":"SEMGREP_APP_TOKEN=sk-secret-abc123 semgrep --json ."}}`, true, "sk-secret", "check_id"},
+		{"a nested env with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"run":{"env":{"SEMGREP_APP_TOKEN":"sk-secret-abc123"}}}`, true, "sk-secret", "check_id"},
+		{"an argv with a token is stripped", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"argv":["semgrep","--token","sk-secret-abc123"]}`, true, "sk-secret", "check_id"},
+		// A linter exits non-zero exactly when it has findings, so a report
+		// beside an exit code is the ordinary shape, not the exception.
+		{"report beside an exit code", `{"results":[{"check_id":"py.no-requests","path":"a.py","extra":{"message":"Use the shared client."}}],"exit_code":1}`, true, "", "py.no-requests"},
 		{"stderr prose stays out of the corpus", `{"results":[{"check_id":"c","path":"a.py","extra":{"message":"Use the shared client."}}],"stderr":"Traceback: token sk-secret-abc123 rejected"}`, true, "sk-secret", "check_id"},
 		{"prose review beats a bookkeeping line", `{"output":"Command exited with code 1","body":"## Review\n\n- Use the shared http client."}`, true, "", "shared http client"},
 		{"report beside bookkeeping", `{"results":[{"check_id":"py.no-requests","path":"a.py","extra":{"message":"Use the shared client."}}],"message":"Command exited with code 1"}`, true, "", "py.no-requests"},

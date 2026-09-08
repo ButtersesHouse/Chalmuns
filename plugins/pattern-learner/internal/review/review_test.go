@@ -827,13 +827,13 @@ func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
 	}
 }
 
-// A capture stamp that does not parse is not a position on the watermark line.
-// Skipping such an artifact made it permanently unselectable the moment a
-// watermark existed — a review lost for good, reported to the user as
-// "everything has been mined" — so it is kept in every selection instead, and
-// the warning says why. The watermark handed back must itself parse, or the
-// next run rejects its own.
-func TestExtractLean_anUnparseableStampIsNeverLost(t *testing.T) {
+// A capture stamp that does not parse is not a position on the watermark line,
+// and every way of handling that downstream is bad: skipping the artifact
+// loses the review the moment a watermark exists, and keeping it in every
+// selection re-mines it forever and makes "everything already mined"
+// unreachable. The stamp is repaired from the file's timestamp instead, so the
+// artifact is mined once like any other and the watermark moves past it.
+func TestExtractLean_anUnparseableStampIsRepaired(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := WriteArtifact(dir, Artifact{
 		ReviewID: "rev-000000000001", Source: "code-review", Format: FormatMarkdown,
@@ -855,24 +855,18 @@ func TestExtractLean_anUnparseableStampIsNeverLost(t *testing.T) {
 	if len(lean) != 2 || len(unreadable) != 0 {
 		t.Errorf("a first run mines both and reports nothing lost: lean=%d unreadable=%v", len(lean), unreadable)
 	}
-	if watermark != "2026-01-15T10:00:00Z" {
-		t.Errorf("the watermark must be a stamp the next run can parse; got %q", watermark)
+	// The watermark must be a stamp the next run can parse — it validates its
+	// own --since — and must be past the repaired artifact, not behind it.
+	if _, parseErr := time.Parse(time.RFC3339Nano, watermark); parseErr != nil {
+		t.Fatalf("watermark %q does not parse: %v", watermark, parseErr)
 	}
 
-	// A watermark run afterwards still reaches it. It is offered again rather
-	// than reported lost, and the good artifact behind the watermark is not.
-	lean, next, unreadable, err := ExtractLean(dir, nil, watermark)
+	// Which means the next run is quiet: mined once, not offered again.
+	lean, _, unreadable, err = ExtractLean(dir, nil, watermark)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unreadable) != 0 {
-		t.Errorf("nothing was lost, so nothing should be reported: %v", unreadable)
-	}
-	if len(lean) != 1 || lean[0].ReviewID != "rev-000000000002" {
-		t.Fatalf("the unparseable-stamp artifact must stay reachable; got %+v", lean)
-	}
-	// And it cannot become the watermark, or the next run would reject its own.
-	if next != "" {
-		t.Errorf("an unparseable stamp must never be handed back as a watermark; got %q", next)
+	if len(lean) != 0 || len(unreadable) != 0 {
+		t.Errorf("a routine run should report nothing: lean=%d unreadable=%v", len(lean), unreadable)
 	}
 }

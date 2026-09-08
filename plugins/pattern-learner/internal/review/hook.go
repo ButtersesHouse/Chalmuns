@@ -336,26 +336,38 @@ func valueText(v interface{}, depth int) string {
 				return
 			}
 			format := Detect([]byte(text))
-			findings, err := parse(format, []byte(text))
-			structured := format != FormatMarkdown
-			switch {
-			case structured && err == nil && len(findings) > 0:
-				if report == "" {
-					report = text
+			if format == FormatMarkdown {
+				// Checked before parsing: prose on stderr is discarded
+				// whatever it holds, and parsing it first spent a full
+				// markdown scan on a candidate that was never eligible.
+				if !allowProse {
+					return
 				}
-			case structured:
-				if empty == "" {
-					empty = text
+				// A write-up has sections; a runner's status line does not.
+				if findings, _ := parse(format, []byte(text)); len(findings) > 0 {
+					if prose == "" {
+						prose = text
+					}
+					return
 				}
-			case !allowProse:
-			case err == nil && len(findings) > 0:
-				if prose == "" {
-					prose = text
-				}
-			default:
+				// Structureless prose is still a review — a reviewer may say
+				// "the auth package looks right" and nothing more. It ranks
+				// last, so it cannot outrank a write-up or a report; the cost
+				// is that a runner's own status line, when it is the only
+				// thing in the response, is recorded as a short artifact with
+				// no findings. That is cache clutter, and the alternative —
+				// a length or shape floor — throws away real short reviews.
 				if aside == "" {
 					aside = text
 				}
+				return
+			}
+			if findings, err := parse(format, []byte(text)); err == nil && len(findings) > 0 {
+				if report == "" {
+					report = text
+				}
+			} else if empty == "" {
+				empty = text
 			}
 		}
 		for _, key := range responseTextKeys {
@@ -415,31 +427,68 @@ func marshalText(v interface{}) string {
 	return ""
 }
 
-// envelopeKeys are the fields a tool runner adds around a result. Their
-// presence means this map describes a call rather than being a report, and
+// envelopeKeys are the fields a tool runner adds around a result: what was
+// invoked, where, and how it ended. They are never part of a report, and
 // several of them routinely carry a command line — which is where credentials
 // live, and why hookLabel refuses to record one.
 var envelopeKeys = map[string]bool{
-	"command": true, "cwd": true, "file_path": true, "description": true,
-	"tool_name": true, "tool_input": true, "tool_use_id": true,
-	"is_error": true, "interrupted": true, "exit_code": true, "sandbox": true,
+	"command": true, "cmd": true, "argv": true, "args": true, "input": true,
+	"env": true, "environment": true, "cwd": true, "file_path": true,
+	"description": true, "tool_name": true, "tool_input": true,
+	"tool_use_id": true, "is_error": true, "interrupted": true,
+	"exit_code": true, "exitCode": true, "sandbox": true,
 }
 
-// reportPayload renders a decoded response as a candidate review: the map
-// without the fields already considered on their own, and nothing at all when
-// it carries a runner's bookkeeping.
+// reportPayload renders a decoded response as a candidate review: the map with
+// the runner's bookkeeping removed, and without the fields already considered
+// on their own.
+//
+// Removing rather than refusing. Bailing out on any bookkeeping key threw away
+// a real report that happened to sit beside an `exit_code` — and a linter
+// exits non-zero precisely when it has findings, so that is the ordinary
+// shape, not the exception.
+//
+// Removing at every level, because one level is not where credentials stop:
+// `{"results":[…],"metadata":{"command":"SEMGREP_APP_TOKEN=… semgrep"}}` put
+// the token into an artifact inside the repository just as surely as a
+// top-level `command` did.
 func reportPayload(t map[string]interface{}) string {
 	rest := make(map[string]interface{}, len(t))
 	for key, val := range t {
-		if envelopeKeys[key] {
-			return ""
-		}
-		if isResponseTextKey(key) {
+		if envelopeKeys[key] || isResponseTextKey(key) {
 			continue
 		}
-		rest[key] = val
+		rest[key] = scrub(val, 0)
 	}
 	return marshalText(rest)
+}
+
+// scrub removes bookkeeping fields from a decoded value at every level. depth
+// bounds it the way valueText is bounded, so a deeply nested document cannot
+// spin; below the bound the value is dropped rather than passed through
+// unscrubbed, because a credential does not become safe by being deep.
+func scrub(v interface{}, depth int) interface{} {
+	if depth > 6 {
+		return nil
+	}
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for key, val := range t {
+			if envelopeKeys[key] {
+				continue
+			}
+			out[key] = scrub(val, depth+1)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, 0, len(t))
+		for _, e := range t {
+			out = append(out, scrub(e, depth+1))
+		}
+		return out
+	}
+	return v
 }
 
 func isResponseTextKey(key string) bool {
