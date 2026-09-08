@@ -322,13 +322,9 @@ func runExtractReview(args []string) error {
 		return fmt.Errorf("no captured review with id %s in %s", strings.Join(missing, ", "), cacheDir)
 	}
 
-	lean, watermark, err := review.ExtractLeanFrom(cacheDir, meta, ids, since)
-	if err != nil {
-		return err
-	}
-	if lean == nil {
-		lean = []review.LeanReview{}
-	}
+	// Lean always returns a non-nil slice, so the documented `[]` for an empty
+	// cache needs no guard here — TestRunExtractReview pins that contract.
+	lean, watermark := review.ExtractLeanFrom(cacheDir, meta, ids, since)
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

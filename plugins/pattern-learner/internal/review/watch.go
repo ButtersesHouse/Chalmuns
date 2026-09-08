@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ButtersesHouse/Chalmuns/internal/state"
 )
@@ -224,71 +225,61 @@ func matchesCommand(name, command string) bool {
 // review. That breaks the invariant this whole path exists to hold: nothing is
 // captured from a tool that was not designated.
 func sanitizeCommand(command string) string {
-	var out strings.Builder
-	out.Grow(len(command))
-	lines := strings.Split(command, "\n")
-	for i := 0; i < len(lines); i++ {
-		masked, delim := maskLine(lines[i])
-		out.WriteString(masked)
-		out.WriteByte('\n')
-		if delim == "" {
-			continue
-		}
-		// A here-document's body is input to a command, not more commands.
-		// Skip to its terminator and carry on scanning after it — truncating
-		// the script there instead meant a designated tool run later in the
-		// same call was never captured.
-		for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != delim {
-			i++
-		}
-		if i+1 < len(lines) {
-			i++
-		}
-	}
-	return out.String()
-}
-
-// maskLine blanks the quoted spans of one line and reports the here-document
-// delimiter the line opens, if any.
-//
-// The two jobs share one scan because they depend on each other: a `<<` inside
-// a quoted string is text, not an operator, and a delimiter written `<<'EOF'`
-// is itself quoted. Doing either pass first gets the other wrong — masking
-// first erases the delimiter, scanning first treats quoted text as an opener
-// and swallows every line after it.
-func maskLine(line string) (masked, delimiter string) {
 	var b strings.Builder
-	b.Grow(len(line))
-	runes := []rune(line)
+	b.Grow(len(command))
+	runes := []rune(command)
+
 	var quote rune
+	var span []rune
+	delimiter := ""
+
+	// closeSpan decides what a finished quoted span was. A span is a program
+	// name only if it is a single bare word: `"semgrep" --json .` and
+	// `"$HOME/my tools/semgrep"`... the second is not, and that is the point.
+	// Keeping the words of a span that holds whitespace let quoted data
+	// manufacture a command position it never had — `MSG="semgrep found
+	// nothing" && git commit -m "$MSG"` read as a run of semgrep, and git's
+	// output was filed as semgrep's review. Blanking every span instead lost
+	// the quoted program name, which is silence, so neither extreme will do.
+	closeSpan := func(closed bool) {
+		if closed && isBareWord(span) {
+			b.WriteString(string(span))
+		} else {
+			b.WriteRune(' ')
+		}
+		span = span[:0]
+	}
+
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
-		switch {
-		case quote == 0 && (r == '\'' || r == '"'):
-			quote = r
-			b.WriteRune(' ')
-		case quote != 0 && r == '\\' && quote != '\'':
-			// The character after a backslash is literal, so an escaped quote
-			// does not end the string. Treating it as if it did re-exposed the
-			// rest of the argument as command positions.
-			b.WriteRune(' ')
-			if i+1 < len(runes) {
-				i++
-				b.WriteRune(' ')
-			}
-		case quote != 0:
-			if r == quote {
+
+		// Quote state is carried across newlines, because a shell string is:
+		// `git commit -m "fix things<newline>semgrep now runs on every PR"` is
+		// one argument, and scanning each line from a clean state read its
+		// second line as a command of its own.
+		if quote != 0 {
+			switch {
+			case r == '\\' && quote != '\'':
+				// The character after a backslash is literal, so an escaped
+				// quote does not end the string. Treating it as if it did
+				// re-exposed the rest of the argument as command positions.
+				span = append(span, ' ')
+				if i+1 < len(runes) {
+					i++
+					span = append(span, ' ')
+				}
+			case r == quote:
 				quote = 0
-				b.WriteRune(' ')
-				continue
+				closeSpan(true)
+			default:
+				span = append(span, r)
 			}
-			// Inside quotes, only the shell's own punctuation loses its
-			// meaning. Blanking the whole span instead also erased a quoted
-			// program name, so `"semgrep" --json .` and
-			// `"$HOME/bin/semgrep" .` — ordinary ways to invoke a tool whose
-			// path has a space — matched nothing at all, which is the silence
-			// this package exists to avoid.
-			b.WriteRune(neutralize(r))
+			continue
+		}
+
+		switch {
+		case r == '\'' || r == '"':
+			quote = r
 		case r == '\\':
 			b.WriteRune(' ')
 			if i+1 < len(runes) {
@@ -301,11 +292,61 @@ func maskLine(line string) (masked, delimiter string) {
 			delimiter = heredocDelimiter(string(runes[i:]))
 			b.WriteString("<<")
 			i++
+		case r == '\n':
+			b.WriteRune('\n')
+			if delimiter != "" {
+				// A here-document's body is input to a command, not more
+				// commands. Skip to its terminator and carry on scanning after
+				// it — truncating the script there instead meant a designated
+				// tool run later in the same call was never captured.
+				i = skipHeredocBody(runes, i+1, delimiter) - 1
+				delimiter = ""
+			}
 		default:
 			b.WriteRune(r)
 		}
 	}
-	return b.String(), delimiter
+	// An unterminated quote runs to the end of the command. Nothing closed it,
+	// so its content was never a program name.
+	if quote != 0 {
+		closeSpan(false)
+	}
+	return b.String()
+}
+
+// isBareWord reports whether a quoted span is a single unadorned word — the
+// only shape in which quoting a program name is ordinary.
+func isBareWord(span []rune) bool {
+	if len(span) == 0 {
+		return false
+	}
+	for _, r := range span {
+		if unicode.IsSpace(r) || neutralize(r) == ' ' {
+			return false
+		}
+	}
+	return true
+}
+
+// skipHeredocBody returns the index just past the line terminating a
+// here-document that begins at i, or the end of the command if it is never
+// terminated.
+func skipHeredocBody(runes []rune, i int, delimiter string) int {
+	for i < len(runes) {
+		end := i
+		for end < len(runes) && runes[end] != '\n' {
+			end++
+		}
+		line := strings.TrimSpace(string(runes[i:end]))
+		if end < len(runes) {
+			end++
+		}
+		if line == delimiter {
+			return end
+		}
+		i = end
+	}
+	return i
 }
 
 // neutralize strips a character of shell meaning while keeping it as text, so

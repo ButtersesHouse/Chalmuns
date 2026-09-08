@@ -443,6 +443,17 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"run after a heredoc", "cat <<EOF > rules.yaml\nrules: []\nEOF\nsemgrep --config rules.yaml .", true},
 		{"escaped quote then a real run", `echo "a \" " && semgrep .`, true},
 		{"plain run", "semgrep --json .", true},
+		// A quoted span is a program name only if it is one bare word.
+		{"quoted program name", `"semgrep" --json .`, true},
+		{"quoted path with a space", `"/opt/my tools/semgrep" .`, false},
+		// Quoted prose assigned to a variable put the tool's name one field
+		// after an env assignment, which reads as command position.
+		{"quoted prose in an assignment", `MSG="semgrep found nothing" && git commit -m "$MSG"`, false},
+		{"quoted prose after a separator", `echo hi; "semgrep is great"`, false},
+		// A shell string spans newlines. Scanning each line from a clean quote
+		// state read the second line of a commit message as its own command.
+		{"multi-line quoted argument", "git commit -m \"fix things\nsemgrep now runs on every PR\"", false},
+		{"unterminated quote", `echo "semgrep found nothing`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -578,5 +589,63 @@ func TestFromHook_emptyResponseEnvelopeIsNotAReview(t *testing.T) {
 		`"tool_response":{"stdout":"","stderr":"","interrupted":false}}`
 	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
 		t.Error("an empty response envelope should capture nothing")
+	}
+}
+
+// Match accepts a skill named as the payload's tool_name, so the filter that
+// keeps a reporting skill's own call out of the cache has to read that
+// spelling too. Testing only tool_input let the same review through twice,
+// under two ids, which downstream reads as two reviewers agreeing.
+func TestFromHook_reporterNamedAsTheToolNameIsStillFiltered(t *testing.T) {
+	ws := watchers(t, "code-review:any")
+	payload := `{"tool_name":"code-review","tool_input":{"prompt":"review the diff"},` +
+		`"tool_response":{"stdout":"I reviewed the diff and reported the findings."}}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("the reporting skill's own call is prompt text, not the review")
+	}
+}
+
+// A linter that writes its report to stderr has still reported. Treating an
+// empty stdout as an empty response made it silent, which is indistinguishable
+// from "found no conventions" — the failure this package exists to avoid.
+func TestFromHook_reportOnStderrIsStillAReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"","stderr":"{\"results\":[{\"check_id\":\"py.no-requests\",` +
+		`\"path\":\"svc/c.py\",\"extra\":{\"message\":\"Use the shared http client.\"}}]}"}}`
+	a, _, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok {
+		t.Fatal("a report on stderr should be captured")
+	}
+	if len(a.Findings) != 1 || a.Findings[0].Title != "py.no-requests" {
+		t.Errorf("stderr report did not parse: %+v", a.Findings)
+	}
+}
+
+// A response whose only non-empty fields are the runner's own bookkeeping is
+// not a review: `{"stdout":"","interrupted":false}` is a tool that said
+// nothing, and recording it filed JSON punctuation as the reviewer's words.
+func TestFromHook_bookkeepingFieldsAreNotAReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"","stderr":"","interrupted":false,"exit_code":0}}`
+	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+		t.Error("an empty response envelope should capture nothing")
+	}
+}
+
+// A field this package does not know by name can still carry the whole report.
+// Returning "" as soon as the recognised text fields were empty silenced it.
+func TestFromHook_anUnknownPayloadFieldIsStillTheReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"","results":[{"check_id":"py.no-requests","path":"svc/c.py",` +
+		`"extra":{"message":"Use the shared http client."}}]}}`
+	a, _, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok {
+		t.Fatal("a report under an unrecognised key should still be captured")
+	}
+	if len(a.Findings) != 1 {
+		t.Errorf("want the one finding, got %+v", a.Findings)
 	}
 }

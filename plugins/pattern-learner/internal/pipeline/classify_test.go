@@ -353,37 +353,53 @@ func TestClassify_reviewEvidenceIsCountedInReviews(t *testing.T) {
 	}
 }
 
-// Once a candidate carries review evidence, PR sources collapse per PR too: a
-// reviewer who flagged four files in one review and three comments left on one
-// PR are two occasions, not seven. signal_count reports the same number the
-// threshold was applied to, so the approval display cannot disagree with the
-// tier beside it.
-func TestClassify_mixedEvidenceCountsOccasionsNotSignals(t *testing.T) {
+// Evidence that corroborates a rule must never lower its tier. Folding PR
+// sources together once a review source appeared did exactly that: a rule
+// established across six comments in three PRs *dropped* to emerging the
+// moment a watched reviewer confirmed it, and the signal_count shown beside it
+// fell from 7 to 4.
+func TestClassify_reviewEvidenceNeverLowersTheTier(t *testing.T) {
 	type src struct {
 		PRNumber int    `json:"pr_number"`
 		Strength string `json:"strength,omitempty"`
 		ReviewID string `json:"review_id,omitempty"`
 	}
-	raw, _ := json.Marshal(map[string]interface{}{
-		"title": "r",
-		"sources": []src{
-			{ReviewID: "rev-000000000001", Strength: "implicit"},
-			{ReviewID: "rev-000000000001", Strength: "implicit"},
-			{ReviewID: "rev-000000000001", Strength: "implicit"},
-			{ReviewID: "rev-000000000001", Strength: "implicit"},
-			{PRNumber: 90, Strength: "implicit"},
-			{PRNumber: 90, Strength: "implicit"},
-			{PRNumber: 90, Strength: "implicit"},
-		},
-	})
-	got := classifyOne(t, raw, 100, 0)
-	if got == nil {
-		t.Fatal("candidate was dropped")
+	prSources := []src{
+		{PRNumber: 90, Strength: "implicit"}, {PRNumber: 90, Strength: "implicit"},
+		{PRNumber: 95, Strength: "implicit"}, {PRNumber: 95, Strength: "implicit"},
+		{PRNumber: 99, Strength: "implicit"}, {PRNumber: 99, Strength: "implicit"},
 	}
-	if got["confidence"] != "emerging" {
-		t.Errorf("one review and one PR is two occasions, not seven; got %v", got["confidence"])
+	build := func(sources []src) json.RawMessage {
+		b, _ := json.Marshal(map[string]interface{}{"title": "r", "sources": sources})
+		return b
 	}
-	if n, _ := got["signal_count"].(float64); n != 2 {
-		t.Errorf("signal_count should report the occasions the tier was decided on; got %v", got["signal_count"])
+
+	before := classifyOne(t, build(prSources), 100, 0)
+	if before == nil || before["confidence"] != "established" {
+		t.Fatalf("fixture should start established; got %v", before)
+	}
+
+	withReview := classifyOne(t, build(append(append([]src{}, prSources...),
+		src{ReviewID: "rev-000000000001", Strength: "implicit"})), 100, 0)
+	if withReview == nil {
+		t.Fatal("adding review evidence dropped the candidate")
+	}
+	if withReview["confidence"] != "established" {
+		t.Errorf("a reviewer confirming the rule demoted it to %v", withReview["confidence"])
+	}
+	if n, _ := withReview["signal_count"].(float64); n != 7 {
+		t.Errorf("signal_count should have risen to 7; got %v", withReview["signal_count"])
+	}
+
+	// The collapse that does apply: four findings from one review are one
+	// signal, so the same six PR comments plus one review — however many
+	// findings that review held — count the same.
+	repeated := append([]src{}, prSources...)
+	for i := 0; i < 4; i++ {
+		repeated = append(repeated, src{ReviewID: "rev-000000000001", Strength: "implicit"})
+	}
+	got := classifyOne(t, build(repeated), 100, 0)
+	if n, _ := got["signal_count"].(float64); n != 7 {
+		t.Errorf("four findings from one review is one signal; got %v", got["signal_count"])
 	}
 }

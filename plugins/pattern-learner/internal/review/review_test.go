@@ -2,6 +2,7 @@ package review
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -365,9 +366,6 @@ func TestSelect_byWatermarkAndIDs(t *testing.T) {
 	if len(got) != 2 {
 		t.Errorf("explicit ids should override the watermark; got %+v", got)
 	}
-	if Newest(all) != "2026-01-03T00:00:00Z" {
-		t.Errorf("Newest: got %q", Newest(all))
-	}
 }
 
 func TestLean_textOnlyWhenUnstructured(t *testing.T) {
@@ -700,13 +698,21 @@ func TestCapture_foreignFenceCharacterInsideABlockIsContent(t *testing.T) {
 // review whose first fence happened to end in a space produced one finding
 // instead of ten.
 func TestCapture_closingFenceWithTrailingSpace(t *testing.T) {
+	// Three fences: if the trailing-whitespace closer is not recognised, the
+	// *next* block's opener is paired as it instead, and everything between —
+	// the second heading — is swallowed as code.
 	a := capture(t, "code-review", FormatMarkdown,
-		"## First\n\nUse the helper.\n\n```go\nx := 1\n```   \n\n## Second\n\nAnd wrap errors.\n")
-	if len(a.Findings) != 2 {
-		t.Fatalf("want 2 findings, got %d: %+v", len(a.Findings), a.Findings)
+		"## First\n\nUse the helper.\n\n```go\nx := 1\n```   \n\n"+
+			"## Second\n\nAnd wrap errors.\n\n```go\ny := 2\n```\n\n"+
+			"## Third\n\nAnd name the receiver.\n")
+	if len(a.Findings) != 3 {
+		t.Fatalf("want 3 findings, got %d: %+v", len(a.Findings), a.Findings)
 	}
-	if a.Findings[1].Title != "Second" {
-		t.Errorf("second heading should have escaped the fence; got %q", a.Findings[1].Title)
+	if a.Findings[1].Title != "Second" || a.Findings[2].Title != "Third" {
+		t.Errorf("headings after the fence were swallowed: %q, %q", a.Findings[1].Title, a.Findings[2].Title)
+	}
+	if !strings.Contains(a.Findings[0].Body, "Use the helper.") || strings.Contains(a.Findings[0].Body, "wrap errors") {
+		t.Errorf("the first finding absorbed the sections after it: %q", a.Findings[0].Body)
 	}
 }
 
@@ -724,44 +730,70 @@ func TestCapture_hashInsideAFenceIsNotAHeading(t *testing.T) {
 	}
 }
 
-// Two different linters that both come back clean have the same content —
-// nothing — so an id derived from the findings alone collapsed them into one
-// artifact. The first clean run then stood for every later one, and the tally
-// the watch list prints attributed it to whichever reviewer got there first.
-func TestCapture_cleanRunsOfDifferentToolsAreDifferentReviews(t *testing.T) {
-	eslint := capture(t, "eslint", FormatAuto, `[]`)
-	semgrep := capture(t, "semgrep", FormatAuto, `{"results":[]}`)
-	if len(eslint.Findings) != 0 || len(semgrep.Findings) != 0 {
-		t.Fatalf("both runs should be clean: %d / %d", len(eslint.Findings), len(semgrep.Findings))
+// A review that reports no findings still says something, and its RawText is
+// the grounding corpus. Keying a clean capture on the format alone collapsed
+// two unrelated clean reviews onto one id, so the second was dropped with
+// written:false — indistinguishable from an idempotent re-capture — and any
+// rule quoting its prose later failed grounding with nothing to explain why.
+func TestCapture_cleanReviewsAreDistinguishedByWhatTheySay(t *testing.T) {
+	auth := capture(t, "code-review", FormatAuto,
+		`{"findings":[],"note":"reviewed the auth package, nothing to flag"}`)
+	billing := capture(t, "code-review", FormatAuto,
+		`{"findings":[],"note":"reviewed the billing package, nothing to flag"}`)
+	if len(auth.Findings) != 0 || len(billing.Findings) != 0 {
+		t.Fatalf("both should be clean: %d / %d", len(auth.Findings), len(billing.Findings))
 	}
-	if eslint.ReviewID == semgrep.ReviewID {
-		t.Errorf("a clean eslint run and a clean semgrep run share id %s", eslint.ReviewID)
+	if auth.ReviewID == billing.ReviewID {
+		t.Errorf("two different clean reviews share id %s", auth.ReviewID)
 	}
-	// Two clean runs of the *same* tool are still one review: that is the
-	// idempotence the content-addressed id exists for.
-	again := capture(t, "eslint", FormatAuto, `[]`)
-	if again.ReviewID != eslint.ReviewID {
-		t.Errorf("re-running one clean linter should be the same review: %s vs %s", again.ReviewID, eslint.ReviewID)
+	// Re-capturing one of them is still the no-op it claims to be.
+	if again := capture(t, "code-review", FormatAuto,
+		`{"findings":[],"note":"reviewed the auth package, nothing to flag"}`); again.ReviewID != auth.ReviewID {
+		t.Errorf("re-capture should be the same review: %s vs %s", again.ReviewID, auth.ReviewID)
 	}
 }
 
-// The watermark must come from what was read, not from what was selected. An
-// artifact whose file will not parse used to advance it anyway, so the next
-// --since run never selected it again and the review was lost for good.
+// The resolved format says how the capture was requested, not what the
+// reviewer said. Putting it in the digest split one clean run into two
+// artifacts the moment a watcher's --format was named explicitly instead of
+// sniffed, and the confidence model reads two artifacts as two reviews.
+func TestCapture_theSameBytesAreOneReviewUnderAutoOrAnExplicitFormat(t *testing.T) {
+	sniffed := capture(t, "eslint", FormatAuto, `[]`)
+	explicit := capture(t, "eslint", FormatESLint, `[]`)
+	if sniffed.Format == explicit.Format {
+		t.Fatalf("fixture no longer exercises two resolved formats (both %q)", sniffed.Format)
+	}
+	if sniffed.ReviewID != explicit.ReviewID {
+		t.Errorf("one clean run captured two ways: %s (%s) vs %s (%s)",
+			sniffed.ReviewID, sniffed.Format, explicit.ReviewID, explicit.Format)
+	}
+}
+
+// The watermark is a position in the capture order, and it may not step over
+// an artifact that failed to read — including one in the middle of the
+// selection. Advancing past it meant the next --since run never selected it
+// again and the review was unmineable for good, on the strength of one warning.
 func TestExtractLean_watermarkStopsAtAnUnreadableArtifact(t *testing.T) {
 	dir := t.TempDir()
-	for _, a := range []Artifact{
-		{ReviewID: "rev-000000000001", Source: "code-review", Format: FormatMarkdown,
-			CapturedAt: "2026-01-15T10:00:00Z", RawText: "## A\n\ntext\n"},
-		{ReviewID: "rev-000000000002", Source: "code-review", Format: FormatMarkdown,
-			CapturedAt: "2026-01-15T11:00:00Z", RawText: "## B\n\ntext\n"},
-	} {
-		if _, err := WriteArtifact(dir, a); err != nil {
+	for i, stamp := range []string{"2026-01-15T10:00:00Z", "2026-01-15T11:00:00Z", "2026-01-15T12:00:00Z"} {
+		if _, err := WriteArtifact(dir, Artifact{
+			ReviewID:   fmt.Sprintf("rev-00000000000%d", i+1),
+			Source:     "code-review",
+			Format:     FormatMarkdown,
+			CapturedAt: stamp,
+			RawText:    "## A\n\nsome review text\n",
+		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Corrupt the newer one after the fact, exactly as a truncated write would.
-	if err := os.WriteFile(ArtifactPath(dir, "rev-000000000002"), []byte(`{"review_id":`), 0644); err != nil {
+	// Break the *middle* artifact in a way the metadata listing survives: it
+	// only decodes review_id, source and captured_at, so the file still lists
+	// and is still selected — it is ReadArtifact that fails on it. A file
+	// corrupt enough to fail the listing would vanish from the selection
+	// entirely, which is a different (and unrecoverable) case.
+	if err := os.WriteFile(ArtifactPath(dir, "rev-000000000002"),
+		[]byte(`{"review_id":"rev-000000000002","source":"code-review",`+
+			`"captured_at":"2026-01-15T11:00:00Z","findings":"not an array"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -769,10 +801,10 @@ func TestExtractLean_watermarkStopsAtAnUnreadableArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lean) != 1 {
-		t.Fatalf("want the one readable review, got %d", len(lean))
+	if len(lean) != 2 {
+		t.Fatalf("want the two readable reviews, got %d", len(lean))
 	}
 	if watermark != "2026-01-15T10:00:00Z" {
-		t.Errorf("watermark advanced past the unreadable artifact: %q", watermark)
+		t.Errorf("watermark stepped over the unreadable artifact: %q", watermark)
 	}
 }

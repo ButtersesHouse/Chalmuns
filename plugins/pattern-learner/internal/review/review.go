@@ -205,7 +205,7 @@ func Capture(in Input) (Artifact, error) {
 		now = time.Now()
 	}
 	return Artifact{
-		ReviewID:   artifactID(source, format, findings, in.Data),
+		ReviewID:   artifactID(source, findings, in.Data),
 		Source:     source,
 		Format:     format,
 		CapturedAt: now.UTC().Format(time.RFC3339Nano),
@@ -231,24 +231,30 @@ func Capture(in Input) (Artifact, error) {
 //
 // Source stays in the digest: two *different* tools reporting the same thing
 // is real corroboration and must remain two artifacts.
-func artifactID(source, format string, findings []Finding, data []byte) string {
+//
+// The resolved format is deliberately *not* in the digest. It is a property of
+// how the capture was requested, not of what the reviewer said: the same clean
+// `[]` sniffed as findings under a watcher set to auto and parsed as eslint
+// under one set explicitly would otherwise mint two artifacts for one run,
+// which the confidence model reads as two reviewers agreeing.
+func artifactID(source string, findings []Finding, data []byte) string {
 	h := sha256.New()
 	h.Write([]byte(source))
 	h.Write([]byte{0})
 	if len(findings) == 0 {
-		if format == FormatMarkdown {
-			// Prose carries its whole meaning in its text, so the bytes are
-			// all the identity there is.
-			h.Write(data)
-		} else {
-			// A structured report that found nothing is the same review every
-			// time, whatever its incidental fields say. Hashing the bytes
-			// minted a fresh artifact for each clean run — eslint varies the
-			// echoed `source`, semgrep varies `paths.scanned` — so a tool run
-			// on a green tree accumulated a content-free artifact per run,
-			// each of which the extraction step then read.
-			h.Write([]byte("clean:" + format))
-		}
+		// With no findings to hash, the bytes are all the identity there is.
+		//
+		// A linter that varies its incidental fields between clean runs —
+		// eslint echoes `source`, semgrep varies `paths.scanned` — therefore
+		// mints an artifact per clean run, and that is the better failure.
+		// Collapsing them under a per-format "clean" marker instead discarded
+		// the second clean review's RawText, which is the grounding corpus, so
+		// a report that found no findings but said something in prose
+		// (`{"findings":[],"note":"the auth package looks right"}`) was thrown
+		// away with `written: false` — indistinguishable from an idempotent
+		// re-capture. An artifact with no findings contributes no signals, so
+		// keeping them costs cache files and nothing else.
+		h.Write(data)
 	} else {
 		// Sorted, so a tool that reports the same findings in a different
 		// order between runs — a parallel scanner, or one whose worklist

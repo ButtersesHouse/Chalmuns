@@ -66,8 +66,37 @@ func init() {
 	}
 }
 
-// textKeys are the fields that may carry text inside a structured response.
-var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
+// textKeys are the fields that may carry text inside a structured response,
+// most specific first. stderr is among them because a linter reporting to
+// stderr is ordinary — semgrep and eslint both do it under some flags — and a
+// report is a report whichever stream carried it.
+var textKeys = []string{"content", "output", "stdout", "stderr", "text", "body", "message"}
+
+var textKeySet = func() map[string]bool {
+	m := make(map[string]bool, len(textKeys))
+	for _, k := range textKeys {
+		m[k] = true
+	}
+	return m
+}()
+
+func isTextKey(key string) bool { return textKeySet[key] }
+
+// hasPayload reports whether a decoded JSON value could hold a review. A
+// number or a bool cannot: `{"interrupted":false,"exit_code":0}` is the
+// bookkeeping a tool runner adds around output that is not there, and treating
+// it as the reviewer's words is how an empty response became a review.
+func hasPayload(v interface{}) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t) != ""
+	case []interface{}:
+		return len(t) > 0
+	case map[string]interface{}:
+		return len(t) > 0
+	}
+	return false
+}
 
 // FromHook decides whether a hook payload belongs to a designated watcher and,
 // if so, normalizes the reviewed output into an Artifact. The second return is
@@ -91,7 +120,13 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 
 	// A skill that reports through a reporting tool is captured from that tool
 	// alone; its own call carries prompt text, not findings.
-	if !isReporting && reportingSkills[bareSkillName(skill)] {
+	//
+	// Both spellings are checked because Match accepts both: a skill call may
+	// name the skill in tool_input, or the payload may carry it as the
+	// tool_name itself. Testing only tool_input let the same review through as
+	// two artifacts with two ids, which downstream reads as two independent
+	// reviewers agreeing.
+	if !isReporting && (reportingSkills[bareSkillName(skill)] || reportingSkills[bareSkillName(toolName)]) {
 		return Artifact{}, state.Watcher{}, false
 	}
 
@@ -296,9 +331,9 @@ func valueText(v interface{}, depth int) string {
 			return marshalText(v)
 		}
 		// A response envelope that carries text fields has already said what it
-		// has: if they are all empty the tool produced no output, and falling
-		// through to marshal the envelope would record `{"stdout":"", …}` as
-		// the reviewer's words.
+		// has: marshalling the whole envelope would record `{"stdout":"", …}`
+		// as the reviewer's words, which grounds perfectly and is JSON
+		// punctuation.
 		envelope := false
 		for _, key := range textKeys {
 			inner, present := t[key]
@@ -311,7 +346,23 @@ func valueText(v interface{}, depth int) string {
 			}
 		}
 		if envelope {
-			return ""
+			// Empty text fields are not the same as an empty response: a
+			// linter that writes its report to a field this package does not
+			// know by name still ran, and returning "" here made it silent —
+			// indistinguishable from "found no conventions", which is the
+			// failure this package exists to avoid. Drop the empty fields and
+			// the bookkeeping flags, and hand over whatever payload is left.
+			rest := make(map[string]interface{}, len(t))
+			for key, val := range t {
+				if isTextKey(key) || !hasPayload(val) {
+					continue
+				}
+				rest[key] = val
+			}
+			if len(rest) == 0 {
+				return ""
+			}
+			return marshalText(rest)
 		}
 		return marshalText(v)
 	}

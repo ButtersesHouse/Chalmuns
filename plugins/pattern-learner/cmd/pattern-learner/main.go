@@ -137,7 +137,7 @@ func runStateWrite(args []string) error {
 		}
 	}
 
-	if err := os.MkdirAll(dirOf(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 	return state.Write(path, s)
@@ -794,13 +794,4 @@ func findInFile(filename, substring string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			return path[:i]
-		}
-	}
-	return "."
 }

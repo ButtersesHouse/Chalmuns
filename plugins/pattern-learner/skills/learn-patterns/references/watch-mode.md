@@ -7,11 +7,21 @@ skills, so Steps 5–13 do not apply. Release the run-lock when done.
 
 A designation is what makes capture happen at all. The plugin ships a
 PostToolUse hook that runs `capture-review --hook` after every Bash, Skill,
-SlashCommand and Task call; with no watchers designated it reads the payload,
-matches nothing, and exits. Once a reviewer is designated, that reviewer's
-output is written into `.claude/pattern-learner/review-cache/` as it happens,
-and `--learn-reviews` mines it. Nothing is captured from a tool nobody asked
-for, and nothing is ever captured from a tool that is not designated.
+SlashCommand and ReportFindings call; with no watchers designated it reads the
+payload, matches nothing, and exits. Once a reviewer is designated, that
+reviewer's output is written into `.claude/pattern-learner/review-cache/` as it
+happens, and `--learn-reviews` mines it. Nothing is captured from a tool nobody
+asked for, and nothing is ever captured from a tool that is not designated.
+
+ReportFindings is in that list because Claude Code's own `/code-review` skill
+does not return its findings as the skill call's result — it reports them by
+calling ReportFindings, whose arguments carry the findings array. Its Skill
+call is filtered out so one review is not recorded twice.
+
+A reviewer that runs as a **subagent** (a Task call) is not captured by the
+hook: a subagent's transcript is not a tool response the hook can read. Capture
+that one by hand — pipe its write-up into `capture-review --source <name>` — or
+have it write findings to a file the parent reads.
 
 ---
 

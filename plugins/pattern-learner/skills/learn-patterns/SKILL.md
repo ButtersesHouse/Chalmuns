@@ -317,7 +317,7 @@ The tool applies the strength-aware confidence rules and recency downgrade:
 - **Explicit** (any source `strength: "explicit"`): `"established"` (3+ signals) or `"stated"` (1–2 signals). Kept unconditionally — a stated preference does not expire.
 - **Implicit** (all sources implicit or empty): `"established"` (5+) or `"emerging"` (1–4). Recency downgrade: if the candidate's most-recent source PR is below the midpoint of the scanned range (`max_pr_seen − (max_pr_seen − since_pr) × 0.5`) the confidence is downgraded one tier (`established` → `emerging`; `emerging` → dropped). A candidate with no PR source, or with any review source, is exempt — recency is a judgement on the PR number line and those candidates have no point on it.
 
-`signal_count` is set authoritatively by the tool, ending manual drift. It counts `len(sources)` for a candidate mined only from PRs; once any source carries a `review_id` it counts distinct *occasions* instead — one per review, one per PR, one per source naming neither — so a single linter run that tripped one check in five files is one signal, not five.
+`signal_count` is set authoritatively by the tool, ending manual drift. It is `len(sources)`, except that sources sharing a `review_id` count once between them — a single linter run that tripped one check in five files is one signal, not five.
 
 Output: `{"kept": [...candidates with confidence set...], "dropped": N}`. Use `kept` as input to Step 10.
 

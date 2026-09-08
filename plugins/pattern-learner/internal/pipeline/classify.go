@@ -29,8 +29,10 @@ type ClassifyResult struct {
 
 // RunClassify reads candidates from stdin, assigns confidence based on
 // sources[].strength, applies the threshold and recency downgrade, then
-// writes a ClassifyResult to stdout. Guaranteed to set signal_count =
-// len(sources) on every kept candidate (prevents drift from hand-maintenance).
+// writes a ClassifyResult to stdout. Guaranteed to set signal_count on every
+// kept candidate (prevents drift from hand-maintenance), to the same number
+// the threshold was applied to: len(sources), except that sources sharing a
+// review_id count once between them. See countEvidence.
 //
 // Usage: classify --max-pr-seen <N> [--since-pr <N>]  (candidates JSON array on stdin)
 func RunClassify(args []string) error {
@@ -67,27 +69,30 @@ func RunClassify(args []string) error {
 	return enc.Encode(result)
 }
 
-// countEvidence counts the distinct occasions a candidate's sources came from:
-// one per review, one per PR, and one per source that names neither (a manual
-// or discovered rule, which is its own occasion).
+// countEvidence collapses a candidate's review sources to one signal per
+// review and leaves every other source counted as it always was.
 //
-// It is applied only to candidates that carry at least one review source. A
-// candidate mined purely from PRs keeps the historical signal count, so adding
-// Review Mode does not silently re-grade every rule learned before it existed.
+// One review reporting the same convention in five files is one piece of
+// evidence, not five: counting the findings graded a single linter run
+// "established" — the top tier, which the approval UI sanctions bulk-approving
+// — off one run nobody had read.
+//
+// Only review sources collapse. Folding PR sources together as well made the
+// count non-monotonic, which is worse than the inflation it was meant to fix:
+// a rule established across six comments in three PRs *dropped* to emerging
+// the moment a watched reviewer confirmed it, because seven signals became
+// four occasions. Evidence that corroborates a rule must never lower its tier.
 func countEvidence(sources []classifySource) int {
-	seen := map[string]bool{}
-	loose := 0
+	reviews := map[string]bool{}
+	others := 0
 	for _, s := range sources {
-		switch {
-		case s.ReviewID != "":
-			seen["rev:"+s.ReviewID] = true
-		case s.PRNumber > 0:
-			seen[fmt.Sprintf("pr:%d", s.PRNumber)] = true
-		default:
-			loose++
+		if s.ReviewID != "" {
+			reviews[s.ReviewID] = true
+			continue
 		}
+		others++
 	}
-	return len(seen) + loose
+	return len(reviews) + others
 }
 
 // Classify assigns confidence and applies the Step 9 threshold and recency
@@ -100,9 +105,9 @@ func countEvidence(sources []classifySource) int {
 //   - Implicit (all sources implicit or empty):
 //     5+ signals → "established"; 1–4 → "emerging"
 //
-// A candidate carrying review evidence is counted in distinct occasions rather
-// than signals — one review is one occasion however many findings it held —
-// see countEvidence.
+// A candidate's review sources collapse to one signal per review — one review
+// is one piece of evidence however many findings it held — while every other
+// source counts as one signal, exactly as before. See countEvidence.
 //
 // Recency downgrade (implicit-only, and only for candidates with at least one
 // PR source and no review source):
@@ -159,15 +164,11 @@ func Classify(rawCandidates []json.RawMessage, maxPRSeen, sincePR int) (Classify
 				maxSourcePR = src.PRNumber
 			}
 		}
-		// Once review evidence is in play, evidence is counted in distinct
-		// occasions rather than signals: one review is one occasion however
-		// many findings it held. Counting signals graded a single linter run
-		// that tripped one check in five files as "established" — top tier,
-		// which the approval UI sanctions bulk-approving.
-		n := len(c.Sources)
-		if hasReviewSource {
-			n = countEvidence(c.Sources)
-		}
+		// One review is one signal however many findings it held; everything
+		// else counts as it always did, so a candidate mined only from PRs is
+		// graded exactly as it was before Review Mode existed. See
+		// countEvidence.
+		n := countEvidence(c.Sources)
 
 		// Assign initial confidence.
 		var confidence string

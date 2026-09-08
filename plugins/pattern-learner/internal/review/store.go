@@ -263,29 +263,38 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 	if err != nil {
 		return nil, "", err
 	}
-	return ExtractLeanFrom(cacheDir, meta, ids, since)
+	lean, watermark = ExtractLeanFrom(cacheDir, meta, ids, since)
+	return lean, watermark, nil
 }
 
 // ExtractLeanFrom is ExtractLean over a metadata listing the caller already
 // has, so a run that validated ids against the cache does not read it twice.
-func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, err error) {
-	full := make([]Artifact, 0)
-	for _, m := range Select(meta, ids, since) {
+//
+// meta must be ordered oldest-first, as ListArtifactMeta returns it: the
+// watermark is a position in that order, not a maximum over the set.
+func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string) {
+	chosen := Select(meta, ids, since)
+	full := make([]Artifact, 0, len(chosen))
+	// The watermark advances only over artifacts that were actually read, and
+	// stops at the first one that was not. Taking it from the selection — or
+	// even from the newest artifact successfully read — steps past an artifact
+	// whose file failed to read, so the next --since run never selects it
+	// again and that review is unmineable for good, on the strength of one
+	// warning. Stopping means the next run retries it.
+	stalled := false
+	for _, m := range chosen {
 		a, readErr := ReadArtifact(cacheDir, m.ReviewID)
 		if readErr != nil {
 			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", m.ReviewID, readErr)
+			stalled = true
 			continue
 		}
 		full = append(full, a)
+		if !stalled && len(ids) == 0 {
+			watermark = a.CapturedAt
+		}
 	}
-	// The watermark comes from what was actually read, not from what was
-	// selected. Taking it from the selection advanced past an artifact whose
-	// file failed to read, so the next --since run never selected it again and
-	// the review was unmineable for good — on the strength of one warning.
-	if len(ids) == 0 {
-		watermark = Newest(full)
-	}
-	return Lean(full), watermark, nil
+	return Lean(full), watermark
 }
 
 // MissingIDs returns the requested ids that name no artifact in the cache.
@@ -304,13 +313,4 @@ func MissingIDs(all []Artifact, ids []string) []string {
 		}
 	}
 	return missing
-}
-
-// Newest returns the capture timestamp of the last artifact in an ordered
-// list, for advancing the watermark. Empty when the list is empty.
-func Newest(as []Artifact) string {
-	if len(as) == 0 {
-		return ""
-	}
-	return as[len(as)-1].CapturedAt
 }
