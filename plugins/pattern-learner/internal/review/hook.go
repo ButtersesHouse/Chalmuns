@@ -884,25 +884,27 @@ func isAssignedCredential(text string, loc []int) bool {
 		// file that does not exist, in the text grounding checks against.
 		return false
 	}
+	if namesSomething(value) {
+		// A name the reviewer quoted, or an indirection standing in for the
+		// credential: `cfg.OAuth2Token`, `SHA256_DIGEST`, `sessionToken2`,
+		// `${POSTGRES_PASSWORD}`, `process.env.API_KEY`, a scanner's own rule
+		// id. The same test the array branch uses, so a value is judged the
+		// same way wherever it turns up.
+		//
+		// This sits above the assignment branch because the commonest line in a
+		// scanned config is `password: $DB_PASSWORD`, and reading the syntax
+		// alone rewrote it into a hardcoded secret. It is safe there only
+		// because the shape tests are the strict ones — no whitespace, every
+		// piece a bounded word — which is what `password: "p@ss w0rd.1"` and
+		// `AWS_SECRET_ACCESS_KEY: WJALRX…_K7MDENG…` fail on.
+		return false
+	}
 	if beginsItsUnit(text, loc[0]) {
 		// An assignment. What follows is an annotation — `# rotate this`,
 		// `(line 4)`, the punctuation closing a field — unless it is a word,
 		// which means the line was a sentence that happened to start with a
 		// secret-ish name.
 		return !startsWithWord(rest)
-	}
-	if namesSomething(value) {
-		// A name the reviewer quoted: `cfg.OAuth2Token`, `SHA256_DIGEST`,
-		// `sessionToken2`, a scanner's own rule id. The same test the array
-		// branch uses, so a value is judged the same way wherever the
-		// surroundings leave the judgement to it.
-		//
-		// Only below the branch above. There the syntax has already said the
-		// line is an assignment holding a value, which is the strongest signal
-		// there is — a config line a scanner echoed, an env dump — and a value
-		// test applied on top of it excused `password: MySecretPass` and
-		// `AWS_SECRET_ACCESS_KEY: WJALRX…_K7MDENG…`.
-		return false
 	}
 	// Inside a markdown span, the sentence around it says nothing about the
 	// value: `- **DB_PASSWORD: hunter2trustno1** is committed in
@@ -954,11 +956,15 @@ func namesSomething(value string) bool {
 	if carriesAPassword(value) {
 		return false
 	}
-	// Every piece has to be a word, whichever shape said it was a name: an
-	// underscore between two 25-character runs is not a CONSTANT_NAME, it is
-	// `WJALRXUTNFEMI_K7MDENGBPXRFICYEXAMPLEKEY`.
-	for _, piece := range strings.FieldsFunc(value, isNameSeparator) {
-		if len([]rune(piece)) >= maxNamePieceRunes {
+	// Every piece has to be spelled like a word, whichever shape said it was a
+	// name: an underscore between two 25-character runs is not a CONSTANT_NAME,
+	// it is `WJALRXUTNFEMI_K7MDENGBPXRFICYEXAMPLEKEY`.
+	pieces := strings.FieldsFunc(value, isNameSeparator)
+	if len(pieces) == 0 {
+		return false
+	}
+	for _, piece := range pieces {
+		if !isWordPiece(piece) {
 			return false
 		}
 	}
@@ -968,17 +974,44 @@ func namesSomething(value string) bool {
 	if strings.Contains(value, ".") {
 		return true
 	}
-	// camelCase, on terms strict enough to mean something. "Contains a
-	// lowercase letter followed by an uppercase one" was the first attempt and
-	// more than 999 random base64 strings in 1000 satisfy it. Requiring *every*
-	// capital to open a lowercase word is a real test: a run of capitals is
-	// what base64 has and an identifier does not, and the odds of forty random
-	// characters avoiding one are about a million to one.
-	sh := shapeOf(value)
-	return sh.hasUpper && sh.hasLower && !sh.capsRun
+	// camelCase — a *variable* name, so it starts lowercase. Without that it is
+	// not a test at all at the length a piece is allowed to run: `Summer2024Rocks`
+	// and `Kj9mQv3xLp7nWd` have humps as regular as any identifier's, and the
+	// "one in a million" argument for the hump rule is an argument about forty
+	// characters, not about fourteen. What is left is what a review actually
+	// quotes: `sessionToken2`, `dbPassword1`, `stripeKey2`.
+	rs := []rune(value)
+	return unicode.IsLower(rs[0]) && shapeOf(value).hasUpper
 }
 
-// carriesAPassword reports whether a value is a URL whose userinfo holds one.
+// isWordPiece reports whether one separator-delimited piece of a value is
+// spelled like a word rather than like a chunk of payload. Two things say it is
+// not: a hump shorter than two runes — `aB3xY9zQ7wE` has the joints of a name
+// and none of its words — and, in a piece that mixes case, a run of capitals,
+// which is what base64 has and an identifier does not. A piece that is capitals
+// all through is a CONSTANT piece and is bounded by its length alone.
+func isWordPiece(piece string) bool {
+	rs := []rune(piece)
+	if len(rs) == 0 || len(rs) >= maxNamePieceRunes {
+		return false
+	}
+	sh := shapeOf(piece)
+	if sh.hasLower && sh.maxCaps >= maxCapsRun {
+		return false
+	}
+	hump := 0
+	for i := 1; i < len(rs); i++ {
+		if unicode.IsUpper(rs[i]) && unicode.IsLower(rs[i-1]) {
+			if i-hump < minHumpRunes {
+				return false
+			}
+			hump = i
+		}
+	}
+	return len(rs)-hump >= minHumpRunes || hump == 0
+}
+
+// carriesAPassword reports whether a value keeps a password in its userinfo.
 // `https://oauth2@dev.azure.com/org/_git/repo` is a clone URL a review cites;
 // `postgres://admin:sup3rS3cret@db.internal:5432/app` is a credential, and so
 // is the same thing with the scheme left off. What separates them is the colon
@@ -990,35 +1023,54 @@ func carriesAPassword(value string) bool {
 	}
 	userinfo := value[:at]
 	if i := strings.Index(userinfo, "://"); i >= 0 {
-		userinfo = userinfo[i+3:]
+		return strings.Contains(userinfo[i+3:], ":")
 	}
-	return strings.Contains(userinfo, ":")
+	// With no scheme in front of it, everything before the `@` is userinfo only
+	// if it reads like one. `com.example:lib:1.2.3@aar` is a package
+	// coordinate, and the dots are what say so.
+	return strings.Contains(userinfo, ":") && !strings.Contains(userinfo, ".")
 }
 
 func isNameSeparator(r rune) bool {
 	return strings.ContainsRune("._-:/@", r)
 }
 
-// maxNamePieceRunes is how long one piece of a qualified name runs before it
-// stops being a word and starts being a payload.
-const maxNamePieceRunes = 16
+const (
+	// How long one piece of a qualified name runs before it stops being a word
+	// and starts being a payload.
+	maxNamePieceRunes = 16
+	// How many capitals may run together inside a piece that has lowercase in
+	// it. Four covers the acronyms a name really carries — API, HTTP, JSON,
+	// UUID — and nothing covers `WJALRXUTNFEMI`.
+	maxCapsRun = 5
+	// How short a camelCase hump may be. A word is at least two letters; a
+	// chunk of base64 that happens to change case is one.
+	minHumpRunes = 2
+)
 
-// wordShape is a value's case pattern. capsRun records a capital that does not
-// open a lowercase word, which is what a payload has and a name does not.
-type wordShape struct{ hasUpper, hasLower, capsRun bool }
+// wordShape is a value's case pattern: whether it has capitals, whether it has
+// lowercase, and the longest run of capitals in it.
+type wordShape struct {
+	hasUpper, hasLower bool
+	maxCaps            int
+}
 
 func shapeOf(value string) wordShape {
 	var sh wordShape
-	rs := []rune(value)
-	for i, r := range rs {
+	run := 0
+	for _, r := range value {
 		switch {
 		case unicode.IsUpper(r):
 			sh.hasUpper = true
-			if i+1 >= len(rs) || !unicode.IsLower(rs[i+1]) {
-				sh.capsRun = true
+			run++
+			if run > sh.maxCaps {
+				sh.maxCaps = run
 			}
-		case unicode.IsLower(r):
-			sh.hasLower = true
+		default:
+			run = 0
+			if unicode.IsLower(r) {
+				sh.hasLower = true
+			}
 		}
 	}
 	return sh
@@ -1173,14 +1225,21 @@ func isFileReference(value string) bool {
 	return true
 }
 
-// readsAsWords reports whether a segment is spelled the way a file name is:
-// lowercase, or capitals that each open a word. It is namesSomething's
-// camelCase test without the requirement that there be a capital at all, since
-// a file name is as often all lowercase — which a credential of this length is
-// not.
+// readsAsWords reports whether a long path segment is spelled the way a file
+// name is: words, with at most an acronym's worth of capitals together, and no
+// digits mixed through it.
+//
+// Both halves are needed and each one alone failed. Digits alone rewrote
+// `ProductionAPIGatewayCertificate.pem`, because a name that long usually has
+// an acronym in it. Case alone excused
+// `uploads/a8f3d9e2c1b47f60a8f3d9e2c1b47f60a8f3d9e2.dat`, because lowercase
+// hex reads as a word to any test that only looks at capitals.
 func readsAsWords(seg string) bool {
+	if strings.ContainsAny(seg, "0123456789") {
+		return false
+	}
 	sh := shapeOf(seg)
-	return sh.hasLower && !sh.capsRun
+	return sh.hasLower && sh.maxCaps < maxCapsRun
 }
 
 // How long a piece of a path may run. maxUnbrokenPathRunes is the stricter

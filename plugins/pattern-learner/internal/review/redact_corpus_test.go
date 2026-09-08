@@ -118,6 +118,13 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	{"a hex credential with an underscore", `api_key: 0F8A2B_C4D6E8FA0B2C4D6E8FA0B2C4D6E8FA0B2C`, "C4D6E8FA0B2C", "api_key"},
 	{"a capitals-run path segment", `private_key: keys/WJALRXUTNFEMIKMDENGBPXRFICYEXAMPLEKEY.key`, "WJALRXUTNFEMI", "private_key"},
 	{"scheme-less userinfo in a list", `{"credentials":["admin:sup3rS3cret@db.internal:5432"]}`, "sup3rS3cret", "credentials"},
+	// Rows for the leaks the twenty-eighth review found: humps of one rune are
+	// the joints of a name with none of its words, and a capitalised value is
+	// not a variable name.
+	{"a chunked credential in a span", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7", "is committed"},
+	{"a capitalised credential in a span", `- **password: Summer2024Rocks** is committed`, "Summer2024Rocks", "is committed"},
+	{"a capitalised credential in an array", `{"passwords":["Kj9mQv3xLp7nWd"]}`, "Kj9mQv3xLp7nWd", "passwords"},
+	{"a lowercase hex path segment", `secret: uploads/a8f3d9e2c1b47f60a8f3d9e2c1b47f60a8f3d9e2.dat`, "a8f3d9e2c1b47f60", "secret"},
 	{"a jwt in a span", "- **api_key: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc** is hardcoded", "eyJhbGciOiJIUzI1NiJ9", "is hardcoded"},
 	{"a url with a password in a span", `- **token: https://user:s3cr3tpassw0rd@example.com/repo** is committed`, "s3cr3tpassw0rd", "is committed"},
 	// An array element that is not itself a credential still goes through the
@@ -157,12 +164,12 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
-	// A credential shaped like a qualified name survives: dotted, with every
-	// piece under sixteen runes and no userinfo in it. The bound is what the
-	// class is — a secret can be spelled that way and a name has to be, and
-	// the alternative rewrote every identifier a review quotes that happens to
-	// carry a digit. See namesSomething.
-	{"a short qualified credential", "- **secret: aB3.xY9zQ7** is committed", "aB3.xY9zQ7"},
+	// A credential shaped like a *word-composed* qualified name survives:
+	// pieces under sixteen runes, humps of two or more, no run of capitals, no
+	// userinfo. The bound is what the class is — a secret can be spelled that
+	// way and a name has to be — and the alternative rewrote every identifier
+	// a review quotes that happens to carry a digit. See namesSomething.
+	{"a word-shaped credential", "- **secret: dbHunter2.pass** is committed", "dbHunter2.pass"},
 	// Past the depth bound the structural pass hands the whole text to the
 	// patterns, and the patterns have no equivalent of the array rule — a name
 	// followed by `[` is not a `name: value`. Nothing but nesting built to
@@ -248,6 +255,15 @@ var proseCorpus = []struct{ name, in string }{
 	// classes a Java or TypeScript suite is full of.
 	{"a long cited test file", "- The private_key: src/test/AuthenticationTokenProviderTest.java is committed"},
 	{"a long cited chunk file", "- The token: dist/static/js/VendorAuthenticationBundleChunk.js reads it"},
+	// An acronym inside a long file name is still a name, and a value that
+	// stands in for the credential is not the credential.
+	{"an acronym in a long cited path", "- The private_key: config/certificates/ProductionAPIGatewayCertificate.pem is committed"},
+	{"a shell env indirection", `password: $DB_PASSWORD`},
+	{"a braced env indirection", `password: ${POSTGRES_PASSWORD}`},
+	{"an env lookup echoed from a config", `{"extra":{"lines":"api_key: process.env.API_KEY"}}`},
+	{"a config field in a span", "- `token: cfg.OAuth2Token`"},
+	{"a constant in a span", "- **secret: SHA256_DIGEST**"},
+	{"a package coordinate in a list", `{"secrets":["com.example:lib:1.2.3@aar"]}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
