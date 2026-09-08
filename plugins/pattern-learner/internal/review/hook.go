@@ -66,13 +66,9 @@ func init() {
 	}
 }
 
-// textKeys are the fields that may carry a review inside a structured
-// response, most specific first.
-var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
-
-// responseTextKeys is textKeys plus stderr, which is read on different terms —
-// see valueText. It is built once so the two lists cannot drift.
-var responseTextKeys = append(append([]string{}, textKeys...), "stderr")
+// responseTextKeys are the fields that may carry a review inside a structured
+// response. stderr is last and read on different terms — see valueText.
+var responseTextKeys = []string{"content", "output", "stdout", "text", "body", "message", "stderr"}
 
 // FromHook decides whether a hook payload belongs to a designated watcher and,
 // if so, normalizes the reviewed output into an Artifact. The second return is
@@ -315,61 +311,64 @@ func valueText(v interface{}, depth int) string {
 		}
 		return marshalText(v)
 	case map[string]interface{}:
-		// A findings payload is data, not prose — hand it over whole so the
-		// findings parser can read it rather than digging out a text field.
-		if _, ok := t["findings"]; ok {
-			return marshalText(v)
+		// One pass over everything in this map that could be the review, then
+		// the best of it, in a fixed order of preference. Returning the first
+		// non-empty candidate instead let whichever key happened to be checked
+		// first win, and the loser was sometimes the actual review:
+		//
+		//   - A report beats prose wherever it sits, so a runner that adds
+		//     `"message":"Command exited with code 1"` beside a linter's JSON
+		//     does not have its own bookkeeping recorded as the review.
+		//   - A report with findings beats one without. An empty
+		//     `{"results":[]}` on stderr used to shadow a prose write-up on
+		//     stdout, and FromHook's clean-run guard then dropped the empty
+		//     report — losing the review entirely.
+		//   - The map itself is a candidate: a response handed over as a
+		//     decoded object is a report, not an envelope around one.
+		//   - Prose on stderr is not a candidate at all. A usage error and a
+		//     write-up share that stream and nothing tells them apart; mining
+		//     standing conventions out of a crash message is the worse
+		//     mistake.
+		var report, prose, empty string
+		consider := func(text string, allowProse bool) {
+			if strings.TrimSpace(text) == "" {
+				return
+			}
+			format := Detect([]byte(text))
+			if format == FormatMarkdown {
+				if allowProse && prose == "" {
+					prose = text
+				}
+				return
+			}
+			if findings, err := parse(format, []byte(text)); err == nil && len(findings) > 0 {
+				if report == "" {
+					report = text
+				}
+			} else if empty == "" {
+				empty = text
+			}
 		}
-
-		// One pass over every field that may carry a review, with two rules.
-		//
-		// A structured report wins wherever it sits. A runner that adds
-		// `"message":"Command exited with code 1"` beside a linter's JSON
-		// otherwise had its own bookkeeping read as the review, purely because
-		// "message" is checked before the field the report was in.
-		//
-		// stderr is prose only under protest. A linter writing its report
-		// there is ordinary, but so is one writing a usage error or a progress
-		// banner, and nothing in the stream itself tells the two apart. A
-		// report has a shape; a diagnostic does not, and mining standing
-		// conventions out of a crash message is worse than missing the review.
-		envelope := false
-		prose := ""
 		for _, key := range responseTextKeys {
 			inner, present := t[key]
 			if !present {
 				continue
 			}
-			// Present but empty still means "this envelope has said what it
-			// has" — including a null or false stderr, which reaching
-			// marshalText below would have recorded as the reviewer's words.
-			envelope = true
-			text := valueText(inner, depth+1)
-			if strings.TrimSpace(text) == "" {
-				continue
-			}
-			if Detect([]byte(text)) != FormatMarkdown {
-				return text
-			}
-			if prose == "" && key != "stderr" {
-				prose = text
-			}
+			consider(valueText(inner, depth+1), key != "stderr")
 		}
-		if prose != "" {
+		consider(marshalText(v), false)
+
+		switch {
+		case report != "":
+			return report
+		case prose != "":
 			return prose
+		default:
+			// An empty structured report is still what the tool said. It
+			// reaches FromHook's clean-run guard, which is where "the tool
+			// found nothing" is decided — not here.
+			return empty
 		}
-		if envelope {
-			return ""
-		}
-		// An unrecognised map is handed over only when it is itself a report.
-		// Marshalling any object recorded a runner's bookkeeping —
-		// `{"is_error":true,"tool_use_id":"…"}` — as the reviewer's words, and
-		// because that JSON sniffs as prose, the clean-run guard in FromHook
-		// (which exempts prose) could not catch it either.
-		if s := marshalText(v); s != "" && Detect([]byte(s)) != FormatMarkdown {
-			return s
-		}
-		return ""
 	}
 	return ""
 }

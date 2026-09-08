@@ -51,13 +51,11 @@ Take it from here rather than computing it — it is empty after a `--reviews`
 run, because advancing past the reviews such a run deliberately skipped would
 make them unmineable for good.
 
-An `unreadable` array may also be present, listing artifacts this run could not
-mine: a file that would not read, or one whose `captured_at` does not parse and
-which the watermark can therefore never select again. The watermark advances
-past them regardless, so they will not be offered a second time — say so
-plainly: "Could not read `<ids>` in the review cache; those reviews were
-skipped. Delete the files or re-capture the reviews." Never pass over it
-silently.
+An `unreadable` array may also be present, listing artifacts this run selected
+but whose files would not read. The watermark advances past them, so they are
+reported once and never offered again — say so plainly: "Could not read
+`<ids>` in the review cache; those reviews were skipped. Delete the files or
+re-capture the reviews." Never pass over it silently.
 
 If `reviews` is empty, stop here and tell the user plainly which case it is —
 check them in this order, because `unreadable` outranks the rest:

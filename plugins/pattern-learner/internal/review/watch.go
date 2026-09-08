@@ -231,11 +231,22 @@ func sanitizeCommand(command string) string {
 
 	var quote rune
 	var span []rune
-	// pending holds the here-document delimiters opened on the current line,
-	// in the order bash reads their bodies. One slot was not enough: with
+	// pending holds the here-documents opened on the current line, in the
+	// order bash reads their bodies. One slot was not enough: with
 	// `cat <<A <<B`, B's body was scanned as commands, so a body line reading
 	// `note; semgrep now runs on every PR` manufactured a command position.
-	var pending []string
+	var pending []heredoc
+	// parens records what each open paren was, because `)` means different
+	// things to the rest of the scan: `$(date +%Y)#1` closes a substitution
+	// inside a word and carries no comment, while `(true)#note` closes a
+	// subshell and does.
+	var parens []parenKind
+	// prev is the previous character as the shell sees it — after line
+	// continuations are joined, and never a character inside quotes. Reading
+	// the raw text instead made the `#` in `echo hello\<newline>#1` a comment
+	// and dropped the rest of the joined command.
+	var prev rune
+	closedSubshell := false
 
 	// closeSpan decides what a finished quoted span was. A span is a program
 	// name only if it is a single bare word: `"semgrep" --json .` is an
@@ -255,12 +266,11 @@ func sanitizeCommand(command string) string {
 	}
 
 	// atNewline runs the here-document bodies opened on the line just ended.
-	// A body is input to a command, not more commands. Scanning resumes after
-	// the last terminator — truncating the script there instead meant a
-	// designated tool run later in the same call was never captured.
+	// A body is input to a command, not more commands, and scanning resumes
+	// after the last terminator.
 	atNewline := func(i int) int {
-		for _, d := range pending {
-			i = skipHeredocBody(runes, i+1, d) - 1
+		for _, h := range pending {
+			i = skipHeredocBody(runes, i+1, h) - 1
 		}
 		pending = pending[:0]
 		return i
@@ -287,6 +297,7 @@ func sanitizeCommand(command string) string {
 			case r == quote:
 				quote = 0
 				closeSpan(true)
+				prev = '"'
 			default:
 				span = append(span, r)
 			}
@@ -294,34 +305,71 @@ func sanitizeCommand(command string) string {
 		}
 
 		switch {
-		case r == '#' && startsWord(runes, i):
+		case r == '#' && startsWord(prev, closedSubshell):
 			// A comment, and its text is not a command. Skipping it is not a
 			// nicety: an apostrophe in one (`# see the tool's docs`) opened a
 			// quote that, now that quote state crosses newlines, swallowed
-			// every command after it — so a designated tool run below a
-			// commented line was never captured.
+			// every command after it.
 			for i+1 < len(runes) && runes[i+1] != '\n' {
 				i++
 			}
+			continue
 		case r == '\'' || r == '"':
 			quote = r
+			continue
 		case r == '\\':
 			// A backslash-newline is a line continuation: bash joins the two
 			// lines into one command, so it is neither a separator nor the
 			// boundary a here-document body starts at. Emitting a real newline
-			// here read `npm install --save-dev \<newline>  eslint` as a run
-			// of eslint, and running the here-document skip here swallowed the
-			// commands on the joined line.
+			// read `npm install --save-dev \<newline>  eslint` as a run of
+			// eslint, and running the body skip here swallowed the commands on
+			// the joined line. prev is left alone so the joined text reads as
+			// one word, which is what bash does with it.
 			b.WriteRune(' ')
 			if i+1 < len(runes) {
 				i++
-				b.WriteRune(neutralize(runes[i]))
+				if runes[i] != '\n' {
+					b.WriteRune(neutralize(runes[i]))
+					prev = ' '
+				}
 			}
-		case r == '<' && i+1 < len(runes) && runes[i+1] == '<':
-			// An operator, because we are outside quotes. Read its delimiter
-			// from the raw text, where its own quotes are still intact.
-			if d := heredocDelimiter(string(runes[i:])); d != "" {
-				pending = append(pending, d)
+			continue
+		case r == '$' && i+2 < len(runes) && runes[i+1] == '(' && runes[i+2] == '(':
+			parens = append(parens, parenArith)
+			b.WriteString("  ")
+			i += 2
+		case r == '$' && i+1 < len(runes) && runes[i+1] == '(':
+			parens = append(parens, parenSubstitution)
+			b.WriteRune(' ')
+			i++
+		case r == '(' && i+1 < len(runes) && runes[i+1] == '(':
+			parens = append(parens, parenArith)
+			b.WriteString("  ")
+			i++
+		case r == '(':
+			parens = append(parens, parenSubshell)
+			b.WriteRune(r)
+		case r == ')':
+			kind := parenSubshell
+			if n := len(parens); n > 0 {
+				kind = parens[n-1]
+				parens = parens[:n-1]
+			}
+			closedSubshell = kind != parenSubstitution
+			if kind == parenArith && i+1 < len(runes) && runes[i+1] == ')' {
+				b.WriteString("  ")
+				i++
+			} else {
+				b.WriteRune(r)
+			}
+			prev = ')'
+			continue
+		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && !inArithmetic(parens):
+			// A here-document operator, because we are outside quotes and
+			// outside `$(( ))` — where `<<` is a left shift, and reading its
+			// operand as a delimiter discarded everything after it.
+			if h, ok := parseHeredoc(runes, i); ok {
+				pending = append(pending, h)
 			}
 			b.WriteString("<<")
 			i++
@@ -331,6 +379,8 @@ func sanitizeCommand(command string) string {
 		default:
 			b.WriteRune(r)
 		}
+		prev = r
+		closedSubshell = false
 	}
 	// An unterminated quote runs to the end of the command. Nothing closed it,
 	// so its content was never a program name.
@@ -340,21 +390,41 @@ func sanitizeCommand(command string) string {
 	return b.String()
 }
 
-// startsWord reports whether the rune at i begins a word — the only position
-// in which `#` opens a comment.
-//
-// The set is deliberately narrower than the separators neutralize blanks:
-// bash starts a comment after whitespace or a control operator, but `#` after
-// a closing paren or a redirection is part of the word. `echo $(date +%Y)#1`
-// prints `2026#1`, and treating it as a comment dropped the rest of the line —
-// including a designated tool run after a `&&`.
-func startsWord(runes []rune, i int) bool {
-	if i == 0 {
-		return true
+// parenKind records what an open paren was, so the scan can tell a subshell
+// from a command substitution when the matching `)` arrives.
+type parenKind int
+
+const (
+	parenSubshell parenKind = iota
+	parenSubstitution
+	parenArith
+)
+
+func inArithmetic(parens []parenKind) bool {
+	for _, k := range parens {
+		if k == parenArith {
+			return true
+		}
 	}
-	switch prev := runes[i-1]; prev {
-	case ';', '|', '&', '(':
+	return false
+}
+
+// startsWord reports whether a `#` following prev opens a comment.
+//
+// bash starts a comment at the beginning of a word: after whitespace, after a
+// control operator, or after a redirection. It does not start one mid-word,
+// which is where a command substitution leaves it — `echo $(date +%Y)#1`
+// prints `2026#1`, while `(true)#note` really is a comment. Getting either
+// wrong costs a command: the first drops a designated run that followed a
+// `&&`, the second scans comment text for one.
+func startsWord(prev rune, closedSubshell bool) bool {
+	switch prev {
+	case 0:
 		return true
+	case ';', '|', '&', '(', '<', '>', '\n':
+		return true
+	case ')':
+		return closedSubshell
 	default:
 		return unicode.IsSpace(prev)
 	}
@@ -374,28 +444,45 @@ func isBareWord(span []rune) bool {
 	return true
 }
 
-// skipHeredocBody returns the index just past the line terminating a
-// here-document that begins at i. When no line matches the delimiter it
-// returns start unchanged: an unterminated here-document is far more often a
-// `<<` that was never one — an arithmetic shift in `$(( 1 << x ))`, a
-// delimiter spelled in a way the regex does not know — and skipping to the end
-// of the command on that guess discarded every designated run after it.
-func skipHeredocBody(runes []rune, start int, delimiter string) int {
+// heredoc is one pending here-document: the terminator to look for, and
+// whether the operator was `<<-`, which lets the terminator be indented.
+type heredoc struct {
+	delimiter string
+	dashed    bool
+}
+
+// skipHeredocBody returns the index just past the line terminating h, or the
+// end of the command when no line terminates it.
+//
+// Skipping to the end on an unterminated here-document is the safe answer, not
+// the tidy one. bash reads an unterminated body to end-of-input as data too,
+// and the alternative — scanning the body as commands — is how a commit
+// message beginning "semgrep now runs on every PR" got captured as semgrep's
+// review. A missed capture is recoverable; a review attributed to a tool that
+// never ran corrupts provenance silently.
+func skipHeredocBody(runes []rune, start int, h heredoc) int {
 	for i := start; i < len(runes); {
 		end := i
 		for end < len(runes) && runes[end] != '\n' {
 			end++
 		}
-		line := strings.TrimSpace(string(runes[i:end]))
+		line := string(runes[i:end])
 		if end < len(runes) {
 			end++
 		}
-		if line == delimiter {
+		// bash strips leading tabs from the terminator only for `<<-`, and
+		// never strips spaces. Comparing a trimmed line let an indented `EOF`
+		// inside a plain here-document end it, and the body after it was then
+		// scanned as commands.
+		if h.dashed {
+			line = strings.TrimLeft(line, "\t")
+		}
+		if line == h.delimiter {
 			return end
 		}
 		i = end
 	}
-	return start
+	return len(runes)
 }
 
 // neutralize strips a character of shell meaning while keeping it as text, so
@@ -411,22 +498,32 @@ func neutralize(r rune) rune {
 
 // reHeredoc matches a here-document operator and its delimiter word in every
 // form bash accepts it: `<<EOF`, `<<'EOF'`, `<<-"EOF"`, `<<\EOF`, `<<EOF-1`,
-// `<<1EOF`. All name the same terminator, and a form this misses is a body
-// scanned as commands — that is how `cat <<\EOF` let a here-document body
-// manufacture a command position.
-var reHeredoc = regexp.MustCompile(`^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\([A-Za-z0-9_.+-]+)|([A-Za-z0-9_.+-]+))`)
+// `<<1EOF`. A form this misses is a body scanned as commands, which is how a
+// here-document body could manufacture a command position.
+var reHeredoc = regexp.MustCompile(`^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|((?:\\?[^\s;|&<>()'"])+))`)
 
-func heredocDelimiter(s string) string {
-	m := reHeredoc.FindStringSubmatch(s)
-	if m == nil {
-		return ""
+// heredocWindow bounds how much of the command the delimiter match looks at.
+// Handing it the whole tail copied the rest of the command into a fresh string
+// for every `<<` on the line.
+const heredocWindow = 128
+
+func parseHeredoc(runes []rune, i int) (heredoc, bool) {
+	end := i + heredocWindow
+	if end > len(runes) {
+		end = len(runes)
 	}
-	for _, group := range m[1:] {
-		if group != "" {
-			return group
+	m := reHeredoc.FindStringSubmatch(string(runes[i:end]))
+	if m == nil {
+		return heredoc{}, false
+	}
+	for _, word := range m[2:] {
+		if word != "" {
+			// A backslash quotes the next character in an unquoted delimiter;
+			// the terminator line carries the bare word.
+			return heredoc{delimiter: strings.ReplaceAll(word, `\`, ""), dashed: m[1] == "-"}, true
 		}
 	}
-	return ""
+	return heredoc{}, false
 }
 
 // commandBase reduces an invocation token to the program's name: quotes off,

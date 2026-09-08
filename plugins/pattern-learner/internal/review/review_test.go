@@ -827,12 +827,13 @@ func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
 	}
 }
 
-// A capture stamp that does not parse is not a position on the watermark line,
-// so once a watermark is in play Select can never offer that artifact again.
-// Dropping it on a stderr warning alone is the same silent loss an unreadable
-// file used to be, and the watermark handed back must itself parse — the next
-// run validates it and would reject its own.
-func TestExtractLean_anUnparseableStampIsReported(t *testing.T) {
+// A capture stamp that does not parse is mined like any other artifact on a
+// run with no watermark, and Select names it on stderr on every run that has
+// one. It is deliberately not in `unreadable`: reporting it there announced a
+// loss on every routine "nothing new" run, for a review that had in fact
+// already been mined. The watermark handed back must itself parse, or the next
+// run rejects its own.
+func TestExtractLean_anUnparseableStampDoesNotBreakTheWatermark(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := WriteArtifact(dir, Artifact{
 		ReviewID: "rev-000000000001", Source: "code-review", Format: FormatMarkdown,
@@ -847,7 +848,6 @@ func TestExtractLean_anUnparseableStampIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A first run has no watermark, so it mines everything and loses nothing.
 	lean, watermark, unreadable, err := ExtractLean(dir, nil, "")
 	if err != nil {
 		t.Fatal(err)
@@ -859,12 +859,13 @@ func TestExtractLean_anUnparseableStampIsReported(t *testing.T) {
 		t.Errorf("the watermark must be a stamp the next run can parse; got %q", watermark)
 	}
 
-	// A watermark run cannot reach it, and says so.
-	_, _, unreadable, err = ExtractLean(dir, nil, "2026-01-15T09:00:00Z")
+	// And a routine watermark run afterwards is quiet: nothing new, no loss
+	// announced for a review that was already mined.
+	lean, _, unreadable, err = ExtractLean(dir, nil, watermark)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(unreadable) != 1 || unreadable[0] != "rev-000000000002" {
-		t.Errorf("the unparseable stamp should be reported by id; got %v", unreadable)
+	if len(lean) != 0 || len(unreadable) != 0 {
+		t.Errorf("a routine run should report nothing: lean=%d unreadable=%v", len(lean), unreadable)
 	}
 }

@@ -273,18 +273,21 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 // meta must be ordered oldest-first, as ListArtifactMeta returns it: the
 // watermark is a position in that order, not a maximum over the set.
 //
-// unreadable names the artifacts the run could not mine: one it selected but
-// could not read, and one whose capture stamp does not parse, which the
-// watermark can never select again.
+// unreadable names the artifacts this run selected but could not read. They
+// are reported rather than swallowed because neither silent option is honest.
+// Advancing the watermark over a broken artifact loses that review on nothing
+// louder than a stderr warning; holding the watermark behind one pins it
+// forever, so a single truncated file makes every later run re-mine the whole
+// tail of the cache and re-present conventions the user already decided on. So
+// the watermark advances over everything this run considered — read or not —
+// and the run says once what it could not read, so the file can be repaired or
+// deleted.
 //
-// They are reported rather than swallowed because neither silent option is
-// honest. Advancing the watermark over a broken artifact loses that review on
-// nothing louder than a stderr warning; holding the watermark behind one pins
-// it forever, so a single truncated file makes every later run re-mine the
-// whole tail of the cache and re-present conventions the user already decided
-// on. So the watermark advances over everything this run considered — read or
-// not — and the run says out loud what it could not read, so the files can be
-// repaired or deleted.
+// An artifact whose captured_at does not parse is not reported here. It is
+// mined normally on a run with no watermark, and Select warns about it by name
+// on every run that has one; adding it to this list instead reported a loss on
+// every routine "nothing new" run, for an artifact that had already been
+// mined, and gave two answers to a question Select already answers.
 func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))
@@ -312,18 +315,6 @@ func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since strin
 			if !capturedTime(chosen[i].CapturedAt).IsZero() {
 				watermark = chosen[i].CapturedAt
 				break
-			}
-		}
-		// A stamp that does not parse is not a position on the watermark line,
-		// so once a watermark is in play Select can never offer these again.
-		// That is a loss, and it is reported for the same reason an unreadable
-		// file is. On a first run (no watermark) they are mined like any other
-		// artifact, so there is nothing to report.
-		if since != "" {
-			for _, m := range meta {
-				if capturedTime(m.CapturedAt).IsZero() {
-					unreadable = append(unreadable, m.ReviewID)
-				}
 			}
 		}
 	}

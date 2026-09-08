@@ -428,7 +428,9 @@ func TestSkillFromCommand(t *testing.T) {
 // Quoting and here-documents are data, not commands. Each of these once
 // produced a false capture or a false miss.
 func TestMatch_quotingAndHeredocs(t *testing.T) {
-	ws := watchers(t, "semgrep:tool")
+	// Both names are designated: a case asserting that `npm install … eslint`
+	// is not a run needs an eslint designation to assert anything at all.
+	ws := watchers(t, "semgrep:tool", "eslint:tool")
 	cases := []struct {
 		name, command string
 		want          bool
@@ -473,12 +475,26 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		{"continued argument is not a command", "npm install --save-dev \\\n  eslint", false},
 		{"run after a continued heredoc opener", "cat <<EOF > r.yml \\\n  && semgrep --config r.yml .\nrules: []\nEOF", true},
 		{"two heredocs on one line", "cat <<A <<B\nabody\nA\nsemgrep .\nB", false},
-		// A `<<` that never opens a here-document must not swallow the script.
+		// A `<<` inside `$(( ))` is a left shift, not a here-document operator.
 		{"arithmetic shift is not a heredoc", "n=$(( 1 << x ))\nsemgrep .", true},
+		{"arithmetic shift with a later bare word", "n=$(( 1 << x ))\nsemgrep .\nx\ngit log", true},
+		// An unterminated here-document is data to end of input in bash too,
+		// so the safe reading is the accurate one.
+		{"unterminated heredoc", "cat <<EOF\nsemgrep now runs on every PR", false},
+		{"delimiter bash accepts whole", "cat <<EOF@1\nsemgrep now runs\nEOF@1\ntrue", false},
+		// bash strips leading tabs from a terminator only for `<<-`.
+		{"indented terminator in a plain heredoc", "git commit -F - <<EOF\nnotes:\n  EOF\nsemgrep now runs on every PR\nEOF", false},
+		{"indented terminator in a dashed heredoc", "cat <<-EOF\n\tbody\n\tEOF\nsemgrep .", true},
 		{"backslash-quoted delimiter", "cat <<\\EOF\nx; semgrep bad\nEOF\ntrue", false},
 		{"digit-leading delimiter", "cat <<1EOF\nx; semgrep bad\n1EOF\ntrue", false},
-		// `#` opens a comment only at the start of a word.
-		{"hash inside a word", "echo $(date +%Y)#1 && semgrep .", true},
+		// `#` opens a comment only at the start of a word. A command
+		// substitution leaves it mid-word; a subshell does not.
+		{"hash after a substitution", "echo $(date +%Y)#1 && semgrep .", true},
+		{"hash after a subshell", "(true)#note; semgrep .", false},
+		// prev must be the character the shell sees, after continuations are
+		// joined — the raw newline made this `#` a comment.
+		{"hash after a continuation", "echo hello\\\n#1 && semgrep --config r.yml .", true},
+		{"run inside a subshell", "(cd x && semgrep .)", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -712,6 +728,60 @@ func TestFromHook_reportOnStderrIsStillAReview(t *testing.T) {
 	if len(got.Findings) != 1 {
 		t.Errorf("the runner's bookkeeping shadowed the report: %q", got.RawText)
 	}
+}
+
+// Which field of a response is the review is decided by what the field holds,
+// not by which key happens to be checked first. Every case here had the wrong
+// candidate win at some point: a runner's bookkeeping beating a report, an
+// empty report beating a prose write-up, an envelope's punctuation beating
+// nothing at all.
+func TestFromHook_theReviewWinsOverWhateverSitsBesideIt(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
+	report := `{"check_id":"py.no-requests","path":"svc/c.py","extra":{"message":"Use the shared http client."}}`
+	cases := []struct {
+		name, response string
+		wantFindings   int
+		wantContains   string
+	}{
+		{"report beside bookkeeping in one map",
+			`{"results":[` + report + `],"message":"Command exited with code 1"}`, 1, "py.no-requests"},
+		{"report beside a null stderr",
+			`{"results":[` + report + `],"stderr":null}`, 1, "py.no-requests"},
+		{"structured stderr beats a message field",
+			`{"stdout":"","message":"Command exited with code 1","stderr":` +
+				string(mustJSON(`{"results":[`+report+`]}`)) + `}`, 1, "py.no-requests"},
+		{"an empty report does not shadow prose",
+			`{"stdout":"## Review\n\n- Use the shared http client everywhere.\n","stderr":"{\"results\":[]}"}`,
+			1, "shared http client"},
+		{"an empty findings array does not shadow prose",
+			`{"content":"## Review\n\n- Use the shared http client everywhere.\n","stdout":"{\"findings\":[]}"}`,
+			1, "shared http client"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+				`"tool_response":` + tc.response + `}`
+			a, _, ok := FromHook([]byte(payload), ws, fixed)
+			if !ok {
+				t.Fatal("the review should have been captured")
+			}
+			if len(a.Findings) != tc.wantFindings {
+				t.Errorf("findings: want %d got %d (raw %q)", tc.wantFindings, len(a.Findings), a.RawText)
+			}
+			if !strings.Contains(a.RawText+findingText(a), tc.wantContains) {
+				t.Errorf("the wrong candidate won: %q", a.RawText)
+			}
+		})
+	}
+}
+
+func findingText(a Artifact) string {
+	var b strings.Builder
+	for _, f := range a.Findings {
+		b.WriteString(f.Title)
+		b.WriteString(f.Body)
+	}
+	return b.String()
 }
 
 // A response envelope that says nothing must not be recorded whatever shape
