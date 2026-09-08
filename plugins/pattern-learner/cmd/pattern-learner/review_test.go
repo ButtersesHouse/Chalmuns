@@ -327,6 +327,12 @@ func TestRunExtractReview_selectsAndShapesForTheSubagent(t *testing.T) {
 	if len(res.Reviews) != 0 {
 		t.Errorf("empty cache should yield no reviews; got %d", len(res.Reviews))
 	}
+	// Asserted on the printed JSON, not the decoded value: json.Unmarshal maps
+	// both `[]` and `null` to a nil slice, so a decoded check cannot tell them
+	// apart and the contract SKILL.md relies on would go unpinned.
+	if !strings.Contains(out, `"reviews": []`) {
+		t.Errorf("empty cache must print `\"reviews\": []`, never null:\n%s", out)
+	}
 
 	if err := runExtractReview([]string{}); err == nil {
 		t.Error("--cache-dir is required")

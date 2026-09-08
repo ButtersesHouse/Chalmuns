@@ -231,16 +231,20 @@ func sanitizeCommand(command string) string {
 
 	var quote rune
 	var span []rune
-	delimiter := ""
+	// pending holds the here-document delimiters opened on the current line,
+	// in the order bash reads their bodies. One slot was not enough: with
+	// `cat <<A <<B`, B's body was scanned as commands, so a body line reading
+	// `note; semgrep now runs on every PR` manufactured a command position.
+	var pending []string
 
 	// closeSpan decides what a finished quoted span was. A span is a program
-	// name only if it is a single bare word: `"semgrep" --json .` and
-	// `"$HOME/my tools/semgrep"`... the second is not, and that is the point.
-	// Keeping the words of a span that holds whitespace let quoted data
-	// manufacture a command position it never had — `MSG="semgrep found
-	// nothing" && git commit -m "$MSG"` read as a run of semgrep, and git's
-	// output was filed as semgrep's review. Blanking every span instead lost
-	// the quoted program name, which is silence, so neither extreme will do.
+	// name only if it is a single bare word: `"semgrep" --json .` is an
+	// ordinary invocation, `"semgrep found nothing"` is prose. Keeping the
+	// words of a span that holds whitespace let quoted data manufacture a
+	// command position it never had — `MSG="semgrep found nothing" && git
+	// commit -m "$MSG"` read as a run of semgrep, and git's output was filed
+	// as semgrep's review. Blanking every span instead lost the quoted program
+	// name, which is silence, so neither extreme will do.
 	closeSpan := func(closed bool) {
 		if closed && isBareWord(span) {
 			b.WriteString(string(span))
@@ -248,6 +252,18 @@ func sanitizeCommand(command string) string {
 			b.WriteRune(' ')
 		}
 		span = span[:0]
+	}
+
+	// atNewline runs the here-document bodies opened on the line just ended.
+	// A body is input to a command, not more commands. Scanning resumes after
+	// the last terminator — truncating the script there instead meant a
+	// designated tool run later in the same call was never captured.
+	atNewline := func(i int) int {
+		for _, d := range pending {
+			i = skipHeredocBody(runes, i+1, d) - 1
+		}
+		pending = pending[:0]
+		return i
 	}
 
 	for i := 0; i < len(runes); i++ {
@@ -278,30 +294,43 @@ func sanitizeCommand(command string) string {
 		}
 
 		switch {
+		case r == '#' && startsWord(runes, i):
+			// A comment, and its text is not a command. Skipping it is not a
+			// nicety: an apostrophe in one (`# see the tool's docs`) opened a
+			// quote that, now that quote state crosses newlines, swallowed
+			// every command after it — so a designated tool run below a
+			// commented line was never captured.
+			for i+1 < len(runes) && runes[i+1] != '\n' {
+				i++
+			}
 		case r == '\'' || r == '"':
 			quote = r
 		case r == '\\':
+			if i+1 < len(runes) && runes[i+1] == '\n' {
+				// A line continuation still ends the line as far as a
+				// here-document is concerned; consuming it silently let the
+				// body leak into the scanned command stream.
+				i++
+				b.WriteRune('\n')
+				i = atNewline(i)
+				continue
+			}
 			b.WriteRune(' ')
 			if i+1 < len(runes) {
 				i++
 				b.WriteRune(neutralize(runes[i]))
 			}
-		case r == '<' && i+1 < len(runes) && runes[i+1] == '<' && delimiter == "":
+		case r == '<' && i+1 < len(runes) && runes[i+1] == '<':
 			// An operator, because we are outside quotes. Read its delimiter
 			// from the raw text, where its own quotes are still intact.
-			delimiter = heredocDelimiter(string(runes[i:]))
+			if d := heredocDelimiter(string(runes[i:])); d != "" {
+				pending = append(pending, d)
+			}
 			b.WriteString("<<")
 			i++
 		case r == '\n':
 			b.WriteRune('\n')
-			if delimiter != "" {
-				// A here-document's body is input to a command, not more
-				// commands. Skip to its terminator and carry on scanning after
-				// it — truncating the script there instead meant a designated
-				// tool run later in the same call was never captured.
-				i = skipHeredocBody(runes, i+1, delimiter) - 1
-				delimiter = ""
-			}
+			i = atNewline(i)
 		default:
 			b.WriteRune(r)
 		}
@@ -312,6 +341,16 @@ func sanitizeCommand(command string) string {
 		closeSpan(false)
 	}
 	return b.String()
+}
+
+// startsWord reports whether the rune at i begins a word — the only position
+// in which `#` opens a comment. `curl host/path#frag` carries no comment.
+func startsWord(runes []rune, i int) bool {
+	if i == 0 {
+		return true
+	}
+	prev := runes[i-1]
+	return unicode.IsSpace(prev) || neutralize(prev) == ' '
 }
 
 // isBareWord reports whether a quoted span is a single unadorned word — the
@@ -330,7 +369,7 @@ func isBareWord(span []rune) bool {
 
 // skipHeredocBody returns the index just past the line terminating a
 // here-document that begins at i, or the end of the command if it is never
-// terminated.
+// terminated — which is where bash would end it too.
 func skipHeredocBody(runes []rune, i int, delimiter string) int {
 	for i < len(runes) {
 		end := i
@@ -361,12 +400,21 @@ func neutralize(r rune) rune {
 }
 
 // reHeredoc matches a here-document operator and its delimiter word, quoted or
-// not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator.
-var reHeredoc = regexp.MustCompile(`^<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+// not — `<<EOF`, `<<'EOF'`, `<<-"EOF"` all name the same terminator. The
+// unquoted alternative accepts the punctuation bash accepts in a word: reading
+// `<<'EOF-1'` as "EOF" meant the terminator was never recognised, and the skip
+// then swallowed every command after the here-document.
+var reHeredoc = regexp.MustCompile(`^<<-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|([A-Za-z_][A-Za-z0-9_.+-]*))`)
 
 func heredocDelimiter(s string) string {
-	if m := reHeredoc.FindStringSubmatch(s); m != nil {
-		return m[1]
+	m := reHeredoc.FindStringSubmatch(s)
+	if m == nil {
+		return ""
+	}
+	for _, group := range m[1:] {
+		if group != "" {
+			return group
+		}
 	}
 	return ""
 }

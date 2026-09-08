@@ -51,6 +51,12 @@ Take it from here rather than computing it — it is empty after a `--reviews`
 run, because advancing past the reviews such a run deliberately skipped would
 make them unmineable for good.
 
+An `unreadable` array may also be present, listing artifacts that were selected
+but whose files could not be read. The watermark still advances past them, so
+they will not be offered again — say so plainly: "Could not read `<ids>` in the
+review cache; those reviews were skipped. Delete the files or re-capture the
+reviews." Never pass over it silently.
+
 If `reviews` is empty, stop here and tell the user plainly which case it is:
 
 - **No watchers designated** (`$BIN watch --state … --list` prints `[]`) →

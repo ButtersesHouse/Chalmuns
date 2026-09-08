@@ -769,11 +769,12 @@ func TestCapture_theSameBytesAreOneReviewUnderAutoOrAnExplicitFormat(t *testing.
 	}
 }
 
-// The watermark is a position in the capture order, and it may not step over
-// an artifact that failed to read — including one in the middle of the
-// selection. Advancing past it meant the next --since run never selected it
-// again and the review was unmineable for good, on the strength of one warning.
-func TestExtractLean_watermarkStopsAtAnUnreadableArtifact(t *testing.T) {
+// An artifact that fails to read is reported, not swallowed. Neither silent
+// option is honest: advancing the watermark over one loses that review on
+// nothing louder than a stderr warning, and holding the watermark behind one
+// pins it forever, so a single truncated file makes every later run re-mine
+// the whole tail of the cache. The watermark advances and the id is named.
+func TestExtractLean_anUnreadableArtifactIsReported(t *testing.T) {
 	dir := t.TempDir()
 	for i, stamp := range []string{"2026-01-15T10:00:00Z", "2026-01-15T11:00:00Z", "2026-01-15T12:00:00Z"} {
 		if _, err := WriteArtifact(dir, Artifact{
@@ -797,14 +798,21 @@ func TestExtractLean_watermarkStopsAtAnUnreadableArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lean, watermark, err := ExtractLean(dir, nil, "")
+	lean, watermark, unreadable, err := ExtractLean(dir, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(lean) != 2 {
 		t.Fatalf("want the two readable reviews, got %d", len(lean))
 	}
-	if watermark != "2026-01-15T10:00:00Z" {
-		t.Errorf("watermark stepped over the unreadable artifact: %q", watermark)
+	// The watermark advances: holding it behind a permanently broken file
+	// would re-mine the whole tail of the cache on every later run, forever.
+	if watermark != "2026-01-15T12:00:00Z" {
+		t.Errorf("watermark: got %q", watermark)
+	}
+	// Which means the run has to say what it lost, or the review goes missing
+	// on nothing louder than a stderr warning.
+	if len(unreadable) != 1 || unreadable[0] != "rev-000000000002" {
+		t.Errorf("the unreadable artifact should be reported by id; got %v", unreadable)
 	}
 }

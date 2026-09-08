@@ -23,6 +23,12 @@ hook: a subagent's transcript is not a tool response the hook can read. Capture
 that one by hand — pipe its write-up into `capture-review --source <name>` — or
 have it write findings to a file the parent reads.
 
+The hook also records nothing when a designated tool's report parses cleanly
+and holds no findings: a linter on a green tree has said nothing, and the hook
+fires on every run. `capture-review --file` still records whatever it is
+handed. A prose review is always recorded — its content is its text, so having
+no parsed findings says nothing about whether it has anything to say.
+
 ---
 
 ## Watch Step W1: Determine the action

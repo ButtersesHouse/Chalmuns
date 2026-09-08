@@ -274,6 +274,12 @@ func captureFromHook(args []string) {
 type extractReviewResult struct {
 	Reviews       []review.LeanReview `json:"reviews"`
 	NextWatermark string              `json:"next_watermark,omitempty"`
+	// Unreadable names artifacts that were selected but whose files could not
+	// be read. The watermark still advances past them — holding it behind one
+	// truncated file would re-mine the whole tail of the cache on every later
+	// run — so the run has to say which reviews it lost, or they would go
+	// missing on nothing louder than a stderr warning.
+	Unreadable []string `json:"unreadable,omitempty"`
 }
 
 // runExtractReview prints the lean views of captured reviews for the
@@ -323,10 +329,12 @@ func runExtractReview(args []string) error {
 	}
 
 	// Lean always returns a non-nil slice, so the documented `[]` for an empty
-	// cache needs no guard here — TestRunExtractReview pins that contract.
-	lean, watermark := review.ExtractLeanFrom(cacheDir, meta, ids, since)
+	// cache needs no guard here — TestRunExtractReview pins that contract by
+	// asserting on the printed JSON, which is the only place `[]` and `null`
+	// differ once they are decoded again.
+	lean, watermark, unreadable := review.ExtractLeanFrom(cacheDir, meta, ids, since)
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	return enc.Encode(extractReviewResult{Reviews: lean, NextWatermark: watermark})
+	return enc.Encode(extractReviewResult{Reviews: lean, NextWatermark: watermark, Unreadable: unreadable})
 }

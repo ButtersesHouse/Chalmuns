@@ -258,13 +258,13 @@ func Lean(as []Artifact) []LeanReview {
 // artifact carries its whole review text — decoding the entire cache to throw
 // almost all of it away was the bulk of the work on a path that runs on every
 // review-mode invocation.
-func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview, watermark string, err error) {
+func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string, err error) {
 	meta, err := ListArtifactMeta(cacheDir)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	lean, watermark = ExtractLeanFrom(cacheDir, meta, ids, since)
-	return lean, watermark, nil
+	lean, watermark, unreadable = ExtractLeanFrom(cacheDir, meta, ids, since)
+	return lean, watermark, unreadable, nil
 }
 
 // ExtractLeanFrom is ExtractLean over a metadata listing the caller already
@@ -272,29 +272,34 @@ func ExtractLean(cacheDir string, ids []string, since string) (lean []LeanReview
 //
 // meta must be ordered oldest-first, as ListArtifactMeta returns it: the
 // watermark is a position in that order, not a maximum over the set.
-func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string) {
+//
+// unreadable names the artifacts that were selected but could not be read.
+// They are reported rather than swallowed because neither silent option is
+// honest. Advancing the watermark over one loses that review with only a
+// stderr warning; holding the watermark behind one pins it forever — a single
+// truncated file would make every later run re-mine the whole tail of the
+// cache and re-present conventions the user already decided on. So the
+// watermark advances, and the run says out loud which files it could not read
+// so they can be repaired or deleted.
+func ExtractLeanFrom(cacheDir string, meta []Artifact, ids []string, since string) (lean []LeanReview, watermark string, unreadable []string) {
 	chosen := Select(meta, ids, since)
 	full := make([]Artifact, 0, len(chosen))
-	// The watermark advances only over artifacts that were actually read, and
-	// stops at the first one that was not. Taking it from the selection — or
-	// even from the newest artifact successfully read — steps past an artifact
-	// whose file failed to read, so the next --since run never selects it
-	// again and that review is unmineable for good, on the strength of one
-	// warning. Stopping means the next run retries it.
-	stalled := false
+	// An explicit id list never advances the watermark: stepping past reviews
+	// the run skipped on purpose would make them unmineable for good.
+	trackWatermark := len(ids) == 0
 	for _, m := range chosen {
 		a, readErr := ReadArtifact(cacheDir, m.ReviewID)
 		if readErr != nil {
 			fmt.Fprintf(os.Stderr, "warn: skip %s: %v\n", m.ReviewID, readErr)
-			stalled = true
+			unreadable = append(unreadable, m.ReviewID)
 			continue
 		}
 		full = append(full, a)
-		if !stalled && len(ids) == 0 {
+		if trackWatermark {
 			watermark = a.CapturedAt
 		}
 	}
-	return Lean(full), watermark
+	return Lean(full), watermark, unreadable
 }
 
 // MissingIDs returns the requested ids that name no artifact in the cache.

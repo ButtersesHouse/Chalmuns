@@ -454,6 +454,19 @@ func TestMatch_quotingAndHeredocs(t *testing.T) {
 		// state read the second line of a commit message as its own command.
 		{"multi-line quoted argument", "git commit -m \"fix things\nsemgrep now runs on every PR\"", false},
 		{"unterminated quote", `echo "semgrep found nothing`, false},
+		// An apostrophe in a comment opened a quote that, once quote state
+		// crossed newlines, swallowed every command below it.
+		{"apostrophe in a comment", "# see the tool's docs\nsemgrep --json .", true},
+		{"comment after a command", "echo \"a\" # it's fine\nsemgrep .", true},
+		{"trailing comment", "semgrep . # done", true},
+		{"a fragment is not a comment", "curl host/path#frag && semgrep .", true},
+		// Reading `<<'EOF-1'` as "EOF" meant the terminator was never found and
+		// the skip ate the rest of the script.
+		{"delimiter with punctuation", "cat <<'EOF-1' > f\nbody\nEOF-1\nsemgrep .", true},
+		// A line continuation still ends the line for a here-document, and a
+		// second here-document on one line still has a body.
+		{"continuation before a heredoc body", "cat <<EOF \\\nnote; semgrep now runs on every PR\nEOF\ntrue", false},
+		{"two heredocs on one line", "cat <<A <<B\nabody\nA\nsemgrep .\nB", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -580,15 +593,43 @@ func TestFromHook_pluginQualifiedSkillIsStillTheReporter(t *testing.T) {
 }
 
 // A tool that ran and produced nothing comes back as an envelope of empty
-// strings. Marshalling it recorded `{"stdout":"","stderr":""}` as the
-// reviewer's words — a review made of JSON punctuation, which then counted as
-// an occasion the convention recurred on.
+// text fields beside the runner's own bookkeeping. Handing back either — the
+// envelope marshalled whole, or the fields it did not recognise — recorded
+// JSON punctuation as the reviewer's words, and because the first non-empty
+// candidate wins it also shadowed a real review under a later response key.
 func TestFromHook_emptyResponseEnvelopeIsNotAReview(t *testing.T) {
 	ws := watchers(t, "semgrep:tool")
+	cases := []struct{ name, response string }{
+		{"empty text fields", `{"stdout":"","stderr":"","interrupted":false}`},
+		{"numeric bookkeeping", `{"stdout":"","stderr":"","exit_code":0}`},
+		{"string bookkeeping", `{"stdout":"","tool_use_id":"toolu_01ABC","sandbox":"none"}`},
+		{"nested bookkeeping", `{"stdout":"","meta":{"tool_use_id":"toolu_01ABC"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+				`"tool_response":` + tc.response + `}`
+			if a, _, ok := FromHook([]byte(payload), ws, fixed); ok {
+				t.Errorf("an empty response envelope should capture nothing; got %q", a.RawText)
+			}
+		})
+	}
+}
+
+// An empty envelope must not shadow the real review either: responseText takes
+// the first non-empty candidate, so residue handed back from tool_response
+// discarded a review sitting under a later response key.
+func TestFromHook_anEmptyEnvelopeDoesNotShadowTheReview(t *testing.T) {
+	ws := watchers(t, "semgrep:tool")
 	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
-		`"tool_response":{"stdout":"","stderr":"","interrupted":false}}`
-	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
-		t.Error("an empty response envelope should capture nothing")
+		`"tool_response":{"stdout":"","tool_use_id":"toolu_01ABC"},` +
+		`"result":{"stdout":"## Use the shared http client\n\nThe svc package should reuse it."}}`
+	a, _, ok := FromHook([]byte(payload), ws, fixed)
+	if !ok {
+		t.Fatal("the review under a later response key should be captured")
+	}
+	if !strings.Contains(a.RawText, "Use the shared http client") {
+		t.Errorf("captured the wrong thing: %q", a.RawText)
 	}
 }
 
@@ -620,32 +661,47 @@ func TestFromHook_reportOnStderrIsStillAReview(t *testing.T) {
 	if len(a.Findings) != 1 || a.Findings[0].Title != "py.no-requests" {
 		t.Errorf("stderr report did not parse: %+v", a.Findings)
 	}
-}
 
-// A response whose only non-empty fields are the runner's own bookkeeping is
-// not a review: `{"stdout":"","interrupted":false}` is a tool that said
-// nothing, and recording it filed JSON punctuation as the reviewer's words.
-func TestFromHook_bookkeepingFieldsAreNotAReview(t *testing.T) {
-	ws := watchers(t, "semgrep:tool")
-	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
-		`"tool_response":{"stdout":"","stderr":"","interrupted":false,"exit_code":0}}`
-	if _, _, ok := FromHook([]byte(payload), ws, fixed); ok {
-		t.Error("an empty response envelope should capture nothing")
+	// But a diagnostic is not a report, and nothing in the stream tells them
+	// apart — only the shape does. Capturing a crash message would ask the
+	// extraction subagent to mine standing conventions out of it.
+	for _, noise := range []string{
+		"semgrep: error: unrecognized argument --jsonn",
+		"Scanning 12 files with 40 rules.",
+	} {
+		diag := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+			`"tool_response":{"stdout":"","stderr":` + string(mustJSON(noise)) + `}}`
+		if got, _, ok := FromHook([]byte(diag), ws, fixed); ok {
+			t.Errorf("a diagnostic on stderr is not a review; captured %q", got.RawText)
+		}
+	}
+
+	// A report under a known text key still wins over stderr noise.
+	both := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stderr":"Scanning 12 files with 40 rules.",` +
+		`"text":"## Use the shared client\n\nThe auth package should reuse it."}}`
+	got, _, ok := FromHook([]byte(both), ws, fixed)
+	if !ok || !strings.Contains(got.RawText, "shared client") {
+		t.Errorf("stderr noise shadowed the review: ok=%v raw=%q", ok, got.RawText)
 	}
 }
 
-// A field this package does not know by name can still carry the whole report.
-// Returning "" as soon as the recognised text fields were empty silenced it.
-func TestFromHook_anUnknownPayloadFieldIsStillTheReview(t *testing.T) {
-	ws := watchers(t, "semgrep:tool")
-	payload := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
-		`"tool_response":{"stdout":"","results":[{"check_id":"py.no-requests","path":"svc/c.py",` +
-		`"extra":{"message":"Use the shared http client."}}]}}`
-	a, _, ok := FromHook([]byte(payload), ws, fixed)
-	if !ok {
-		t.Fatal("a report under an unrecognised key should still be captured")
+// The hook is the unattended path, so a designated linter fires on every run.
+// A structured report that found nothing has said nothing, and recording it
+// would write one content-free artifact per clean run into the repository
+// forever. A prose review is exempt: its whole content is its text.
+func TestFromHook_aCleanStructuredRunIsNotRecorded(t *testing.T) {
+	ws := watchers(t, "semgrep:tool", "house-review:skill")
+
+	clean := `{"tool_name":"Bash","tool_input":{"command":"semgrep --json ."},` +
+		`"tool_response":{"stdout":"{\"results\":[],\"paths\":{\"scanned\":[\"a.py\"]}}"}}`
+	if a, _, ok := FromHook([]byte(clean), ws, fixed); ok {
+		t.Errorf("a clean structured run should record nothing; got %q", a.RawText)
 	}
-	if len(a.Findings) != 1 {
-		t.Errorf("want the one finding, got %+v", a.Findings)
+
+	prose := `{"tool_name":"Skill","tool_input":{"skill":"house-review"},` +
+		`"tool_response":{"stdout":"The auth package looks right; nothing to flag this round."}}`
+	if _, _, ok := FromHook([]byte(prose), ws, fixed); !ok {
+		t.Error("a prose review with no parsed findings still has something to say")
 	}
 }

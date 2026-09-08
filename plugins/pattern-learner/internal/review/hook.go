@@ -66,37 +66,9 @@ func init() {
 	}
 }
 
-// textKeys are the fields that may carry text inside a structured response,
-// most specific first. stderr is among them because a linter reporting to
-// stderr is ordinary — semgrep and eslint both do it under some flags — and a
-// report is a report whichever stream carried it.
-var textKeys = []string{"content", "output", "stdout", "stderr", "text", "body", "message"}
-
-var textKeySet = func() map[string]bool {
-	m := make(map[string]bool, len(textKeys))
-	for _, k := range textKeys {
-		m[k] = true
-	}
-	return m
-}()
-
-func isTextKey(key string) bool { return textKeySet[key] }
-
-// hasPayload reports whether a decoded JSON value could hold a review. A
-// number or a bool cannot: `{"interrupted":false,"exit_code":0}` is the
-// bookkeeping a tool runner adds around output that is not there, and treating
-// it as the reviewer's words is how an empty response became a review.
-func hasPayload(v interface{}) bool {
-	switch t := v.(type) {
-	case string:
-		return strings.TrimSpace(t) != ""
-	case []interface{}:
-		return len(t) > 0
-	case map[string]interface{}:
-		return len(t) > 0
-	}
-	return false
-}
+// textKeys are the fields that may carry a review inside a structured
+// response, most specific first.
+var textKeys = []string{"content", "output", "stdout", "text", "body", "message"}
 
 // FromHook decides whether a hook payload belongs to a designated watcher and,
 // if so, normalizes the reviewed output into an Artifact. The second return is
@@ -165,6 +137,20 @@ func FromHook(payload []byte, watchers []state.Watcher, now time.Time) (a Artifa
 		Now:    now,
 	})
 	if err != nil {
+		return Artifact{}, state.Watcher{}, false
+	}
+	// A structured report that parsed cleanly and found nothing has said
+	// nothing, and the hook is the unattended path: a linter wired to a
+	// designation fires on every run, and a tool that varies its incidental
+	// fields between clean runs — eslint echoes `source`, semgrep varies
+	// `paths.scanned` — would otherwise write one content-free artifact per run
+	// into the repository forever, inflating the capture tally `watch --list`
+	// reports and the work of every mining run. `capture-review --file` still
+	// records whatever it is handed: there someone asked for it.
+	//
+	// Prose is exempt. A markdown review's whole content is its text, so
+	// "no parsed findings" says nothing about whether it has anything to say.
+	if len(art.Findings) == 0 && art.Format != FormatMarkdown {
 		return Artifact{}, state.Watcher{}, false
 	}
 	return art, *matched, true
@@ -345,24 +331,25 @@ func valueText(v interface{}, depth int) string {
 				return text
 			}
 		}
+		// stderr is read last and only when it carries a structured report.
+		// A linter writing its report there is ordinary, but so is a linter
+		// writing a usage error or a progress banner there, and nothing in the
+		// stream itself tells the two apart. A report has a shape; a
+		// diagnostic is prose, and mining standing conventions out of a crash
+		// message is worse than missing the review.
+		if raw, ok := t["stderr"].(string); ok {
+			envelope = true
+			if strings.TrimSpace(raw) != "" && Detect([]byte(raw)) != FormatMarkdown {
+				return raw
+			}
+		}
 		if envelope {
-			// Empty text fields are not the same as an empty response: a
-			// linter that writes its report to a field this package does not
-			// know by name still ran, and returning "" here made it silent —
-			// indistinguishable from "found no conventions", which is the
-			// failure this package exists to avoid. Drop the empty fields and
-			// the bookkeeping flags, and hand over whatever payload is left.
-			rest := make(map[string]interface{}, len(t))
-			for key, val := range t {
-				if isTextKey(key) || !hasPayload(val) {
-					continue
-				}
-				rest[key] = val
-			}
-			if len(rest) == 0 {
-				return ""
-			}
-			return marshalText(rest)
+			// The response envelope has already said what it has. Handing back
+			// the fields it did not recognise instead — a tool_use_id, a
+			// sandbox flag — recorded JSON punctuation as the reviewer's words
+			// and, because the first non-empty candidate wins, shadowed a real
+			// review sitting under a later response key.
+			return ""
 		}
 		return marshalText(v)
 	}
