@@ -29,6 +29,15 @@ fires on every run. `capture-review --file` still records whatever it is
 handed. A prose review is always recorded — its content is its text, so having
 no parsed findings says nothing about whether it has anything to say.
 
+**Credentials.** Every capture is scrubbed before it is written, whichever way
+it arrives — the hook, `--file`, stdin. A captured artifact is a file in the
+repository, so a token echoed in a scanner's own report (`SEMGREP_APP_TOKEN=…`
+in the command line it quotes, a key in the source line it flags) would
+otherwise be committed. What the scrub catches is a list of shapes and a list
+is never complete: it is a backstop, not a guarantee. Treat the cache as you
+would any other committed file, and if a review is known to carry a live
+credential, do not capture it.
+
 **stderr.** A designated tool's stderr is read only when it carries a
 structured report (SARIF, ESLint, semgrep or findings JSON). Prose on stderr is
 ignored, because a usage error and a write-up are the same stream and nothing

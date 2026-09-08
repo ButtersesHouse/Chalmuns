@@ -88,6 +88,29 @@ var redactCorpus = []struct{ name, in, absent, keep string }{
 	// one rendered the rest of the write-up as code.
 	{"a value in a code span", "`api_key: abcdefghijkl`", "abcdefghijkl", "api_key"},
 	{"a value in bold", `**secret: hunter2trustno1**`, "hunter2trustno1", "secret"},
+	// Rows for the leaks the twenty-fourth review found. A reviewer quoting an
+	// assignment and then describing it is the commonest write-up shape there
+	// is, and the span rule that stopped `token: sessionToken` being rewritten
+	// let every one of these through.
+	{"a bold value a sentence continues past", `- **DB_PASSWORD: hunter2trustno1** is committed in docker-compose.yml`, "hunter2trustno1", "docker-compose.yml"},
+	{"a code-span value a sentence continues past", "- `api_key: abcdef123456` is hardcoded in config.go", "abcdef123456", "config.go"},
+	{"an emphasised value a sentence continues past", `- _secret: hunter2trustno1_ appears twice`, "hunter2trustno1", "appears twice"},
+	// An array under a secret-ish name holds credentials; dropping the key to
+	// spare a list of rule names committed them.
+	{"an array of credentials", `{"leaked_credentials":{"passwords":["a8f3d9e2c1b47f60"]}}`, "a8f3d9e2c1b47f60", "leaked_credentials"},
+	{"a nested array of credentials", `{"secrets":[["a8f3d9e2c1b47f60"]]}`, "a8f3d9e2c1b47f60", "secrets"},
+	// The ceiling on isFileReference: past it no path a review cites is that
+	// long, so a separator and an extension stop excusing the value.
+	{"a long slashed value with a dotted tail", `secret: wJalrXUtnFEMI/K7MDENGbPxRfiCYEXAMPLEKEY/AKIAIOSFODNN7EXAMPLEwJalrXUtn.key`, "wJalrXUtnFEMI", "secret"},
+	// A document too deep to walk is handed to the patterns rather than
+	// half-scrubbed: the credential goes, and the depth is not an excuse.
+	{"a credential past the depth bound", deeplyNested(`{"password":"hunter2trustno1"}`, 80), "hunter2trustno1", "password"},
+}
+
+// deeplyNested wraps a document in n levels of array, which is what makes the
+// structural pass run out of depth.
+func deeplyNested(inner string, n int) string {
+	return strings.Repeat(`[`, n) + inner + strings.Repeat(`]`, n)
 }
 
 // knownLimitations are the shapes this pattern set deliberately does not
@@ -105,6 +128,9 @@ var knownLimitations = []struct{ name, in, survives string }{
 	// cost is a password that happens to end that way. Past 24 runes with no
 	// separator the length settles it and a JWT is redacted; see isFileReference.
 	{"a short value with a dotted tail", `password: hunter2.key`, "hunter2.key"},
+	// An array element under a secret-ish name is taken on its own shape, so a
+	// list of rule names survives — and so does a credential shaped like one.
+	{"an array of wordlike credentials", `{"passwords":["correcthorse"]}`, "correcthorse"},
 	// A name with words before it needs a value that could be nothing else,
 	// and "could be nothing else" is spelled "carries a digit".
 	{"a wordless credential mid-sentence", `Using the password: correcthorse`, "correcthorse"},
@@ -142,6 +168,10 @@ var proseCorpus = []struct{ name, in string }{
 	// One unbalanced quote after a secret-ish name deleted every finding up to
 	// the next quote in the review.
 	{"an unbalanced quote after a name", "## Findings\n\n### 1. Hardcoded password: \"admin — see the note\n\nThe handler compares the value directly.\n\n### 2. Missing rate limit\n\nUse a \"token bucket\" here.\n\n### 3. Retry loop never backs off\n"},
+	// The same, single-quoted: the double-quote rules were bounded to a line
+	// and the single-quote ones were not, so an apostrophe in the reviewer's
+	// prose deleted every finding down to the next one.
+	{"an unbalanced single quote after a name", "## Findings\n\n- secret='admin — see the note\n\n- The retry loop doesn't back off\n\n- The endpoint is unbounded\n"},
 	// Code the reviewer quoted, and a value with words after it: an
 	// assignment's line ends at the value, a sentence's does not.
 	{"a struct field in prose", "- The struct sets Token:tokenValue without validation"},
@@ -157,6 +187,11 @@ var proseCorpus = []struct{ name, in string }{
 	// a bullet holding an assignment. The span that holds nothing but the
 	// assignment is redacted; see beginsItsUnit.
 	{"a code span a sentence continues past", "`token: sessionToken` is never validated"},
+	// The span rule does not turn every quoted assignment into a credential:
+	// inside the span the value still has to be one, and a cited path or an
+	// identifier is not.
+	{"a cited path in a span a sentence continues past", "- **The api_key: internal/auth/token.go** is unused"},
+	{"a rule name listed under a secret-ish key", `{"secrets":["hardcoded-aws-key","generic-api-key"]}`},
 	{"a rule's own remediation text", `{"results":[{"extra":{"message":"Detected a hardcoded password: change_me_now"}}]}`},
 	// A colon at the end of a line, and a report that quotes a key's header
 	// line mid-sentence: both had every finding after them deleted.
@@ -234,5 +269,23 @@ func TestRedactSecrets_keepsDocumentsParseable(t *testing.T) {
 		if !json.Valid([]byte(got)) {
 			t.Errorf("redaction broke JSON:\n  in:  %s\n  out: %s", in, got)
 		}
+	}
+}
+
+// The corpus row for a deep document passes either way — the patterns catch
+// the credential too — so the handover itself is asserted here. A structural
+// pass that stops short has scrubbed only part of the document, and reporting
+// that as a completed scrub is what would leave the rest of it committed.
+func TestRedactJSON_abandonsADocumentTooDeepToWalk(t *testing.T) {
+	shallow := `{"a":{"password":"hunter2trustno1"}}`
+	if _, ok := redactJSON(shallow); !ok {
+		t.Fatal("a shallow document should be handled structurally")
+	}
+	if _, ok := redactJSON(deeplyNested(shallow, 80)); ok {
+		t.Error("a document past the depth bound should fall through to the patterns")
+	}
+	// The bound is on nesting, not on size: a wide document is still walked.
+	if _, ok := redactJSON(`[` + strings.Repeat(`"x",`, 5000) + `"y"]`); !ok {
+		t.Error("a wide document should still be handled structurally")
 	}
 }

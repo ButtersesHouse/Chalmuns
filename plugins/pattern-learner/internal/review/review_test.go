@@ -261,6 +261,25 @@ func TestCapture_redactsWhicheverDoorTheReviewCameThrough(t *testing.T) {
 	}
 }
 
+func TestCapture_capsTheTextItActuallyStores(t *testing.T) {
+	// `[redacted]` is longer than a short credential, so redaction grows the
+	// text. Checking the cap only on the input let a document under it produce
+	// a RawText over it — the one thing the cap exists to bound.
+	one := "auth=a1b2c3 "
+	body := strings.Repeat(one, maxArtifactBytes/len(one)-1)
+	if len(body) > maxArtifactBytes {
+		t.Fatalf("test input must start under the cap, got %d", len(body))
+	}
+	if _, err := Capture(Input{Data: []byte(body), Source: "semgrep", Now: fixed}); err == nil {
+		t.Error("a capture that redaction grows past the cap should be refused")
+	}
+	// And a capture that stays under it is still accepted.
+	a := capture(t, "semgrep", FormatAuto, "## A finding\n\nauth=a1b2c3\n")
+	if strings.Contains(a.RawText, "a1b2c3") {
+		t.Errorf("credential survived: %q", a.RawText)
+	}
+}
+
 func TestCapture_idIsContentAddressed(t *testing.T) {
 	body := `{"findings":[{"file":"a.go","summary":"s"}]}`
 	first := capture(t, "code-review", FormatAuto, body)

@@ -64,6 +64,17 @@ func ValidFormat(f string) bool {
 // capture at a narrower review instead.
 const maxArtifactBytes = 4 << 20 // 4 MiB
 
+// checkSize refuses a capture that would not fit. It is applied to the input
+// and again to the redacted text, which is what actually becomes RawText.
+func checkSize(n int) error {
+	if n <= maxArtifactBytes {
+		return nil
+	}
+	return fmt.Errorf("captured review is %d bytes, over the %d-byte cap; "+
+		"the whole text is kept as the grounding corpus and cannot be truncated — capture a narrower review",
+		n, maxArtifactBytes)
+}
+
 // Artifact is the normalized on-disk form of one captured code review. It is
 // written to <cache-dir>/review-<ReviewID>.json.
 type Artifact struct {
@@ -143,10 +154,8 @@ func Capture(in Input) (Artifact, error) {
 	if len(bytes.TrimSpace(in.Data)) == 0 {
 		return Artifact{}, fmt.Errorf("captured review is empty")
 	}
-	if len(in.Data) > maxArtifactBytes {
-		return Artifact{}, fmt.Errorf("captured review is %d bytes, over the %d-byte cap; "+
-			"the whole text is kept as the grounding corpus and cannot be truncated — capture a narrower review",
-			len(in.Data), maxArtifactBytes)
+	if err := checkSize(len(in.Data)); err != nil {
+		return Artifact{}, err
 	}
 	source := strings.TrimSpace(in.Source)
 	if source == "" {
@@ -164,6 +173,14 @@ func Capture(in Input) (Artifact, error) {
 	// from unredacted text.
 	if red := redactSecrets(string(in.Data)); red != string(in.Data) {
 		in.Data = []byte(red)
+		// Redaction can grow the text — `[redacted]` is longer than a short
+		// credential — so the cap is checked again on what will actually be
+		// stored. Checking it only on the input let a document under the cap
+		// produce a RawText over it, which is the one thing the cap exists to
+		// bound.
+		if err := checkSize(len(in.Data)); err != nil {
+			return Artifact{}, err
+		}
 	}
 	format := in.Format
 	sniffed := format == "" || format == FormatAuto

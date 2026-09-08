@@ -503,6 +503,18 @@ func redactText(text string) string {
 	// pattern cannot consume part of an earlier replacement: `--token=x` was
 	// rewritten by the assignment rule and then again by the flag rule, which
 	// ate all but the closing bracket and left `[redacted]]` behind.
+	//
+	// The order is load-bearing for the same reason. reBareSecret's token
+	// classes run to the end of a word, so letting it go first swallowed a
+	// following `NAME=` whole and the assignment rule never saw it.
+	//
+	// Each rule sees the whole text, and the cost is real — about 1.3 seconds
+	// per megabyte, inside someone else's tool call. Confining the
+	// name-and-value rules to the lines carrying a secret-ish word looked like
+	// the fix and measured worse on every report shape but one: review prose
+	// says "token" and "auth" on nearly every line, so the windows saved almost
+	// no bytes while multiplying the per-call cost of twelve regexes by the
+	// line count. What bounds this in practice is maxArtifactBytes.
 	for _, re := range secretPatterns {
 		text = re.ReplaceAllString(text, "${1}"+redactedSentinel+"${2}")
 	}
@@ -558,7 +570,16 @@ func redactJSON(text string) (string, bool) {
 		return "", false
 	}
 
-	redacted, changed := redactValue(doc, "", 0)
+	var scrub jsonScrub
+	redacted, changed := scrub.value(doc, "", 0)
+	if scrub.tooDeep {
+		// The walk stopped short of the bottom, so this pass cannot claim to
+		// have scrubbed the document. Reporting it as not-JSON hands the whole
+		// text to the patterns, which have no depth to run out of — where
+		// replacing the subtree destroyed whatever the tool had nested there,
+		// and passing it through left a credential behind it unscrubbed.
+		return "", false
+	}
 	if !changed {
 		// Nothing to remove, so nothing is rewritten. Re-encoding reorders
 		// keys, compacts the tool's own formatting and rewrites escapes and
@@ -577,15 +598,22 @@ func redactJSON(text string) (string, bool) {
 	return strings.TrimRight(buf.String(), "\n"), true
 }
 
-// redactValue rewrites one decoded value, reporting whether it changed
-// anything. key is the field it was found under, which is what decides whether
-// a string is a credential or the review.
-func redactValue(v interface{}, key string, depth int) (interface{}, bool) {
+// jsonScrub walks a decoded document. It carries one bit of state: whether the
+// walk ran out of depth before reaching the bottom, which makes the whole
+// structural pass inconclusive rather than partially applied.
+type jsonScrub struct{ tooDeep bool }
+
+// value rewrites one decoded value, reporting whether it changed anything. key
+// is the field it was found under, which is what decides whether a string is a
+// credential or the review.
+func (s *jsonScrub) value(v interface{}, key string, depth int) (interface{}, bool) {
 	if depth > 64 {
-		// Past the bound the subtree is replaced rather than passed through:
-		// a guard that gives up silently is one a credential can be nested
-		// behind.
-		return redactedMarker, true
+		// Recorded rather than acted on: replacing the subtree destroyed
+		// whatever was nested there and changed its type, and passing it
+		// through is a hole a credential can be nested behind. redactJSON
+		// abandons the pass instead, and the patterns take the whole text.
+		s.tooDeep = true
+		return v, false
 	}
 	switch t := v.(type) {
 	case map[string]interface{}:
@@ -598,7 +626,7 @@ func redactValue(v interface{}, key string, depth int) (interface{}, bool) {
 			if outKey != k {
 				changed = true
 			}
-			redacted, hit := redactValue(val, k, depth+1)
+			redacted, hit := s.value(val, k, depth+1)
 			changed = changed || hit
 			out[outKey] = redacted
 		}
@@ -610,10 +638,24 @@ func redactValue(v interface{}, key string, depth int) (interface{}, bool) {
 		out := make([]interface{}, len(t))
 		changed := false
 		for i, e := range t {
-			// The field's name is not carried into its elements. A `secrets`
-			// key on a summary object usually names which secret *rules* ran,
-			// and redacting every element of it made the review unreadable.
-			redacted, hit := redactValue(e, "", depth+1)
+			// An element does not inherit its field's name outright, and does
+			// not lose it either. A `secrets` key on a summary object usually
+			// names which secret *rules* fired, and redacting every element of
+			// it made the review unreadable — while `"passwords":["a8f3d9e2"]`
+			// really is a list of credentials, and dropping the key committed
+			// them. So the name is carried in and the element is taken on its
+			// own shape: an opaque token is a credential, a rule name is not.
+			if str, ok := e.(string); ok && reSecretKey.MatchString(key) && looksOpaque(str) {
+				out[i], changed = redactedMarker, true
+				continue
+			}
+			// A nested array is the same list one level down, so it keeps the
+			// name; anything else is a value of its own and starts afresh.
+			inner := ""
+			if _, ok := e.([]interface{}); ok {
+				inner = key
+			}
+			redacted, hit := s.value(e, inner, depth+1)
 			changed = changed || hit
 			out[i] = redacted
 		}
@@ -631,6 +673,19 @@ func redactValue(v interface{}, key string, depth int) (interface{}, bool) {
 		return t, false
 	}
 	return v, false
+}
+
+// looksOpaque reports whether a string could be nothing but a credential: one
+// token of some length, carrying a digit, and not a path the reviewer cited.
+// It is what an array element under a secret-ish name is judged on, where the
+// key alone would redact a list of rule names — the same "could be nothing
+// else" test the prose branch of isAssignedCredential applies, for the same
+// reason.
+func looksOpaque(s string) bool {
+	return len([]rune(s)) >= 8 &&
+		!strings.ContainsAny(s, " \t\n") &&
+		strings.ContainsAny(s, "0123456789") &&
+		!isFileReference(s)
 }
 
 // reSecretKey matches a field name that says its value is a credential.
@@ -676,6 +731,13 @@ var reSecretHint = regexp.MustCompile(`(?i)` + secretName +
 // finding up to the next quote in the review.
 const quotedValue = `(?:[^"\\\n]|\\[^"\n])*`
 
+// singleQuotedValue is the same for a single-quoted value. It excludes the
+// newline for the reason quotedValue does, which the single-quote rules were
+// missing: one unbalanced `'` after a secret-ish name — an apostrophe in the
+// reviewer's prose is enough — let the value run to the next quote anywhere
+// below and deleted every finding in between.
+const singleQuotedValue = `[^'\n]*`
+
 // escapedQuote matches the quote delimiter as it arrives in hook text, which
 // is usually JSON: a review's own `"` reaches this package as `\"`, and rules
 // that required a literal one missed every credential inside a nested string —
@@ -704,9 +766,9 @@ var secretPatterns = []*regexp.Regexp{
 	// a colon is not: `- The credential: "auth.go" is missing` is a sentence,
 	// so there the value has to look like a credential too.
 	regexp.MustCompile(`(?i)(` + escapedQuote + `[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*` + escapedQuote + `[ \t]*[:=][ \t]*` + escapedQuote + `)` + quotedValue + `(` + escapedQuote + `)`),
-	regexp.MustCompile(`(?i)(["'][A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["'][ \t]*[:=][ \t]*')[^']*(')`),
+	regexp.MustCompile(`(?i)(["'][A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*["'][ \t]*[:=][ \t]*')` + singleQuotedValue + `(')`),
 	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*=[ \t]*` + escapedQuote + `)` + quotedValue + `(` + escapedQuote + `)`),
-	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*=[ \t]*')[^']*(')`),
+	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*[ \t]*=[ \t]*')` + singleQuotedValue + `(')`),
 	// An unquoted shell assignment. The `=` is what marks it as one, so `auth`
 	// is safe to name here.
 	regexp.MustCompile(`(?i)(\b[A-Za-z0-9_.-]*` + secretName + `[A-Za-z0-9_.-]*=)[^\s"',;)\]}]+()`),
@@ -807,6 +869,14 @@ func isAssignedCredential(text string, loc []int) bool {
 		// secret-ish name.
 		return !startsWithWord(rest)
 	}
+	// Inside a markdown span, the sentence around it says nothing about the
+	// value: `- **DB_PASSWORD: hunter2trustno1** is committed in
+	// docker-compose.yml` is a reviewer quoting an assignment and then
+	// describing it, and reading "is committed" as words after the value left
+	// the credential in the artifact.
+	if end := markdownSpanEnd(text, loc[0]); end >= loc[4]+len(value) {
+		rest = text[loc[4]+len(value) : end]
+	}
 	// A name with words before it is prose. Only a value that could be
 	// nothing else is taken from it: one token, carrying a digit — an
 	// identifier the reviewer named (`sessionToken`, `change_me_now`) does
@@ -822,36 +892,53 @@ func isAssignedCredential(text string, loc []int) bool {
 // most has no newline in it: a secret scanner echoes the offending source line
 // and the whole report arrives as one line of JSON.
 func beginsItsUnit(text string, i int) bool {
-	start := strings.LastIndexAny(text[:i], "\n\"'")
-	unit := text[start+1:]
-	if j := strings.IndexAny(unit, "\n\"'"); j >= 0 {
-		unit = unit[:j]
-	}
-	prefix := text[start+1 : i]
+	start, end := unitBounds(text, i)
 	// A `` ` `` or `*` that opens a span and closes it again on the same line
 	// is a code span or an emphasis rather than a list item — but only prose
 	// after the closing delimiter says which. "`token: sessionToken` is never
 	// validated" is a sentence about code, and reading its backtick as a bullet
 	// redacted the identifier the reviewer named; "`api_key: abcdefghijkl`" is
 	// a span holding nothing but the assignment, and reading *its* backtick as
-	// emphasis leaked the key. `**` is tested before `*` and the search stops
-	// at the delimiter that opened, or bold's second star reads as a span of
-	// its own that closes at the end of the line.
-	opener := strings.TrimLeft(prefix, " \t-+>|{,[#")
+	// emphasis leaked the key.
+	if close := markdownSpanEnd(text, i); close >= 0 && hasLetter(text[close:end]) {
+		return false
+	}
+	prefix := strings.TrimLeft(text[start:i], " \t-*+>|{,[#`_")
+	// An ordered list item — `1. password: …` — is a bullet too.
+	return prefix == "" || reOrderedItem.MatchString(prefix)
+}
+
+// unitBounds returns the line or string the match at i sits in, as offsets into
+// text.
+func unitBounds(text string, i int) (start, end int) {
+	start = strings.LastIndexAny(text[:i], "\n\"'") + 1
+	end = len(text)
+	if j := strings.IndexAny(text[i:], "\n\"'"); j >= 0 {
+		end = i + j
+	}
+	return start, end
+}
+
+// markdownSpanEnd returns the offset of the delimiter closing the markdown span
+// that the match at i sits inside, or -1 when the match does not open one that
+// closes on its line. `**` is tested before `*` and the search stops at the
+// delimiter that opened, or bold's second star reads as a span of its own
+// closing at the end of the line.
+func markdownSpanEnd(text string, i int) int {
+	start, end := unitBounds(text, i)
+	opener := strings.TrimLeft(text[start:i], " \t-+>|{,[#")
 	for _, delim := range []string{"`", "**", "*", "_"} {
 		if !strings.HasPrefix(opener, delim) {
 			continue
 		}
-		open := strings.Index(unit, delim)
-		closes := strings.Index(unit[open+len(delim):], delim)
-		if closes >= 0 && hasLetter(unit[open+closes+2*len(delim):]) {
-			return false
+		body := i - len(opener) + len(delim)
+		j := strings.Index(text[body:end], delim)
+		if j < 0 {
+			return -1
 		}
-		break
+		return body + j
 	}
-	prefix = strings.TrimLeft(prefix, " \t-*+>|{,[#`_")
-	// An ordered list item — `1. password: …` — is a bullet too.
-	return prefix == "" || reOrderedItem.MatchString(prefix)
+	return -1
 }
 
 var reOrderedItem = regexp.MustCompile(`^[0-9]+[.)][ \t]*$`)
@@ -919,14 +1006,25 @@ func hasLetter(s string) bool {
 //
 // Known limitation: a value that both holds a path separator and ends in a
 // short dotted extension is read as a path, so a base64 secret shaped that way
-// survives. The two are not separable by shape alone, and reading a cited path
-// as a credential is the error that corrupts the corpus this feature builds.
+// survives — up to the ceiling. The two are not separable by shape below it,
+// and reading a cited path as a credential is the error that corrupts the
+// corpus this feature builds; past it, no path a review cites is that long.
 func isFileReference(value string) bool {
 	if !reFileRef.MatchString(value) {
 		return false
 	}
-	return strings.Contains(value, "/") || len([]rune(value)) < 24
+	n := len([]rune(value))
+	return n < maxPathRunes && (n < maxUnbrokenPathRunes || strings.Contains(value, "/"))
 }
+
+// How long a value may be and still read as a path. The lower bound applies
+// where nothing but the extension says "path"; the upper one applies whatever
+// the value contains, because a repository path a review cites is a name, not
+// a payload.
+const (
+	maxUnbrokenPathRunes = 24
+	maxPathRunes         = 64
+)
 
 var reFileRef = regexp.MustCompile(`\.[A-Za-z]{1,4}$`)
 
