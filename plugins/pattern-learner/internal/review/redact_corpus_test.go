@@ -435,6 +435,12 @@ var acceptedRewrites = []struct{ name, in, rewritten string }{
 	// shell variable is conventionally spelled, are unaffected: `$DB_PASSWORD`
 	// and `$dbPassword` both survive, and the proseCorpus pins them.
 	{"a camelcase variable carrying a digit", `password: $oauth2Token`, "oauth2Token"},
+	// Glue is bounded, and a path is longer than the bound: an expansion joined
+	// to one — `${HOME}/.config/app/creds` — is rewritten. Leaving glue
+	// unbounded was the alternative, and it let a whole base64 key follow a
+	// variable. A path a review cites more often has the shape isFileReference
+	// recognises, which is exempt: `${SECRETS_DIR}/keys/service.pem` survives.
+	{"a long path after an expansion", `password: ${HOME}/.config/app/creds`, "/.config/app/creds"},
 	{"a constant in a bare span", "- **secret: SHA256_DIGEST**", "SHA256_DIGEST"},
 }
 

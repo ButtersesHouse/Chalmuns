@@ -7,16 +7,36 @@ skills, so Steps 5–13 do not apply. Release the run-lock when done.
 
 A designation is what makes capture happen at all. The plugin ships a
 PostToolUse hook that runs `capture-review --hook` after every Bash, Skill,
-SlashCommand and ReportFindings call; with no watchers designated it reads the
-payload, matches nothing, and exits. Once a reviewer is designated, that
-reviewer's output is written into `.claude/pattern-learner/review-cache/` as it
-happens, and `--learn-reviews` mines it. Nothing is captured from a tool nobody
-asked for, and nothing is ever captured from a tool that is not designated.
+SlashCommand and ReportFindings call; until a watcher is designated the hook's
+own shell guard sees no `watchers` in `state.json` and the binary is never run.
+Once a reviewer is designated, that reviewer's output is written into
+`.claude/pattern-learner/review-cache/` as it happens, and `--learn-reviews`
+mines it. Nothing is captured from a tool nobody asked for, and nothing is ever
+captured from a tool that is not designated.
 
 ReportFindings is in that list because Claude Code's own `/code-review` skill
 does not return its findings as the skill call's result — it reports them by
 calling ReportFindings, whose arguments carry the findings array. Its Skill
 call is filtered out so one review is not recorded twice.
+
+**A ReportFindings payload names no skill of its own**, so what arrives that way
+is attributed to `code-review` and to nothing else. That matters if you designate
+a *different* skill that also reports through ReportFindings — `/security-review`,
+or a house review skill. Designated under its own name, its findings are not
+captured at all: the payload says `code-review`, the watcher says
+`security-review`, and they do not match. Capture such a skill by hand instead:
+
+```
+/security-review > review.md
+$BIN capture-review --cache-dir .claude/pattern-learner/review-cache \
+  --source security-review --label "what was reviewed" --file review.md
+```
+
+Designating `code-review` *and* running another ReportFindings skill in the same
+session is the case to avoid: the second skill's findings would be recorded under
+`code-review`, and an artifact that names a reviewer which did not produce it is
+the one failure this feature cannot recover from — every rule mined from it cites
+the wrong tool. Designate one ReportFindings reviewer at a time.
 
 A reviewer that runs as a **subagent** (a Task call) is not captured by the
 hook: a subagent's transcript is not a tool response the hook can read. Capture

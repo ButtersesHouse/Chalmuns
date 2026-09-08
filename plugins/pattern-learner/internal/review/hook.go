@@ -43,6 +43,15 @@ var responseKeys = []string{"tool_response", "tool_result", "tool_output", "resp
 // therefore missed the one format this package names as its house shape, and
 // captured the skill's own prose instead. Each entry maps such a tool to the
 // reviewer it belongs to, used when the payload names no skill of its own.
+//
+// A ReportFindings payload names no skill of its own, so this mapping is the
+// whole of its attribution: findings that arrive that way are `code-review`'s
+// and nothing else's. A different skill reporting the same way — a house review
+// skill, `/security-review` — is therefore not captured under its own
+// designation, and would be recorded under `code-review`'s if that one is
+// designated too. references/watch-mode.md says so and gives the by-hand
+// capture to use instead; guessing at the reviewer from what else is designated
+// was tried and is what put one tool's findings under another tool's name.
 var reportingTools = map[string]string{
 	"ReportFindings": "code-review",
 }
